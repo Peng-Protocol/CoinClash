@@ -1,7 +1,8 @@
 /*
  SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
- Version: 0.0.50 (11/10/2025)
+ Version: 0.0.51 (13/10/2025)
  Changes:
+ - v0.0.51 (13/10): Updated _computeFeePercent for 0.05% min fee at ≤1% liquidity usage, scaling to 0.10% at 2%, 0.50% at 10%, up to 50% at 100%.
  - v0.0.50 (11/10): Refactored _processSingleOrder to resolve stack too deep error by splitting into _validateLiquidity, _checkUniswapBalance, and _executeOrder, each handling ≤4 variables. Removed unused parameters: orderIdentifier from _prepareLiquidityUpdates, isBuyOrder from _computeUpdateStatus, maxIterations from _collectOrderIdentifiers, tokenDecimals from _prepareLiquidityUpdates, pendingAmount from _executeOrderWithFees, recipientAddress from _computeAmountSent, and result from _processSingleOrder. Added UniswapLiquidityExcess event and check in _checkUniswapBalance. Consolidated fee updates in _updateFees.
  - v0.0.49: Added Uniswap LP balance check in _processSingleOrder to prevent settlement if Uniswap LP output token balance exceeds xLiquid/yLiquid. (11/10/2025)
  - v0.0.48: Refactored _computeFee into _getLiquidityData, _computeFeePercent, _finalizeFee. (Previous changes omitted for brevity)
@@ -205,10 +206,12 @@ contract CCLiquidPartial is CCMainPartial {
     }
 
     function _computeFeePercent(uint256 amountIn, uint256 liquidityAmount) private pure returns (uint256 feePercent) {
-        feePercent = (amountIn * 1e18) / (liquidityAmount == 0 ? 1 : liquidityAmount);
-        if (feePercent < 1e14) feePercent = 1e14; // 0.01% minimum
-        if (feePercent > 1e17) feePercent = 1e17; // 10% maximum
-    }
+    // Scales fee from 0.05% at ≤1% usage to 50% at 100% usage
+    uint256 usagePercent = (amountIn * 1e18) / (liquidityAmount == 0 ? 1 : liquidityAmount);
+    feePercent = (usagePercent * 5e15) / 1e16; // Linear scaling: 0.05% per 1% usage
+    if (feePercent < 5e14) feePercent = 5e14; // 0.05% minimum
+    if (feePercent > 5e17) feePercent = 5e17; // 50% maximum
+}
 
     function _finalizeFee(uint256 amountIn, uint256 feePercent, uint8 decimals) private pure returns (FeeContext memory feeContext) {
         feeContext.feeAmount = (amountIn * feePercent) / 1e18;
