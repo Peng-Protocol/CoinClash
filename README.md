@@ -1,21 +1,19 @@
 # Overview
-CoinClash, derived from [ShockSpace](https://github.com/Peng-Protocol/Dexhune-SS/tree/main/ShockSpace) uses Uniswap V2 for order settlement. The system introduces range/limit orders - dynamic fees - historical data, etc to Uniswap v2. 
+CoinClash, derived from [Dexhune-P](https://github.com/Peng-Protocol/Dexhune-P) uses Uniswap V2 for order settlement. The system introduces range/limit orders - dynamic fees - historical data, etc to Uniswap v2. 
 
 ## System Summary
 CoinClash operates via `CCAgent`, to deploy `CCListingTemplate` and `CCLiquidityTemplate` contracts for unique token pairs. `CCListingTemplate` serves as the order book, enabling order creation, cancellation, and settlement via `CCOrderRouter`, `CCSettlementRouter`, and `CCLiquidRouter`. It uses Uniswap V2 for real-time pricing and partial fills, tracking historical data and balances. `CCLiquidityTemplate` enables deposits, withdrawals, fee claims, and payouts, storing liquidity details and slot data. `CCLiquidityRouter` handles deposits, partial withdrawals with compensation, and fee calculations, while `CCLiquidRouter` settles orders using liquidity balances, charging between 0.01% and 10% fees depending on liquidity usage. `CCGlobalizer` and `TokenRegistry` ensure cross-contract order and balance consistency. Pagination (`maxIterations`, `step`) optimizes queries, and relisting supports system upgrades.
 
-*Pending*: The contracts listed below make up the leverage and multi-hop functionalities. They are still in testing and currently do not work. Existing functionality covers basic swaps and liquidity provision.
+*Pending*: The contracts listed below make up the leverage and multi-hop functionalities. They are still in development and currently do not work. Existing functionality covers basic swaps and liquidity provision.
 
-* ShockEntry
-* ShockExit
 * MultiController
 * MultiInitializer 
 * Multistorage 
-* CCS/CISEntryDrivers 
-* CCS/CISExitDrivers 
-* CCS/CISExecutionDrivers 
-* CCS/CISLiquidationDrivers
-* CS/SIStorages
+* UAEntryDriver
+* UAExitDriver
+* UALiquidationDriver
+* UAExecutionDriver
+* UAStorage
 
 # CCAgent
 
@@ -111,4 +109,5 @@ As seen in [MFP](https://github.com/Peng-Protocol/Dexhune-P).
 # CCLiquidityRouter
 
 ## Description 
+
 As seen in [MFP](https://github.com/Peng-Protocol/Dexhune-P).
