@@ -173,48 +173,4 @@ contract CCOrderRouter is CCOrderPartial {
             _clearOrderData(listingAddress, orderId, isBuyOrder);
         }
     }
-
-    function settleLongLiquid(address listingAddress, uint256 maxIterations) external nonReentrant onlyValidListing(listingAddress) {
-    // Settles multiple long liquidations up to maxIterations using active payout IDs
-    ICCListing listingContract = ICCListing(listingAddress);
-    ICCLiquidity liquidityContract = ICCLiquidity(listingContract.liquidityAddressView());
-    uint256[] memory orderIdentifiers = liquidityContract.activeLongPayoutsView();
-    uint256 iterationCount = maxIterations < orderIdentifiers.length ? maxIterations : orderIdentifiers.length;
-    ICCLiquidity.PayoutUpdate[] memory tempUpdates = new ICCLiquidity.PayoutUpdate[](iterationCount);
-    uint256 updateIndex = 0;
-    for (uint256 i = 0; i < iterationCount; ++i) {
-        ICCLiquidity.PayoutUpdate[] memory updates = settleSingleLongLiquid(listingAddress, orderIdentifiers[i]);
-        if (updates.length == 0) continue;
-        tempUpdates[updateIndex++] = updates[0];
-    }
-    ICCLiquidity.PayoutUpdate[] memory finalUpdates = new ICCLiquidity.PayoutUpdate[](updateIndex);
-    for (uint256 i = 0; i < updateIndex; ++i) {
-        finalUpdates[i] = tempUpdates[i];
-    }
-    if (updateIndex > 0) {
-        liquidityContract.ssUpdate(finalUpdates);
-    }
-}
-
-function settleShortLiquid(address listingAddress, uint256 maxIterations) external nonReentrant onlyValidListing(listingAddress) {
-    // Settles multiple short liquidations up to maxIterations using active payout IDs
-    ICCListing listingContract = ICCListing(listingAddress);
-    ICCLiquidity liquidityContract = ICCLiquidity(listingContract.liquidityAddressView());
-    uint256[] memory orderIdentifiers = liquidityContract.activeShortPayoutsView();
-    uint256 iterationCount = maxIterations < orderIdentifiers.length ? maxIterations : orderIdentifiers.length;
-    ICCLiquidity.PayoutUpdate[] memory tempUpdates = new ICCLiquidity.PayoutUpdate[](iterationCount);
-    uint256 updateIndex = 0;
-    for (uint256 i = 0; i < iterationCount; ++i) {
-        ICCLiquidity.PayoutUpdate[] memory updates = settleSingleShortLiquid(listingAddress, orderIdentifiers[i]);
-        if (updates.length == 0) continue;
-        tempUpdates[updateIndex++] = updates[0];
-    }
-    ICCLiquidity.PayoutUpdate[] memory finalUpdates = new ICCLiquidity.PayoutUpdate[](updateIndex);
-    for (uint256 i = 0; i < updateIndex; ++i) {
-        finalUpdates[i] = tempUpdates[i];
-    }
-    if (updateIndex > 0) {
-        liquidityContract.ssUpdate(finalUpdates);
-    }
-}
 }
