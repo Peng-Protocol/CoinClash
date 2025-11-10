@@ -1,205 +1,229 @@
 # CCSettlementRouter Contract Documentation
 
 ## Overview
-The `CCSettlementRouter` contract, implemented in Solidity (`^0.8.2`), facilitates the settlement of buy and sell orders on a decentralized trading platform using Uniswap V2 for order execution. It inherits functionality from `CCSettlementPartial`, which extends `CCUniPartial` and `CCMainPartial`, integrating with external interfaces (`ICCListing`, `IUniswapV2Pair`, `IUniswapV2Router02`, `IERC20`) for token operations, `ReentrancyGuard` for reentrancy protection, and `Ownable` for administrative control. The contract handles order settlement via `settleOrders`, with gas optimization through `step` and `maxIterations`, robust error handling, and decimal precision for tokens. It avoids reserved keywords, uses explicit casting, and ensures graceful degradation with try-catch returning decoded error reasons. Transfers to/from the listing call `listingContract.ccUpdate` after successful Uniswap V2 swaps, ensuring state consistency. Transfer taxes are handled using `amountInReceived` for buy/sell orders, with post-transfer balance checks, allowance verification (10^50 for high-supply tokens), and `amountOutMin` adjusted to reflect tax-adjusted `amountInReceived`.
+The `CCSettlementRouter` contract, implemented in Solidity (`^0.8.2`), facilitates the settlement of buy and sell orders on a decentralized trading platform using Uniswap V2 for order execution. It inherits functionality from `CCSettlementPartial`, which extends `CCUniPartial` and `CCMainPartial`, integrating with external interfaces (`ICCListing`, `IUniswapV2Pair`, `IUniswapV2Router02`, `IERC20`) for token operations, `ReentrancyGuard` for reentrancy protection, and `Ownable` for administrative control. The contract handles order settlement via `settleOrders`, accepting pre-calculated `amountsIn` in **normalized 18-decimal format** (off-chain computed), eliminating on-chain price impact and slippage calculations. All normalization/denormalization is handled in `CCUniPartial.sol`. The router validates orders, executes swaps, and applies updates via `ccUpdate` on the listing contract. It uses `nonReentrant`, emits `OrderSkipped` for non-critical failures, and reverts with decoded reasons on catastrophic errors. No `SafeERC20`, no virtual/override, no inline assembly, no fixed loops — uses user-supplied arrays. Addresses set post-deployment via `set*` functions.
 
 **SPDX License:** BSL 1.1 - Peng Protocol 2025
 
-**Version:** 0.1.23 (updated 2025-10-01)
+**Version:** 0.2.1 (10/11)
 
 **Inheritance Tree:** `CCSettlementRouter` → `CCSettlementPartial` → `CCUniPartial` → `CCMainPartial`
 
 **Compatible Contracts:**
 - `CCListingTemplate.sol` (v0.3.9)
 - `CCMainPartial.sol` (v0.1.5)
-- `CCUniPartial.sol` (v0.1.27)
-- `CCSettlementPartial.sol` (v0.1.22)
+- `CCUniPartial.sol` (v0.2.1)
+- `CCSettlementPartial.sol` (v0.2.0)
 
 ### Changes
-- **v0.1.23**: Updated to reflect `CCUniPartial.sol` v0.1.27 (commented unused `amounts` in try/catch blocks for `_performETHBuySwap`, `_performETHSellSwap`, `_executeTokenSwap` to silence warnings; merged `_createBuyOrderUpdates` and `_createSellOrderUpdates` into `_createOrderUpdates`; simplified `PrepOrderUpdateResult` by removing `normalizedReceived` and `amountIn`; inlined `prepResult` handling in `_executeBuyTokenSwap` and `_executeSellTokenSwap`; removed redundant status checks in `_prepareSwapData` and `_prepareSellSwapData`), `CCSettlementPartial.sol` v0.1.22 (simplified `OrderProcessContext` by removing `maxPrice`, `minPrice`, `currentPrice`, `maxAmountIn`; merged `_updateFilledAndStatus` and `_prepareUpdateData` into `_prepareUpdateData`; inlined `_extractPendingAmount` logic; reduced `_validateOrderParams` checks).
-- **v0.1.22**: Updated to reflect `CCSettlementRouter.sol` v0.1.12 (patched `_validateOrder` to set `context.status = 0` when pricing fails, updated `_processOrderBatch` to skip orders with `context.status == 0` to prevent silent failures).
-- **v0.1.21**: Updated to reflect `CCSettlementPartial.sol` v0.1.19 (fixed `amountSent` calculation in `_applyOrderUpdate` by capturing `preBalance` before swap in `_executeOrderSwap` and passing it to `_applyOrderUpdate`).
-- **v0.1.20**: Updated to reflect `CCUniPartial.sol` v0.1.24 (fixed `_createBuyOrderUpdates` and `_createSellOrderUpdates` to accumulate `amountSent` by adding prior `amountSent` from `getBuyOrderAmounts`/`getSellOrderAmounts`).
-- **v0.1.19**: Updated to reflect `CCUniPartial.sol` v0.1.23 (restored `_computeCurrentPrice` to resolve `DeclarationError` in `_prepareSwapData`/`_prepareSellSwapData`), v0.1.22 (removed redundant denormalization in `_prepBuyOrderUpdate`/`_prepSellOrderUpdate`, used pre/post balance checks for `amountSent`). Compatible with `CCListingTemplate.sol` v0.3.9.
-- **v0.1.18**: Updated to reflect `CCSettlementRouter.sol` v0.1.10 (patched `_validateOrder` to handle non-reverting `_checkPricing`, emitting `OrderSkipped` and skipping invalid orders), `CCSettlementPartial.sol` v0.1.17 (patched `_validateOrderParams` to handle non-reverting `_checkPricing`, emitting `OrderSkipped` and skipping invalid orders). Compatible with `CCListingTemplate.sol` v0.3.9.
-- **v0.1.17**: Updated to reflect `CCSettlementPartial.sol` v0.1.17 (fixed TypeError in `_applyOrderUpdate` using `settlementContext.tokenA/tokenB`, made `_applyOrderUpdate` view), v0.1.16 (added `OrderSkipped` event, modified `_checkPricing` to emit instead of revert, updated `_applyOrderUpdate` for `amountSent` and status). Compatible with `CCListingTemplate.sol` v0.3.9.
-- **v0.1.16**: Updated to reflect `CCUniPartial.sol` v0.1.20 (moved `_prepBuyOrderUpdate`, `_prepSellOrderUpdate`, `_getTokenAndDecimals`, `uint2str`, `PrepOrderUpdateResult` to resolve declaration errors; patched `_prepareSwapData`/`_prepareSellSwapData` to compute `amountOutMin` using `amountInReceived` from `_prepBuyOrderUpdate`/`_prepSellOrderUpdate` for transfer taxes), `CCSettlementPartial.sol` v0.1.15 (removed moved functions). Compatible with `CCListingTemplate.sol` v0.3.9.
-- **v0.1.15**: Updated to reflect `CCUniPartial.sol` v0.1.17 (patched `_executeTokenSwap` to use `amountInReceived`, added allowance check in `_prepareTokenSwap` with 10^50 for high-supply tokens), `CCSettlementPartial.sol` v0.1.14 (patched `_prepBuyOrderUpdate`/`_prepSellOrderUpdate` to use actual contract balance for `amountIn` post-`transactToken`/`transactNative`). Compatible with `CCListingTemplate.sol` v0.3.9.
-- **v0.1.14**: Updated to reflect `CCUniPartial.sol` v0.1.16 (modified `_fetchReserves` to use token balances at Uniswap V2 pair address, updated `_computeMaxAmountIn` and `_computeSwapImpact` to handle unusual token decimals with `normalize`/`denormalize`).
-- **v0.1.13**: Updated to reflect `CCSettlementRouter.sol` v0.1.9 (refactored `settleOrders` into `_initSettlement`, `_createHistoricalEntry`, `_processOrderBatch` using `SettlementState` struct), `CCSettlementPartial.sol` v0.1.13 (post-`transactToken` balance checks for tax-on-transfer), `CCUniPartial.sol` v0.1.15 (removed `_ensureTokenBalance`, dynamic `maxAmountIn`, streamlined static data). Compatible with `CCListingTemplate.sol` v0.1.12.
+- **v0.2.1 (10/11)**: **Critical Refactor (x64)** — Resolved `Stack too deep` in `_createOrderUpdates` by refactoring into **call-tree of helper functions** with **private structs** (`UpdateIds`, `UpdateAmounts`, `UpdateState`) limited to **4 fields each**. All logic preserved. Fixed `ParserError` by renaming `partial` → `buyPartial`/`sellPartial`. Added inline comments per helper. **No behavior change**.
+- **v0.2.0 (Trimmed)**: **Major Off-Chain Calculation Shift** — Removed on-chain `_computeSwapAmount`, `_computeMaxAmountIn`, `_prepareSwapData`, `_prepareSellSwapData`, `_executeBuyTokenSwap`, `_executeSellTokenSwap`, `_executeBuyETHSwap`, `_executeSellETHSwapInternal`, `_finalizeTokenSwap`, `_executeTokenSwap`, `_prepBuyOrderUpdate`, `_prepSellOrderUpdate` from `CCUniPartial`. Removed `_processOrder`, `_validateOrderParams`, `_applyOrderUpdate`, `_prepareUpdateData`, `_updateFilledAndStatus` from `CCSettlementPartial`. Removed `_initSettlement`, `_processOrderBatch`, `SettlementState`, `OrderProcessContext`, `PrepOrderUpdateResult`. **Now**: `settleOrders` accepts `orderIds[]` and `amountsIn[]` (normalized 18-decimal, pre-calculated off-chain). `_processBuyOrder`/`_processSellOrder` denormalize `amountIn`, pull funds, execute swap via `_executePartialBuySwap`/`_executePartialSellSwap`, create updates via refactored `_createOrderUpdates`. Historical entry created once per call. **All price impact, slippage, tax handling now off-chain**.
+- **v0.1.23**: Updated to reflect `CCUniPartial.sol` v0.1.27 (merged `_createBuyOrderUpdates`/`_createSellOrderUpdates` into `_createOrderUpdates`; inlined `prepResult` in swap execution; commented unused `amounts`), `CCSettlementPartial.sol` v0.1.22 (inlined `_extractPendingAmount`, merged `_updateFilledAndStatus`/`_prepareUpdateData`).
+- **v0.1.22**: Patched `_validateOrder` to set `context.status = 0` on pricing failure; `_processOrderBatch` skips `status == 0`.
+- **v0.1.21**: Fixed `amountSent` using pre-swap balance in `_executeOrderSwap`.
+- **v0.1.20**: Fixed `_createOrderUpdates` to accumulate `amountSent` from prior state.
+- **v0.1.19**: Restored `_computeCurrentPrice`, removed redundant denormalization in prep functions.
+- **v0.1.18**: Made `_checkPricing` non-reverting, emit `OrderSkipped`.
+- **v0.1.17**: Added `OrderSkipped` event, made `_applyOrderUpdate` view.
+- **v0.1.16**: Moved prep functions to `CCUniPartial`, used `amountInReceived` for tax tokens.
+- **v0.1.15**: Added allowance check (10^50), used post-transfer balance for `amountIn`.
+- **v0.1.14**: Used live pair balances for reserves.
+- **v0.1.13**: Refactored `settleOrders` with `SettlementState`, added tax handling.
 
 ## Mappings
-- None defined directly in `CCSettlementRouter` or `CCSettlementPartial`. Relies on `ICCListing` view functions (`pendingBuyOrdersView`, `pendingSellOrdersView`) for order tracking.
+- None defined directly. Relies on `ICCListing` views: `getBuyOrderCore`, `getSellOrderAmounts`, `getBuyOrderPricing`, `prices`, `volumeBalances`, `historicalDataLengthView`, `getHistoricalDataView`.
 
 ## Structs
-- **OrderContext** (`CCSettlementRouter`): Contains `orderId` (uint256), `pending` (uint256), `status` (uint8), `buyUpdates` (ICCListing.BuyOrderUpdate[]), `sellUpdates` (ICCListing.SellOrderUpdate[]).
-- **SettlementState** (`CCSettlementRouter`): Contains `listingAddress` (address), `isBuyOrder` (bool), `step` (uint256), `maxIterations` (uint256).
-- **OrderProcessContext** (`CCSettlementPartial`): Contains `orderId` (uint256), `pendingAmount` (uint256), `filled` (uint256), `amountSent` (uint256), `makerAddress` (address), `recipientAddress` (address), `status` (uint8), `swapAmount` (uint256), `buyUpdates` (ICCListing.BuyOrderUpdate[]), `sellUpdates` (ICCListing.SellOrderUpdate[]).
-- **PrepOrderUpdateResult** (`CCUniPartial`): Contains `tokenAddress` (address), `tokenDecimals` (uint8), `makerAddress` (address), `recipientAddress` (address), `orderStatus` (uint8), `amountSent` (uint256).
+- **OrderContext** (`CCSettlementRouter`): 
+  - `orderId` (uint256)
+  - `buyUpdates` (ICCListing.BuyOrderUpdate[])
+  - `sellUpdates` (ICCListing.SellOrderUpdate[])
+  - `status` (uint8) — updated post-`ccUpdate`
+- **SettlementContext** (`CCUniPartial`): 
+  - `tokenA`, `tokenB` (address)
+  - `decimalsA`, `decimalsB` (uint8)
+  - `uniswapV2Pair` (address)
+- **SwapContext** (`CCUniPartial`): 
+  - `listingContract` (ICCListing)
+  - `makerAddress`, `recipientAddress` (address)
+  - `status` (uint8)
+  - `tokenIn`, `tokenOut` (address)
+  - `decimalsIn`, `decimalsOut` (uint8)
+  - `denormAmountIn`, `denormAmountOutMin` (uint256)
+  - `price`, `expectedAmountOut` (uint256)
+- **UpdateIds** (private, `CCUniPartial`): `orderId`, `maker`, `recipient` — max 4 fields
+- **UpdateAmounts** (private, `CCUniPartial`): `pending`, `filled`, `amountIn`, `amountOut` — max 4 fields
+- **UpdateState** (private, `CCUniPartial`): `priorSent`, `decimalsOut`, `isBuyOrder` — max 4 fields
 
 ## External Functions
-- **settleOrders(address listingAddress, uint256 step, uint256 maxIterations, bool isBuyOrder) → string memory reason** (`CCSettlementRouter`):
-  - Iterates pending orders from `step` up to `maxIterations`.
-  - Fetches static data via `SettlementContext`.
-  - Calls `_initSettlement`, `_createHistoricalEntry`, `_processOrderBatch`.
-  - Validates via `_validateOrder`, processes via `_processOrder`, applies via `_updateOrder`.
-  - Returns empty string or error reason.
+- **settleOrders(address listingAddress, uint256[] calldata orderIds, uint256[] calldata amountsIn, bool isBuyOrder) → string memory reason** (`CCSettlementRouter`):
+  - **Inputs**: `orderIds` and `amountsIn` must match in length. `amountsIn` **must be in 18-decimal normalized format** (off-chain calculated).
+  - **Flow**:
+    1. Validate `uniswapV2Router`, length match, non-empty.
+    2. Fetch `SettlementContext` from listing.
+    3. Call `_createHistoricalEntry` → one `HistoricalUpdate` with current `price`, `xBalance`, `yBalance`, `xVolume`, `yVolume`.
+    4. For each order:
+       - Skip if `_validateOrder` fails (emits `OrderSkipped`)
+       - Call `_processBuyOrder` or `_processSellOrder` → returns `buyUpdates`/`sellUpdates`
+       - Call `_updateOrder` → `ccUpdate` with updates
+       - Revert on `ccUpdate` failure
+    5. Return empty string if ≥1 order settled, else error.
   - **Internal Call Tree**:
-    - `_initSettlement` → Fetches order IDs, validates router.
-    - `_createHistoricalEntry` → Creates `HistoricalUpdate` using `volumeBalances`, `prices`, `historicalDataLengthView`, `getHistoricalDataView`.
-    - `_processOrderBatch` → Iterates orders, calls `_validateOrder`, `_processOrder`, `_updateOrder`.
-    - `_validateOrder` → Fetches order data, checks pricing via `_checkPricing`, emits `OrderSkipped` and sets `context.status = 0` for invalid orders (v0.1.12).
-    - `_processOrder` → Calls `_processBuyOrder` or `_processSellOrder`.
-    - `_processBuyOrder` → Validates via `_validateOrderParams`, computes swap via `_computeSwapAmount`, captures `preBalance`, executes via `_executeOrderSwap`, applies via `_applyOrderUpdate`.
-    - `_processSellOrder` → Similar flow for sell orders.
-    - `_executeOrderSwap` → Calls `_executePartialBuySwap` or `_executePartialSellSwap`.
-    - `_executePartialBuySwap` → Prepares via `_prepareSwapData`, executes via `_executeBuyTokenSwap` or `_executeBuyETHSwap`.
-    - `_executePartialSellSwap` → Prepares via `_prepareSellSwapData`, executes via `_executeSellTokenSwap` or `_executeSellETHSwapInternal`.
-    - `_applyOrderUpdate` → Computes `amountSent` with pre/post balance checks, sets status based on pending amount (view).
+    - `_createHistoricalEntry` → `volume`ccUpdate` with `HistoricalUpdate[]`
+    - `_validateOrder` → checks `pending > 0`, `status == 1`, `_checkPricing`
+    - `_checkPricing` → validates `currentPrice` in `[minPrice, maxPrice]`, emits `OrderSkipped` if not
+    - `_processBuyOrder` → denormalizes `amountIn`, pulls funds via `transact*`, calls `_executePartialBuySwap`
+    - `_processSellOrder` → denormalizes `amountIn`, pulls funds, calls `_executePartialSellSwap`
+    - `_executePartialBuySwap` → `_prepareSwapData` → `_computeSwapImpact` → `_performSwap` → `_createOrderUpdates`
+    - `_executePartialSellSwap` → `_prepareSellSwapData` → `_computeSwapImpact` → `_performSwap` → `_createOrderUpdates`
+    - `_createOrderUpdates` → **call-tree**: `_computePendingAndStatus` → `_normalizeOut` → `_buildBuyPartial`/`_buildSellPartial` → `_buildBuyTerminal`/`_buildSellTerminal` → `_assembleBuyUpdates`/`_assembleSellUpdates`
+    - `_updateOrder` → `ccUpdate` with `buyUpdates` or `sellUpdates`, captures new `status`
 
 ## Internal Functions
+
 ### CCSettlementRouter
-- **_validateOrder(address listingAddress, uint256 orderId, bool isBuyOrder, ICCListing listingContract) → OrderContext memory context**: Fetches order data, validates pricing via `_checkPricing`, emits `OrderSkipped` and sets `context.status = 0` for invalid orders (v0.1.12).
-- **_processOrder(address listingAddress, bool isBuyOrder, ICCListing listingContract, OrderContext memory context, SettlementContext memory settlementContext) → OrderContext memory**: Delegates to `_processBuyOrder` or `_processSellOrder`.
-- **_updateOrder(ICCListing listingContract, OrderContext memory context, bool isBuyOrder) → (bool success, string memory reason)**: Applies `ccUpdate` with `buyUpdates` or `sellUpdates`, returns success or error reason.
-- **_initSettlement(address listingAddress, bool isBuyOrder, uint256 step, ICCListing listingContract) → (SettlementState memory state, uint256[] memory orderIds)**: Initializes settlement state, fetches order IDs.
-- **_createHistoricalEntry(ICCListing listingContract) → ICCListing.HistoricalUpdate[] memory**: Creates historical data entry with live `price`, `xBalance`, `yBalance`, `xVolume`, `yVolume`.
-- **_processOrderBatch(SettlementState memory state, uint256[] memory orderIds, ICCListing listingContract, SettlementContext memory settlementContext) → string memory reason**: Iterates orders, skips if `context.status == 0`, calls `_validateOrder`, `_processOrder`, `_updateOrder`.
+- **_validateOrder(address listingAddress, uint256 orderId, bool isBuyOrder, ICCListing listingContract) → bool**: 
+  - Fetches `pending`, `status` via `getBuyOrderAmounts`/`getSellOrderCore`
+  - Returns `false` and emits `OrderSkipped` if `pending == 0` or `status != 1`
+  - Calls `_checkPricing`, returns `false` on failure
+- **_updateOrder(ICCListing listingContract, OrderContext memory context, bool isBuyOrder) → (bool success, string memory reason)**:
+  - Calls `ccUpdate` with `buyUpdates` or `sellUpdates`
+  - On success: fetches new `status`, returns `(false, "")` if `status == 0 || 3`
+  - On catch: returns `(false, "Update failed for order X: reason")`
+- **_createHistoricalEntry(ICCListing listingContract)**:
+  - Fetches `volumeBalances(0)` → `xBalance`, `yBalance` (normalized)
+  - Fetches `prices(0)` → `price`
+  - If `historicalDataLengthView() > 0`: fetches last `HistoricalData` → `xVolume`, `yVolume`
+  - Builds `HistoricalUpdate[]` with current values + `block.timestamp`
+  - Calls `ccUpdate` with `historicalUpdates`, reverts on failure
 
 ### CCSettlementPartial
-- **_checkPricing(address listingAddress, uint256 orderIdentifier, bool isBuyOrder) → bool**: Validates price bounds, emits `OrderSkipped` if invalid.
-- **_computeAmountSent(address tokenAddress, address recipientAddress) → uint256 preBalance**: Captures pre-transfer balance.
-- **_validateOrderParams(address listingAddress, uint256 orderId, bool isBuyOrder, ICCListing listingContract) → OrderProcessContext memory context**: Fetches order data, validates status and pending amount, checks pricing.
-- **_computeSwapAmount(address listingAddress, bool isBuyOrder, OrderProcessContext memory context, SettlementContext memory settlementContext) → OrderProcessContext memory**: Computes `swapAmount` via `_computeMaxAmountIn`.
-- **_executeOrderSwap(address listingAddress, bool isBuyOrder, OrderProcessContext memory context, SettlementContext memory settlementContext) → OrderProcessContext memory**: Executes swap via `_executePartialBuySwap` or `_executePartialSellSwap`.
-- **_prepareUpdateData(OrderProcessContext memory context, bool isBuyOrder, uint256 pendingAmount, uint256 preBalance, SettlementContext memory settlementContext) → (ICCListing.BuyOrderUpdate[] memory buyUpdates, ICCListing.SellOrderUpdate[] memory sellUpdates)**: Prepares updates, computes `amountSent`, sets status (v0.1.22).
-- **_applyOrderUpdate(OrderProcessContext memory context, bool isBuyOrder, SettlementContext memory settlementContext, uint256 preBalance) → (ICCListing.BuyOrderUpdate[] memory buyUpdates, ICCListing.SellOrderUpdate[] memory sellUpdates)**: Delegates to `_prepareUpdateData` (view).
-- **_processBuyOrder(address listingAddress, uint256 orderIdentifier, ICCListing listingContract, SettlementContext memory settlementContext) → ICCListing.BuyOrderUpdate[] memory**: Validates, computes, executes, and applies buy order updates.
-- **_processSellOrder(address listingAddress, uint256 orderIdentifier, ICCListing listingContract, SettlementContext memory settlementContext) → ICCListing.SellOrderUpdate[] memory**: Validates, computes, executes, and applies sell order updates.
+- **_checkPricing(address listingAddress, uint256 orderIdentifier, bool isBuyOrder) → bool**:
+  - Fetches `maxPrice`, `minPrice` via `getBuyOrderPricing`/`getSellOrderPricing`
+  - Fetches `currentPrice = prices(0)`
+  - Emits `OrderSkipped` and returns `false` if `currentPrice == 0` or out of bounds
+- **_processBuyOrder(...) → ICCListing.BuyOrderUpdate[]**:
+  - Validates router, `pending > 0`, `status == 1`, `amountIn > 0`
+  - Denormalizes `amountIn` → `denormalize(amountIn, decimalsB)`
+  - Calls `_prepBuyOrderUpdate` → pulls funds via `transactNative`/`transactToken`, captures `amountSent`
+  - Calls `_executePartialBuySwap` → returns updates
+- **_processSellOrder(...) → ICCListing.SellOrderUpdate[]**:
+  - Same as buy, but for sell side
+  - Calls `_prepSellOrderUpdate` before swap
 
 ### CCUniPartial
-- **_getTokenAndDecimals(bool isBuyOrder, SettlementContext memory settlementContext) → (address tokenAddress, uint8 tokenDecimals)**: Returns token address and decimals based on order type.
-- **_prepBuyOrderUpdate(address listingAddress, uint256 orderIdentifier, uint256 amountReceived, SettlementContext memory settlementContext) → PrepOrderUpdateResult memory**: Prepares buy order update, pulls funds via `transactToken`/`transactNative`.
-- **_prepSellOrderUpdate(address listingAddress, uint256 orderIdentifier, uint256 amountReceived, SettlementContext memory settlementContext) → PrepOrderUpdateResult memory**: Prepares sell order update, pulls funds via `transactToken`/`transactNative`.
-- **_computeCurrentPrice(address listingAddress) → uint256 price**: Fetches current price from `listingContract.prices(0)`.
-- **_computeSwapImpact(uint256 amountIn, bool isBuyOrder, SettlementContext memory settlementContext) → (uint256 price, uint256 amountOut)**: Computes swap impact using Uniswap reserves.
-- **_fetchReserves(bool isBuyOrder, SettlementContext memory settlementContext) → ReserveContext memory**: Fetches token reserves from Uniswap pair.
-- **_prepareSwapData(address listingAddress, uint256 orderIdentifier, uint256 amountIn, SettlementContext memory settlementContext) → (SwapContext memory context, address[] memory path)**: Prepares buy swap data, computes `amountOutMin`.
-- **_prepareSellSwapData(address listingAddress, uint256 orderIdentifier, uint256 amountIn, SettlementContext memory settlementContext) → (SwapContext memory context, address[] memory path)**: Prepares sell swap data, computes `amountOutMin`.
-- **_prepareTokenSwap(address tokenIn, address tokenOut, address recipient) → TokenSwapData memory**: Captures pre-swap balances.
-- **_performETHBuySwap(SwapContext memory context, address[] memory path) → ETHSwapData memory**: Executes ETH-to-token swap, uses balance checks (v0.1.27: commented `amounts`).
-- **_performETHSellSwap(SwapContext memory context, address[] memory path) → ETHSwapData memory**: Executes token-to-ETH swap, uses balance checks (v0.1.27: commented `amounts`).
-- **_createOrderUpdates(uint256 orderIdentifier, OrderUpdateContext memory updateContext, uint256 pendingAmount, uint256 filled, bool isBuyOrder) → (ICCListing.BuyOrderUpdate[] memory buyUpdates, ICCListing.SellOrderUpdate[] memory sellUpdates)**: Creates buy or sell order updates (v0.1.27: merged from `_createBuyOrderUpdates`/`_createSellOrderUpdates`).
-- **_finalizeTokenSwap(TokenSwapData memory data, SwapContext memory context, uint256 orderIdentifier, uint256 pendingAmount, bool isBuyOrder) → (ICCListing.BuyOrderUpdate[] memory buyUpdates, ICCListing.SellOrderUpdate[] memory sellUpdates)**: Finalizes swap, prepares updates.
-- **_executeBuyETHSwap(SwapContext memory context, uint256 orderIdentifier, uint256 pendingAmount) → ICCListing.BuyOrderUpdate[] memory**: Executes ETH buy swap, creates updates.
-- **_executeSellETHSwapInternal(SwapContext memory context, uint256 orderIdentifier, uint256 pendingAmount) → ICCListing.SellOrderUpdate[] memory**: Executes sell-to-ETH swap, creates updates.
-- **_executeBuyTokenSwap(SwapContext memory context, uint256 orderIdentifier, uint256 pendingAmount) → ICCListing.BuyOrderUpdate[] memory**: Executes token buy swap, inlines `prepResult` (v0.1.27).
-- **_executeSellTokenSwap(SwapContext memory context, uint256 orderIdentifier, uint256 pendingAmount, uint256 amountInReceived) → ICCListing.SellOrderUpdate[] memory**: Executes sell token swap, inlines `prepResult` (v0.1.27).
-- **_executePartialBuySwap(address listingAddress, uint256 orderIdentifier, uint256 amountIn, uint256 pendingAmount, SettlementContext memory settlementContext) → ICCListing.BuyOrderUpdate[] memory**: Prepares and executes buy swap.
-- **_executePartialSellSwap(address listingAddress, uint256 orderIdentifier, uint256 amountIn, uint256 pendingAmount, SettlementContext memory settlementContext) → ICCListing.SellOrderUpdate[] memory**: Prepares and executes sell swap.
-- **_computeMaxAmountIn(address listingAddress, uint256 maxPrice, uint256 minPrice, uint256 pendingAmount, bool isBuyOrder, SettlementContext memory settlementContext) → uint256 maxAmountIn**: Computes max input respecting price bounds.
-- **_executeTokenSwap(SwapContext memory context, address[] memory path, uint256 amountIn) → TokenSwapData memory**: Executes token-to-token swap, uses balance checks (v0.1.27: commented `amounts`).
-- **uint2str(uint256 _i) → string memory str**: Converts uint256 to string for error messages.
+- **_getTokenAndDecimals(bool isBuyOrder, SettlementContext memory settlementContext) → (address, uint8)**: Returns `tokenB/decimalsB` (buy) or `tokenA/decimalsA` (sell)
+- **_prepBuyOrderUpdate(...) → uint256 amountSent**:
+  - Validates `pending > 0`, `status == 1`
+  - Captures `preBalance` of token/ETH
+  - Calls `transactNative{value}` or `transactToken`
+  - Returns `postBalance - preBalance`, reverts if zero
+- **_prepSellOrderUpdate(...) → uint256 amountSent**: Same for sell side
+- **_computeSwapImpact(uint256 amountIn, bool isBuyOrder, SettlementContext memory settlementContext) → (uint256 price, uint256 amountOut)**:
+  - Fetches live reserves via `IERC20.balanceOf(uniswapV2Pair)`
+  - Normalizes reserves and `amountIn` to 18 decimals
+  - Applies 0.3% fee: `amountInAfterFee = amountIn * 997 / 1000`
+  - Computes `amountOut` via constant product
+  - Returns `price = prices(0)`, `amountOut` denormalized
+  (Used to calculate a safe `amountOutMin` that can be set for slippage protection during the swap).
+- **_prepareSwapData(...) → (SwapContext memory, address[] memory path)**:
+  - Fetches `maker`, `recipient`, `status`
+  - Sets `tokenIn = tokenB`, `tokenOut = tokenA`, decimals
+  - Denormalizes `amountIn`
+  - Calls `_computeSwapImpact` → `price`, `expectedAmountOut`
+  - Sets `denormAmountOutMin = expectedAmountOut * 95 / 100`
+  - Builds `path = [tokenB, tokenA]`
+- **_prepareSellSwapData(...) → (SwapContext memory, address[] memory path)**: Same for sell side, `path = [tokenA, tokenB]`
+- **_performSwap(SwapContext memory context, address[] memory path, bool isETHIn, bool isETHOut) → uint256 amountOut**:
+  - Captures `preBalanceOut`
+  - Executes correct Uniswap call (`swapExactETHForTokens`, `swapExactTokensForETH`, or `swapExactTokensForTokens`)
+  - Returns `postBalance - preBalance`, reverts if zero
+- **_createOrderUpdates(...) → (buyUpdates[], sellUpdates[])**:
+  - **Call Tree (x64)**:
+    1. Group inputs into `UpdateIds`, `UpdateAmounts`, `UpdateState`
+    2. `_computePendingAndStatus` → `newPending`, `newStatus`
+    3. If buy: `_buildBuyPartial` → `buyPartial`, `_buildBuyTerminal` → `buyTerminal`, `_assembleBuyUpdates`
+    4. If sell: `_buildSellPartial` → `sellPartial`, `_buildSellTerminal` → `sellTerminal`, `_assembleSellUpdates`
+  - Normalizes `amountOut` via `_normalizeOut`
+  - Sets `status = 3` if `newPending == 0`, else `2`
+- **_executePartialBuySwap(...) → buyUpdates[]**:
+  - Calls `_prepareSwapData`
+  - Calls `_performSwap`
+  - Fetches `filled`, `priorAmountSent`
+  - Calls `_createOrderUpdates`
+- **_executePartialSellSwap(...) → sellUpdates[]**:
+  - Calls `_prepSellOrderUpdate` first
+  - Then same as buy swap
+- **uint2str(uint256 _i) → string memory**: For error messages
 
 ## Key Calculations
-- **Maximum Input Amount** (`_computeMaxAmountIn` in `CCSettlementPartial.sol`):
-  - **Formulas**:
-    - Buy: `priceAdjustedAmount = (pendingAmount * currentPrice) / 1e18`
-    - Sell: `priceAdjustedAmount = (pendingAmount * 1e18) / currentPrice`
-    - `maxAmountIn = min(priceAdjustedAmount, pendingAmount, normalizedReserveIn)`
-  - **Description**: Computes `maxAmountIn` (tokenB for buys, tokenA for sells) within price constraints using `_fetchReserves`. Caps at `pendingAmount` and `normalizedReserveIn`.
-  - **Example**: Buy order with `currentPrice = 5000e18`, `pendingAmount = 2000e18`, `reserveIn = 10000e6` (tokenB, 6 decimals):
-    - `normalizedReserveIn = normalize(10000e6, 6) = 10000e18`
-    - `priceAdjustedAmount = (2000e18 * 5000e18) / 1e18 = 10000e18`
-    - `maxAmountIn = min(10000e18, 2000e18, 10000e18) = 2000e18`.
-- **Minimum Output** (`_prepareSwapData`/`_prepareSellSwapData` in `CCUniPartial.sol`):
-  - **Formulas**:
-    - Buy: `denormAmountOutMin = expectedAmountOut`
-    - Sell: `denormAmountOutMin = expectedAmountOut`
-  - **Description**: Computes `denormAmountOutMin` (tokenA for buys, tokenB for sells) for Uniswap V2 swaps, derived from `_computeSwapImpact`.
-  - **Example**: Buy order with `expectedAmountOut = 452.73e18` (tokenA):
-    - `denormAmountOutMin = 452.73e18`.
-    
+- **All swap amounts pre-calculated off-chain in 18-decimal format**
+- **No on-chain price impact or slippage calculation**
+- **Normalization**:
+  - `normalize(value, decimals) = value * 10^(18 - decimals)`
+  - `denormalize(value, decimals) = value / 10^(18 - decimals)`
+- **Swap Impact (for validation only)**:
+  - Used in `_computeSwapImpact` to estimate `amountOut` and set `amountOutMin = 95%`
+  - Not used to limit `amountIn` — off-chain responsibility
+  - **`amountOutMin = expectedAmountOut * 95 / 100` means:  
+“Accept no less than **95% of the expected output** from the Uniswap swap — if the actual amount received is lower, **revert the entire transaction**.”**
+
 ## Token Flow
 - **Buy Order**:
-  - Pulls `tokenB` or ETH via `transactToken`/`transactNative` to this contract (`_prepBuyOrderUpdate`).
-  - Executes `swapExactTokensForTokens` or `swapExactETHForTokens` to recipient (`_executeBuyTokenSwap`/`_executeBuyETHSwap`).
-  - `amountReceived` (tokenA) to recipient, tracked via `amountSent`.
+  1. Off-chain: compute `amountIn` (tokenB, normalized)
+  2. `settleOrders` → `_processBuyOrder` → denormalize → `transact*` → pull to router
+  3. `_executePartialBuySwap` → `swapExact*` → send tokenA to recipient
+  4. `amountOut` measured via balance diff
+  5. `_createOrderUpdates` → normalize `amountOut` → `amountSent`
 - **Sell Order**:
-  - Pulls `tokenA` via `transactToken` to this contract (`_prepSellOrderUpdate`).
-  - Executes `swapExactTokensForTokens` or `swapExactTokensForETH` to recipient (`_executeSellTokenSwap`/`_executeSellETHSwapInternal`).
-  - `amountReceived` (tokenB or ETH) to recipient, tracked via `amountSent`.
+  1. Pull tokenA → swap → send tokenB/ETH to recipient
+  2. `amountSent` = actual received (post-tax)
 
 ## Key Interactions
 - **Uniswap V2**:
-  - **Swap Parameters**:
-    - `amountIn`: `denormAmountIn` (from `_prepareSwapData`/`_prepareSellSwapData`, adjusted for taxes via `amountInReceived`).
-    - `amountOutMin`: `denormAmountOutMin` from `_computeSwapImpact`.
-    - `path`: `[tokenB, tokenA]` (buy), `[tokenA, tokenB]` (sell).
-    - `to`: `recipientAddress`.
-    - `deadline`: `block.timestamp + 15`.
-  - **Functions**: `swapExactTokensForTokens`, `swapExactETHForTokens`, `swapExactTokensForETH`.
+  - `amountIn`: denormalized from `amountsIn[i]`
+  - `amountOutMin`: `expectedAmountOut * 95 / 100` (from `_computeSwapImpact`)
+  - `path`: 2-element array
+  - `to`: `recipientAddress`
+  - `deadline`: `block.timestamp + 15`
 - **ICCListing**:
-  - **Data Retrieval**: `getBuyOrderCore`, `getSellOrderCore`, `getBuyOrderAmounts`, `getSellOrderAmounts`, `getBuyOrderPricing`, `getSellOrderPricing`, `prices`, `volumeBalances`, `historicalDataLengthView`, `getHistoricalDataView`, `pendingBuyOrdersView`, `pendingSellOrdersView`, `tokenA`, `tokenB`, `decimalsA`, `decimalsB`, `uniswapV2PairView`.
-  - **State Updates**: `ccUpdate` for `BuyOrderUpdate`, `SellOrderUpdate`, `HistoricalUpdate`.
-  - **Fund Transfers**: `transactToken`, `transactNative` to pull funds to this contract for swaps.
-- **ICCAgent**: Validates listings via `isValidListing` in `onlyValidListing` modifier.
+  - **Views**: All `get*`, `prices`, `volumeBalances`, `historicalDataLengthView`, `getHistoricalDataView`
+  - **Updates**: `ccUpdate` called **twice per call**:
+    - Once for `HistoricalUpdate`
+    - Once per successful order for `BuyOrderUpdate[]` or `SellOrderUpdate[]`
+  - **Transfers**: `transactNative`/`transactToken` pull funds to router
+- **ICCAgent**: `onlyValidListing` modifier
 
 ## Limitations and Assumptions
-- **No Order Creation/Cancellation**: Handled by `CCOrderRouter`.
-- **No Payouts or Liquidity Settlement**: Handled by `CCCLiquidityRouter` or `CCLiquidRouter`.
-- **Uniswap V2 Dependency**: Requires valid `uniswapV2Router` and `uniswapV2PairView`.
-- **Zero-Amount Handling**: Returns empty `BuyOrderUpdate[]` or `SellOrderUpdate[]` for zero pending amounts or failed swaps.
-- **Decimal Handling**: Uses `normalize`/`denormalize` for 18-decimal precision, assumes `IERC20.decimals` or 18 for ETH.
-- **Price Impact**:
-  - Uses `IERC20.balanceOf(uniswapV2Pair)` for `tokenA` and `tokenB` in `_computeSwapImpact`.
-  - Buy: Increases price (via `listingContract.prices(0)`).
-  - Sell: Decreases price (via `listingContract.prices(0)`).
-- **Pending/Filled**: Uses `amountIn` (pre-transfer: tokenB for buys, tokenA for sells) for `pending` and `filled`, accumulating `filled`.
-- **AmountSent**: Uses `amountInReceived` (post-transfer: tokenA for buys, tokenB or ETH for sells) with pre/post balance checks.
-- **Historical Data**: Creates a new `HistoricalUpdate` entry at the start of `settleOrders` if pending orders exist, applying latest `price`, `xBalance`, `yBalance`, `xVolume`, `yVolume` via `ccUpdate`.
+- **Off-Chain Calculation Required**: `amountsIn` must respect:
+  - Price bounds
+  - Reserve constraints
+  - Slippage tolerance
+  - Tax-on-transfer
+  - Convert to **18-decimal normalized**
+- **No On-Chain Validation of `amountsIn`**: Assumes correct input
+- **Historical Entry**: Created once per `settleOrders` call, even if no orders settle
+- **Partial Fills**: Supported via multiple calls with updated `amountsIn`
+- **Tax Tokens**: Handled via pre/post balance checks in `_prep*OrderUpdate`
+- **ETH**: Treated as `address(0)`, balance via `address(this).balance`
 
 ## Additional Details
-- **Reentrancy Protection**: `nonReentrant` on `settleOrders`.
-- **Gas Optimization**: Uses `step`, `maxIterations`, and dynamic arrays. `settleOrders` refactored with `OrderContext` (v0.0.13). `_processBuyOrder`/`_processSellOrder` refactored with `OrderProcessContext` (v0.1.4).
-- **Listing Validation**: `onlyValidListing` checks `ICCAgent.isValidListing`.
-- **Uniswap V2 Parameters**:
-  - `amountIn`: `denormAmountIn` (pre-transfer, tax-adjusted via `amountInReceived`).
-  - `amountOutMin`: `denormAmountOutMin` from `_computeSwapImpact`.
-  - `path`: `[tokenB, tokenA]` (buy), `[tokenA, tokenB]` (sell).
-  - `to`: `recipientAddress`.
-  - `deadline`: `block.timestamp + 15`.
-- **Error Handling**: Try-catch in `transactNative`, `transactToken`, `approve`, `swap`, and `ccUpdate` with decoded reasons (v0.1.5).
-- **Status Handling**: Status set to 3 (complete) if `pending <= 0`, else 2 (partially filled).
-- **ccUpdate Call Locations**:
-  - **CCSettlementRouter.sol**: Handles all `ccUpdate` calls to `CCListingTemplate.sol`. The `_updateOrder` function applies order updates (`buyUpdates` or `sellUpdates`) for buy or sell orders. The `settleOrders` function applies historical data updates (`historicalUpdates`) at the start of order processing. Updates are prepared in `CCUniPartial.sol` (via `_createOrderUpdates`), refined in `CCSettlementPartial.sol` (via `_prepareUpdateData`/`_applyOrderUpdate`, now view), and applied only in `CCSettlementRouter.sol`.
-  - **No Duplicate Calls**: After v0.1.11, `_applyOrderUpdate` is view, and `ccUpdate` is called once per order in `_updateOrder` and once for historical data in `settleOrders`.
-- **State Update (`CCListingTemplate.ccUpdate`)**:
-  - **Core (`structId = 0`)**: Updates `status`; immutable fields (`maker`, `recipient`) are rewritten with original values.
-  - **Pricing (`structId = 1`)**: Immutable fields (`minPrice`/`maxPrice`) are rewritten with original values (no-op for data, ensures consistency).
-  - **Amounts (`structId = 2`)**: Volatile fields (`pending`, `filled`, `amountSent`) are updated with new values from the swap.
-- **Price Impact Protection**: `_computeMaxAmountIn` ensures estimated impact price respects the user's `maxPrice` (for buys) and `minPrice` (for sells).
-- **Price Calculation**:
-  - Uses `listingContract.prices(0)` to fetch the current price, calculated as `(balanceB * 1e18) / balanceA`.
-- **Partial Fills Behavior**:
-  - Partial fills occur when `swapAmount` is limited by `maxAmountIn`, calculated in `_computeMaxAmountIn` to respect price bounds and available reserves. For example, with a buy order of 100 tokenB pending, a pool of 1000 tokenA and 500 tokenB (price = 0.5 tokenA/tokenB), and price bounds (max 0.6, min 0.4), `maxAmountIn` is 50 tokenB due to price-adjusted constraints. This results in a swap of 50 tokenB for ~90.59 tokenA, updating `pending = 50`, `filled += 50`, `amountSent = 90.59`, and `status = 2` (partially filled) via a single `ccUpdate` call in `_updateOrder`.
-- **AmountSent Usage**:
-  - Tracks actual tokens received by the recipient (e.g., tokenA for buys) in `BuyOrderUpdate`/`SellOrderUpdate`.
-  - **Calculation**: Uses pre/post balance checks (e.g., ~90.59 tokenA for 50 tokenB after fees).
-  - **Partial Fills**: Increments `amountSent` for each partial fill.
-  - **Application**: Prepared in `CCUniPartial.sol` (via `_createOrderUpdates`), refined in `CCSettlementPartial.sol` (via `_prepareUpdateData`), applied via one `ccUpdate` call in `CCSettlementRouter.sol`.
-- **Maximum Input Amount**:
-  - `maxAmountIn` ensures the swap size respects `minPrice`/`maxPrice` bounds, calculated in `_computeMaxAmountIn`.
-  - **Calculation**: Uses `priceAdjustedAmount` (based on current price and pending amount), limited by `pendingAmount` and `normalizedReserveIn` (from `_fetchReserves`).
-- **Minimum Output Amount**:
-  - `amountOutMin` (from `_computeSwapImpact`) ensures slippage does not exceed order price bounds, set as `denormAmountOutMin` in swap calls.
-- **Reserve Clarification**:
-  - Uses live balances of the Uniswap pair address for `_computeSwapImpact` and `_computeMaxAmountIn`.
-- **Partial Fills Continuation**:
-  - Supports partial fills and resumes previously partially filled orders until fully filled.
-- **Handling Tax-on-Transfer Tokens**:
-  - **Pending/Filled**: Based on pre-transfer values to ensure users bear tax costs.
-  - **AmountSent**: Based on pre/post transfer balance checks to capture actual settled amounts.
+- **Reentrancy**: `nonReentrant` on `settleOrders`
+- **Gas**: No loops with fixed bounds — full array processing
 - **Error Handling**:
-  - **Graceful Skipping**: Non-critical issues (e.g., invalid price) emit `OrderSkipped` and skip the order, continuing the batch.
-  - **Critical Reverts**: System-level failures (e.g., missing Uniswap router, failed `transactToken`/`ccUpdate`) revert to ensure state consistency.
+  - `OrderSkipped`: Non-critical (zero pending, bad price, zero amount)
+  - Revert: Missing router, length mismatch, `ccUpdate` fail, zero received
+- **Status**:
+  - `1` = active
+  - `2` = partially filled
+  - `3` = filled
+  - `0` = invalid/terminal
+- **ccUpdate**:
+  - **Historical**: `structId` not checked — assumed correct
+  - **Order Updates**: Two updates per order:
+    - `structId = 2`: volatile fields (`pending`, `filled`, `amountSent`)
+    - `structId = 0`: terminal status
+- **AmountSent**: Cumulative, normalized to 18 decimals
+- **No `try` for internal calls** — only external `ccUpdate`, `transact*`, Uniswap
+- **All mappings/arrays properly named in params**
+- **Graceful degradation**: Skip orders, only revert on system failure
