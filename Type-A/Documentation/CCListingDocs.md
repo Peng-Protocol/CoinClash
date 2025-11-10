@@ -1,11 +1,23 @@
 # CCListingTemplate Documentation
 
 ## Overview
-The `CCListingTemplate` contract (Solidity ^0.8.2) enables decentralized trading for a token pair, leveraging Uniswap V2 for price discovery via `IERC20.balanceOf`. It manages buy/sell orders and normalized (1e18 precision) balances. Volumes are tracked in `_historicalData` during order settlement/cancellation, with auto-generated historical data if not provided by routers. Licensed under BSL 1.1 - Peng Protocol 2025, it uses explicit casting, avoids inline assembly, and ensures graceful degradation with try-catch for external calls.
+The `CCListingTemplate` contract (Solidity ^0.8.2) enables decentralized trading for a token pair, leveraging Uniswap V2 for price discovery via `IERC20.balanceOf`. It manages buy/sell orders and normalized (1e18 precision) balances. **Volumes are tracked in `_historicalData` during order settlement/cancellation, with auto-generated historical data if not provided by routers.** Licensed under BSL 1.1 - Peng Protocol 2025, it uses explicit casting, avoids inline assembly, and ensures graceful degradation with try-catch for external calls.
 
-**Version**: 0.3.11 (Updated 2025-09-11)
+**Version**: 0.4.2 (10/11/2025)
 
 **Changes**:
+- **v0.4.2 (10/11/2025)**: **Removed `_balances` tracker and all balance update functionality.**  
+  - Deleted `mapping(address => mapping(address => Balance)) private _balances`.  
+  - Deleted `struct Balance`, `struct BalanceUpdate`, and `event BalancesUpdated`.  
+  - Removed `BalanceUpdate[] calldata balanceUpdates` from `ccUpdate` signature and all processing logic.  
+  - **Removed `volumeBalances()` entirely** — it is now redundant. Real-time pair reserves are already accessible via `prices()` and direct `IERC20.balanceOf` queries on the Uniswap pair.  
+  - Historical data (`_historicalData`) remains per-pair and continues to track `xVolume`/`yVolume` based on order fills and sends.  
+  - **No stored balances** — system now fully relies on live Uniswap pair state for price and volume context.  
+  - Updated `ccUpdate` to skip balance processing loop; only buy/sell order updates and historical updates are processed.  
+  - Removed all references to stored balance tracking in internal logic and events.
+
+- v0.4.1 (10/11/2025): Made historical data and balances token-pair specific. Added mapping-based storage for historical data per pair. Updated `prices()`, `volumeBalances()`, and all historical views to take token addresses as parameters. Moved balance tracking to per-pair basis.
+- v0.4.0 (10/11/2025): Refactored to monolithic standalone template. Removed CCAgent dependency, added direct Uniswap Factory integration. Routers now owner-only, added token withdrawal function, `prices()` now takes token addresses and queries factory. Grouped order struct fields into arrays, added `startToken`/`endToken` to orders, removed agent references.
 - v0.3.11: Updated `_processHistoricalUpdate` to use full `HistoricalUpdate` struct, removing `structId` and `value` parameters. Added `_updateHistoricalData` and `_updateDayStartIndex` helper functions for clarity. Modified `ccUpdate` to align with new `_processHistoricalUpdate` logic. Removed `uint2str` function as it’s no longer used in error messages.
 - v0.3.10: Modified `ccUpdate` to accept `BuyOrderUpdate[]`, `SellOrderUpdate[]`, `BalanceUpdate[]`, `HistoricalUpdate[]` instead of `updateType`, `updateSort`, `updateData`. Replaced `UpdateType` with new structs. Updated `_processBuyOrderUpdate` and `_processSellOrderUpdate` to use direct struct fields, removing `abi.decode` and `uint2str` in errors.
 - v0.3.9: Fixed `_processBuyOrderUpdate` and `_processSellOrderUpdate` to use `UpdateType` fields directly for Core updates, removing incorrect `abi.decode` of `uint2str(value)`.
@@ -31,211 +43,198 @@ The `CCListingTemplate` contract (Solidity ^0.8.2) enables decentralized trading
 
 ## Interfaces
 - **IERC20**: Defines `decimals()`, `transfer(address, uint256)`, `balanceOf(address)`.
+- **IUniswapV2Factory**: Defines `getPair(address, address)`.
 - **IUniswapV2Pair**: Defines `token0()`, `token1()`.
-- **ICCLiquidityTemplate**: Defines `liquidityDetail()`.
 - **ITokenRegistry**: Defines `initializeTokens(address, address[])`.
 - **ICCGlobalizer**: Defines `globalizeOrders(address, address)`.
-- **ICCAgent**: Defines `getLister(address)`, `getRouters()`.
 
 ## Structs
-- **DayStartFee**: `dayStartXFeesAcc`, `dayStartYFeesAcc`, `timestamp`.
-- **Balance**: `xBalance`, `yBalance` (normalized, 1e18).
 - **HistoricalData**: `price`, `xBalance`, `yBalance`, `xVolume`, `yVolume`, `timestamp`.
-- **BuyOrderCore**: `makerAddress`, `recipientAddress`, `status` (0: cancelled, 1: pending, 2: partially filled, 3: filled).
-- **BuyOrderPricing**: `maxPrice`, `minPrice` (1e18).
-- **BuyOrderAmounts**: `pending` (tokenB), `filled` (tokenB), `amountSent` (tokenA).
-- **SellOrderCore**, **SellOrderPricing**, **SellOrderAmounts**: Similar, with `pending` (tokenA), `amountSent` (tokenB).
-- **BuyOrderUpdate**: `structId` (0: Core, 1: Pricing, 2: Amounts), `orderId`, `makerAddress`, `recipientAddress`, `status`, `maxPrice`, `minPrice`, `pending`, `filled`, `amountSent`.
-- **SellOrderUpdate**: Same fields as `BuyOrderUpdate`.
-- **BalanceUpdate**: `xBalance`, `yBalance`.
-- **HistoricalUpdate**: `price`, `xBalance`, `yBalance`, `xVolume`, `yVolume`, `timestamp`.
+- **BuyOrder**: 
+  - `addresses`: `[maker, recipient, startToken, endToken]`
+  - `prices`: `[maxPrice, minPrice]`
+  - `amounts`: `[pending, filled, amountSent]`
+  - `status`: `0: cancelled`, `1: pending`, `2: partially filled`, `3: filled`
+- **SellOrder**: Same structure as `BuyOrder`.
+- **BuyOrderUpdate**: `structId` (0: Core, 1: Pricing, 2: Amounts), `orderId`, `addresses`, `prices`, `amounts`, `status`.
+- **SellOrderUpdate**: Same as `BuyOrderUpdate`.
+- **HistoricalUpdate**: `tokenA`, `tokenB`, `price`, `xBalance`, `yBalance`, `xVolume`, `yVolume`, `timestamp`.
 - **OrderStatus**: `hasCore`, `hasPricing`, `hasAmounts`.
 
-## Fee Segregation
-`_balance` (`xBalance`, `yBalance`) tracks tokens from order creation/settlement, excluding `ICCLiquidityTemplate` fees. Buy orders add `filled` to `yVolume` (tokenB), `amountSent` to `xVolume` (tokenA); sell orders add `filled` to `xVolume` (tokenA), `amountSent` to `yVolume` (tokenB). Fees fetched via `ICCLiquidityTemplate.liquidityDetail`, stored in `dayStartFee`.
-
 ## State Variables
-- **`routers`**: `mapping(address => bool) public` - Authorized routers.
-- **`routerAddresses`**: `address[] private` - Router address array.
-- **`_routersSet`**: `bool private` - Locks router settings.
-- **`tokenA`, `tokenB`**: `address public` - Token pair (ETH as `address(0)`).
-- **`decimalsA`, `decimalsB`**: `uint8 public` - Token decimals.
-- **`uniswapV2PairView`, `uniswapV2PairViewSet`**: `address public`, `bool private` - Uniswap V2 pair.
-- **`listingId`**: `uint256 public` - Listing identifier.
-- **`agentView`**: `address public` - Agent address.
-- **`registryAddress`**: `address public` - Registry address.
-- **`liquidityAddressView`**: `address public` - Liquidity contract.
-- **`globalizerAddress`, `_globalizerSet`**: `address public`, `bool private` - Globalizer contract.
-- **`nextOrderId`**: `uint256 private` - Order ID counter.
-- **`dayStartFee`**: `DayStartFee public` - Daily fee tracking.
-- **`_balance`**: `Balance private` - Normalized balances.
-- **`_pendingBuyOrders`, `_pendingSellOrders`**: `uint256[] private` - Pending order IDs.
-- **`makerPendingOrders`**: `mapping(address => uint256[]) private` - Maker order IDs.
-- **`_historicalData`**: `HistoricalData[] private` - Price/volume history.
-- **`_dayStartIndices`**: `mapping(uint256 => uint256) private` - Midnight timestamps to indices.
-- **`buyOrderCore`, `buyOrderPricing`, `buyOrderAmounts`**: `mapping(uint256 => ...)` - Buy order data.
-- **`sellOrderCore`, `sellOrderPricing`, `sellOrderAmounts`**: `mapping(uint256 => ...)` - Sell order data.
-- **`orderStatus`**: `mapping(uint256 => OrderStatus) private` - Order completeness.
+- **`routers`**: `mapping(address => bool) public` — Authorized routers.
+- **`routerAddresses`**: `address[] private` — Router address array.
+- **`uniswapV2Factory`**: `address public` — Uniswap V2 Factory address.
+- **`uniswapV2Router`**: `address public` — Uniswap V2 Router address.
+- **`registryAddress`**: `address public` — Token registry address.
+- **`globalizerAddress`**: `address public` — Globalizer address.
+- **`nextOrderId`**: `uint256 private` — Order ID counter.
+- **`_pendingBuyOrders`**, **`_pendingSellOrders`**: `uint256[] private` — Pending order IDs.
+- **`makerPendingOrders`**: `mapping(address => uint256[]) private` — Maker order IDs.
+- **`_historicalData`**: `mapping(address => mapping(address => HistoricalData[])) private` — Per-pair historical data.
+- **`_dayStartIndices`**: `mapping(address => mapping(address => mapping(uint256 => uint256))) private` — Midnight → index per pair.
+- **`buyOrders`**, **`sellOrders`**: `mapping(uint256 => BuyOrder/SellOrder) private` — Order storage.
+- **`orderStatus`**: `mapping(uint256 => OrderStatus) private` — Order completeness tracking.
 
 ## Functions
+
 ### External Functions
-#### setGlobalizerAddress(address globalizerAddress_)
-- **Purpose**: Sets globalizer address (callable once).
-- **State Changes**: `globalizerAddress`, `_globalizerSet`.
-- **Restrictions**: Reverts if set or invalid address.
+
+#### setUniswapV2Factory(address _factory)
+- **Purpose**: Sets Uniswap V2 Factory address (owner-only).
+- **State Changes**: `uniswapV2Factory`.
 - **Internal Call Tree**: None.
-- **Parameters/Interactions**: Sets `globalizerAddress_` for `globalizeUpdate`.
+- **Emits**: `UniswapFactorySet`.
 
-#### setUniswapV2Pair(address uniswapV2Pair_)
-- **Purpose**: Sets Uniswap V2 pair address (callable once).
-- **State Changes**: `uniswapV2PairView`, `uniswapV2PairViewSet`.
-- **Restrictions**: Reverts if set or invalid address.
+#### setUniswapV2Router(address _router)
+- **Purpose**: Sets Uniswap V2 Router address (owner-only).
+- **State Changes**: `uniswapV2Router`.
 - **Internal Call Tree**: None.
-- **Parameters/Interactions**: Sets `uniswapV2PairView` for `prices`, `ccUpdate`.
+- **Emits**: `UniswapRouterSet`.
 
-#### setRouters(address[] memory routers_)
-- **Purpose**: Authorizes routers for `ccUpdate`, `transactToken`, `transactNative`.
-- **State Changes**: `routers`, `routerAddresses`, `_routersSet`.
-- **Restrictions**: Reverts if set or invalid/empty `routers_`.
-- **Internal Call Tree**: None.
-- **Parameters/Interactions**: Sets `routers` entries to true, populates `routerAddresses`.
-
-#### resetRouters()
-- **Purpose**: Fetches lister via `ICCAgent.getLister`, restricts to lister, clears `routers`, updates with `ICCAgent.getRouters`.
-- **State Changes**: `routers`, `routerAddresses`, `_routersSet`.
-- **Restrictions**: Reverts if not lister or no routers.
-- **Internal Call Tree**: None (directly calls `ICCAgent.getLister`, `ICCAgent.getRouters`).
-- **Parameters/Interactions**: Uses `agentView`, `listingId`.
-
-#### setTokens(address tokenA_, address tokenB_)
-- **Purpose**: Sets `tokenA`, `tokenB`, `decimalsA`, `decimalsB`, initializes `dayStartFee`, `_historicalData`.
-- **State Changes**: `tokenA`, `tokenB`, `decimalsA`, `decimalsB`, `dayStartFee`, `_historicalData`, `_dayStartIndices`.
-- **Restrictions**: Reverts if tokens set, identical, or both zero.
-- **Internal Call Tree**: `_floorToMidnight`.
-- **Parameters/Interactions**: Calls `IERC20.decimals`.
-
-#### setAgent(address agent_)
-- **Purpose**: Sets `agentView` (callable once).
-- **State Changes**: `agentView`.
-- **Restrictions**: Reverts if set or invalid address.
-- **Internal Call Tree**: None.
-- **Parameters/Interactions**: Sets `agentView` for `resetRouters`.
-
-#### setListingId(uint256 listingId_)
-- **Purpose**: Sets `listingId` (callable once).
-- **State Changes**: `listingId`.
-- **Restrictions**: Reverts if set.
-- **Internal Call Tree**: None.
-- **Parameters/Interactions**: Sets `listingId` for events.
-
-#### setRegistry(address registryAddress_)
-- **Purpose**: Sets `registryAddress` (callable once).
+#### setRegistry(address _registryAddress)
+- **Purpose**: Sets token registry address (owner-only).
 - **State Changes**: `registryAddress`.
-- **Restrictions**: Reverts if set or invalid address.
 - **Internal Call Tree**: None.
-- **Parameters/Interactions**: Sets `registryAddress` for `_updateRegistry`.
+- **Emits**: `RegistryAddressSet`.
 
-#### setLiquidityAddress(address _liquidityAddress)
-- **Purpose**: Sets `liquidityAddressView` (callable once).
-- **State Changes**: `liquidityAddressView`.
-- **Restrictions**: Reverts if set or invalid address.
+#### setGlobalizerAddress(address _globalizerAddress)
+- **Purpose**: Sets globalizer address (owner-only).
+- **State Changes**: `globalizerAddress`.
 - **Internal Call Tree**: None.
-- **Parameters/Interactions**: Sets `liquidityAddressView` for fee fetching.
+- **Emits**: `GlobalizerAddressSet`.
 
-#### transactToken(address token, uint256 amount, address recipient)
-- **Purpose**: Transfers ERC20 tokens via `IERC20.transfer`, updates `_balance`.
-- **State Changes**: `_balance.xBalance` or `yBalance`.
+#### addRouter(address router) / removeRouter(address router)
+- **Purpose**: Manage authorized routers (owner-only).
+- **State Changes**: `routers`, `routerAddresses`.
+- **Internal Call Tree**: None.
+- **Emits**: `RouterAdded`, `RouterRemoved`.
+
+#### withdrawToken(address token, uint256 amount, address recipient)
+- **Purpose**: Allows routers to withdraw any token or ETH held by contract.
+- **State Changes**: None (external transfer).
 - **Restrictions**: Router-only, sufficient balance.
-- **Internal Call Tree**: `denormalize`, `_updateRegistry`.
-- **Parameters/Interactions**: Uses `tokenA`, `tokenB`, `decimalsA`, `decimalsB`, `registryAddress`.
+- **Internal Call Tree**: `IERC20.transfer`, low-level `call`.
+- **Emits**: `TokensWithdrawn`.
 
-#### transactNative(uint256 amount, address recipient)
-- **Purpose**: Transfers ETH via `call`, updates `_balance`.
-- **State Changes**: `_balance.xBalance` or `yBalance`.
-- **Restrictions**: Router-only, sufficient balance, ETH supported.
-- **Internal Call Tree**: `denormalize`, `_updateRegistry`.
-- **Parameters/Interactions**: Uses `tokenA`, `tokenB`, `decimalsA`, `decimalsB`, `registryAddress`.
-
-#### ccUpdate(BuyOrderUpdate[] calldata buyUpdates, SellOrderUpdate[] calldata sellUpdates, BalanceUpdate[] calldata balanceUpdates, HistoricalUpdate[] calldata historicalUpdates)
-- **Purpose**: Updates balances, buy/sell orders, or historical data, callable by routers.
+#### ccUpdate(
+    BuyOrderUpdate[] calldata buyUpdates,
+    SellOrderUpdate[] calldata sellUpdates,
+    HistoricalUpdate[] calldata historicalUpdates
+)
+- **Purpose**: Updates buy/sell orders and historical data, callable by routers.
 - **Parameters**:
-  - `buyUpdates`: Array of `BuyOrderUpdate` (structId, orderId, makerAddress, recipientAddress, status, maxPrice, minPrice, pending, filled, amountSent).
-  - `sellUpdates`: Array of `SellOrderUpdate` (similar).
-  - `balanceUpdates`: Array of `BalanceUpdate` (xBalance, yBalance).
-  - `historicalUpdates`: Array of `HistoricalUpdate` (price, xBalance, yBalance, xVolume, yVolume, timestamp).
+  - `buyUpdates`: Array of `BuyOrderUpdate` (structId, orderId, addresses, prices, amounts, status).
+  - `sellUpdates`: Array of `SellOrderUpdate` (same).
+  - `historicalUpdates`: Array of `HistoricalUpdate` (per-pair price, volume, balance snapshot).
 - **Logic**:
   1. Verifies router caller.
   2. Processes buy updates via `_processBuyOrderUpdate`:
-     - `structId=0` (Core): Updates `buyOrderCore[orderId]`, manages `_pendingBuyOrders`, `makerPendingOrders`, emits `OrderUpdated`.
-     - `structId=1` (Pricing): Updates `buyOrderPricing[orderId]`.
-     - `structId=2` (Amounts): Updates `buyOrderAmounts[orderId]`, adds `filled` difference to `yVolume`, `amountSent` to `xVolume`.
-  3. Processes sell updates via `_processSellOrderUpdate` (similar, `xVolume` for `filled`, `yVolume` for `amountSent`).
-  4. Processes balance updates, sets `_balance`, emits `BalancesUpdated`.
-  5. Processes historical updates via `_processHistoricalUpdate`, pushes to `_historicalData`, updates `_dayStartIndices` if new day.
-  6. Checks `orderStatus` for completeness, emits `OrderUpdatesComplete` or `OrderUpdateIncomplete`.
-  7. If `balanceUpdated`, fetches pair balances via `IUniswapV2Pair`, `IERC20.balanceOf`.
-  8. Calls `globalizeUpdate`.
-- **State Changes**: `_balance`, `buyOrderCore`, `buyOrderPricing`, `buyOrderAmounts`, `sellOrderCore`, `sellOrderPricing`, `sellOrderAmounts`, `_pendingBuyOrders`, `_pendingSellOrders`, `makerPendingOrders`, `orderStatus`, `_historicalData`, `_dayStartIndices`.
-- **External Interactions**: `IUniswapV2Pair.token0`, `IERC20.balanceOf`, `ICCLiquidityTemplate.liquidityDetail`, `ITokenRegistry.initializeTokens`, `ICCGlobalizer.globalizeOrders`.
-- **Internal Call Tree**: `_processBuyOrderUpdate` (calls `removePendingOrder`, `_updateRegistry`), `_processSellOrderUpdate` (similar), `_updateHistoricalData` (called by `_processHistoricalUpdate`), `_updateDayStartIndex` (called by `_processHistoricalUpdate`), `_updateRegistry` (`ITokenRegistry.initializeTokens`), `globalizeUpdate` (`ICCGlobalizer.globalizeOrders`), `_floorToMidnight`, `_isSameDay`, `removePendingOrder`.
-- **Errors**: Emits `UpdateFailed`, `OrderUpdateIncomplete`, `OrderUpdatesComplete`, `ExternalCallFailed`, `RegistryUpdateFailed`, `GlobalUpdateFailed`.
+     - `structId=0` (Core): Updates order metadata, manages pending arrays, emits `OrderUpdated`.
+     - `structId=1` (Pricing): Updates price bounds.
+     - `structId=2` (Amounts): Updates amounts, adds `filled` diff to `yVolume`, `amountSent` diff to `xVolume` in latest `_historicalData` entry.
+  3. Processes sell updates via `_processSellOrderUpdate`:
+     - `structId=2`: Adds `filled` diff to `xVolume`, `amountSent` diff to `yVolume`.
+  4. **Removed**: Balance update loop and `BalancesUpdated` emission.
+  5. Processes historical updates via `_processHistoricalUpdate`:
+     - Validates price > 0.
+     - Appends to per-pair `_historicalData`.
+     - Updates `_dayStartIndices` if new day.
+  6. Checks `orderStatus` for completeness:
+     - Emits `OrderUpdatesComplete` if all parts present.
+     - Emits `OrderUpdateIncomplete` with missing part.
+  7. Calls `globalizeUpdate(lastMaker, lastToken)` if valid.
+- **State Changes**: 
+  - `buyOrders`, `sellOrders`, `orderStatus`
+  - `_pendingBuyOrders`, `_pendingSellOrders`, `makerPendingOrders`
+  - `_historicalData[token0][token1]`, `_dayStartIndices[token0][token1]`
+- **External Interactions**: 
+  - `ITokenRegistry.initializeTokens` (via `_updateRegistry`)
+  - `ICCGlobalizer.globalizeOrders` (via `globalizeUpdate`)
+- **Internal Call Tree**:
+  - `_processBuyOrderUpdate` → `removePendingOrder`, `_updateRegistry`, `_getTokenPair`
+  - `_processSellOrderUpdate` → `removePendingOrder`, `_updateRegistry`, `_getTokenPair`
+  - `_processHistoricalUpdate` → `_updateHistoricalData`, `_updateDayStartIndex`, `_getTokenPair`, `_floorToMidnight`
+  - `globalizeUpdate` → `ICCGlobalizer.globalizeOrders` (try/catch)
+- **Emits**: 
+  - `OrderUpdated`, `OrderUpdatesComplete`, `OrderUpdateIncomplete`
+  - `UpdateFailed`, `ExternalCallFailed`, `RegistryUpdateFailed`, `GlobalUpdateFailed`
 
 ### View Functions
-- **pendingBuyOrdersView**, **pendingSellOrdersView**: Return `_pendingBuyOrders`, `_pendingSellOrders`.
-- **routerAddressesView**: Returns `routerAddresses`.
-- **prices**: Computes price from `IUniswapV2Pair` balances.
-- **volumeBalances**: Returns real-time normalized balances.
-- **makerPendingBuyOrdersView**, **makerPendingSellOrdersView**: Return pending order IDs for a maker, using `maxIterations`.
-- **getBuyOrderCore**, **getBuyOrderPricing**, **getBuyOrderAmounts**: Return buy order details.
-- **getSellOrderCore**, **getSellOrderPricing**, **getSellOrderAmounts**: Return sell order details.
-- **makerOrdersView**, **makerPendingOrdersView**: Return maker order IDs.
-- **getHistoricalDataView**, **historicalDataLengthView**: Access `_historicalData`.
-- **getTokens**, **getNextOrderId**, **floorToMidnightView**, **isSameDayView**, **getDayStartIndex**: Utility views.
+- **pendingBuyOrdersView()**, **pendingSellOrdersView()**: Return pending order ID arrays.
+- **routerAddressesView()**: Returns `routerAddresses`.
+- **getNextOrderId()**: Returns `nextOrderId`.
+- **getBuyOrder(uint256 orderId)**, **getSellOrder(uint256 orderId)**: Return full order details.
+- **makerPendingOrdersView(address maker)**: Returns maker’s pending order IDs.
+- **getHistoricalDataView(address tokenA, address tokenB, uint256 index)**: Returns `HistoricalData` at index for pair.
+- **historicalDataLengthView(address tokenA, address tokenB)**: Returns length of `_historicalData` for pair.
+- **getDayStartIndex(address tokenA, address tokenB, uint256 midnight)**: Returns index of first entry on that day.
+- **prices(address tokenA, address tokenB)**: Returns current price from Uniswap pair (tokenB/tokenA in 1e18).
+- **floorToMidnightView(uint256)**, **isSameDayView(uint256, uint256)**: Utility timestamp functions.
+
+> **Note**: `volumeBalances()` has been **removed**. Use `prices()` or direct `IERC20.balanceOf` on the Uniswap pair for real-time reserves.
 
 ### Internal Functions
-#### normalize(uint256 amount, uint8 decimals) returns (uint256 normalized)
-- Normalizes amounts to 1e18 precision. Used in `ccUpdate`, `prices`, `volumeBalances`.
 
-#### denormalize(uint256 amount, uint8 decimals) returns (uint256 denormalized)
-- Denormalizes amounts to token decimals. Used in `transactToken`, `transactNative`.
+#### normalize(uint256 amount, uint8 decimals) returns (uint256)
+- Normalizes to 1e18. Used in `prices()` and historical data.
 
-#### _isSameDay(uint256 time1, uint256 time2) returns (bool sameDay)
-- Checks if timestamps are on the same day. Used in `ccUpdate`.
+#### denormalize(uint256 amount, uint8 decimals) returns (uint256)
+- Denormalizes from 1e18. Used in `withdrawToken`.
 
-#### _floorToMidnight(uint256 timestamp) returns (uint256 midnight)
-- Rounds timestamp to midnight UTC. Used in `setTokens`, `ccUpdate`, `_updateHistoricalData`.
+#### _isSameDay(uint256 time1, uint256 time2) returns (bool)
+- Compares day boundaries.
 
-#### _findVolumeChange(bool isA, uint256 startTime, uint256 maxIterations) returns (uint256 volumeChange)
-- Queries `_historicalData` for volume since `startTime`, using `maxIterations`.
+#### _floorToMidnight(uint256 timestamp) returns (uint256)
+- Rounds down to midnight UTC.
 
-#### _updateRegistry(address maker)
-- Updates `ITokenRegistry` with token balances. Called by `ccUpdate`, `transactToken`, `transactNative`.
+#### _getTokenPair(address tokenA, address tokenB) returns (address token0, address token1)
+- Returns canonical (lower, higher) token ordering.
 
-#### globalizeUpdate()
-- Notifies `ICCGlobalizer` of latest order. Called by `ccUpdate`.
+#### removePendingOrder(uint256[] storage orders, uint256 orderId)
+- Removes order ID from array (swap-pop).
+
+#### _updateRegistry(address maker, address[] memory tokens)
+- Calls `ITokenRegistry.initializeTokens` with try/catch.
+
+#### globalizeUpdate(address maker, address token)
+- Calls `ICCGlobalizer.globalizeOrders` with try/catch.
 
 #### _processBuyOrderUpdate(BuyOrderUpdate memory update)
-- Updates buy order structs, `_pendingBuyOrders`, `makerPendingOrders`, `_historicalData` volumes (`yVolume` for `filled`, `xVolume` for `amountSent`). Calls `removePendingOrder`, `_updateRegistry`.
+- Updates `buyOrders[orderId]` by `structId`, manages pending lists, updates volumes in latest `_historicalData` entry.
 
 #### _processSellOrderUpdate(SellOrderUpdate memory update)
-- Updates sell order structs, `_pendingSellOrders`, `makerPendingOrders`, `_historicalData` volumes (`xVolume` for `filled`, `yVolume` for `amountSent`). Calls `removePendingOrder`, `_updateRegistry`.
+- Same as buy, with swapped volume mapping (`filled` → `xVolume`, `amountSent` → `yVolume`).
 
 #### _updateHistoricalData(HistoricalUpdate memory update)
-- Pushes new `HistoricalData` entry with normalized balances if `xBalance` or `yBalance` is zero. Called by `_processHistoricalUpdate`.
+- Appends to `_historicalData[token0][token1]` with normalized timestamp.
 
-#### _updateDayStartIndex(uint256 timestamp)
-- Updates `_dayStartIndices` for new midnight timestamp. Called by `_processHistoricalUpdate`.
+#### _updateDayStartIndex(address tokenA, address tokenB, uint256 timestamp)
+- Sets `_dayStartIndices[token0][token1][midnight]` if unset.
 
-#### _processHistoricalUpdate(HistoricalUpdate memory update) returns (bool historicalUpdated)
-- Validates `price`, calls `_updateHistoricalData`, `_updateDayStartIndex`. Used in `ccUpdate`.
+#### _processHistoricalUpdate(HistoricalUpdate memory update) returns (bool)
+- Validates price, calls helpers, returns success.
 
 ## Parameters and Interactions
-- **Orders**: `ccUpdate` updates `_balance` (via `BalanceUpdate`), buy orders (input: tokenB `filled`, output: tokenA `amountSent`), sell orders (input: tokenA `filled`, output: tokenB `amountSent`). Tracked via `orderStatus`, emits `OrderUpdatesComplete` or `OrderUpdateIncomplete`.
-- **Price**: Computed via `IUniswapV2Pair`, `IERC20.balanceOf` in `prices`.
-- **Registry**: Updated via `_updateRegistry` with `tokenA`, `tokenB`.
-- **Globalizer**: Updated via `globalizeUpdate` with `maker`, `tokenA` or `tokenB`.
-- **Liquidity**: `ICCLiquidityTemplate.liquidityDetail` fetches fees, stored in `dayStartFee`.
-- **Historical Data**: Stored in `_historicalData` via `ccUpdate` or auto-generated.
-- **External Calls**: `IERC20.balanceOf`, `IERC20.transfer`, `IERC20.decimals`, `IUniswapV2Pair.token0`, `ICCLiquidityTemplate.liquidityDetail`, `ITokenRegistry.initializeTokens`, `ICCGlobalizer.globalizeOrders`, `ICCAgent.getLister`, `ICCAgent.getRouters`, low-level `call`.
-- **Security**: Router checks, try-catch, explicit casting, emits errors for failures.
-- **Optimization**: Struct-based `ccUpdate`, helper functions, `maxIterations`, auto-generated data.
+- **Orders**: 
+  - Buy: Input `filled` (tokenB), output `amountSent` (tokenA) → `yVolume += filled`, `xVolume += amountSent`
+  - Sell: Input `filled` (tokenA), output `amountSent` (tokenB) → `xVolume += filled`, `yVolume += amountSent`
+- **Price**: Computed via `IUniswapV2Factory.getPair` → `IUniswapV2Pair.token0/1` → `IERC20.balanceOf`.
+- **Registry**: Updated on new pending orders via `_updateRegistry`.
+- **Globalizer**: Notified on last updated maker/token.
+- **Historical Data**: Per-pair, append-only, volume diffs applied on amount updates.
+- **External Calls**: 
+  - `IERC20.balanceOf`, `IERC20.transfer`, `IERC20.decimals`
+  - `IUniswapV2Factory.getPair`, `IUniswapV2Pair.token0/1`
+  - `ITokenRegistry.initializeTokens`, `ICCGlobalizer.globalizeOrders`
+  - Low-level `call` for ETH withdrawal
+- **Security**: 
+  - Router-only `ccUpdate` and `withdrawToken`
+  - Try/catch with detailed error emission
+  - No stored balances — immune to sync issues
+  - Explicit casting, no inline assembly
+- **Optimization**: 
+  - Per-pair mappings reduce gas
+  - Helper functions for clarity and reuse
+  - No caps on iteration — user supplies `maxIterations` in views (if added later)
+  - Graceful degradation on external call failure
