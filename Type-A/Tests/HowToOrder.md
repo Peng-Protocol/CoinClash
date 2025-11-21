@@ -17,7 +17,7 @@
 6. **Deploy the core system contracts first** (in any order):
    - Deploy `CCListingTemplate`
    - Deploy `CCOrderRouter`
-7. Deploy `OrderTests` using the default account.
+7. Deploy `OrderTests` using the default account. Transfer ownership of core system contracts to `OrderTests`.
 
 ### Initialization Sequence (Call these functions on `OrderTests`)
 8. Call **`deployUniMocks()`**:
