@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.2.1
+// Version: 0.2.2
 // Changes:
-// - v0.2.1 (22/11/2025): Addee WETH stare variable and setter. 
+// - v0.2.2 (22/11/2035): Adjusted ETH handling in order cancellation. 
+// - v0.2.1 (22/11/2025): Added WETH stare variable and setter. 
 
 import "./CCMainPartial.sol";
 
@@ -179,78 +180,71 @@ address public wethAddress; // New state variable
     }
 
     function _clearOrderData(
-        uint256 orderId,
-        bool isBuy
-    ) internal {
-        // Clears order data, refunds pending amounts, sets status to cancelled
-        require(listingTemplate != address(0), "Listing template not set");
-        
-        ICCListing listingContract = ICCListing(listingTemplate);
-        
-        address[] memory addresses;
-        uint256[] memory amounts;
-        uint8 status;
-        
-        if (isBuy) {
-            (addresses,, amounts, status) = listingContract.getBuyOrder(orderId);
-        } else {
-            (addresses,, amounts, status) = listingContract.getSellOrder(orderId);
-        }
-        
-        require(addresses.length > 0, "Order not found");
-        require(addresses[0] == msg.sender, "Only maker can cancel");
-        
-        // Refund pending amount if order is pending or partially filled
-        if (amounts.length > 0 && amounts[0] > 0 && (status == 1 || status == 2)) {
-            address tokenAddress = addresses[2]; // startToken
-            address recipient = addresses[1];
-            
-            uint8 tokenDecimals = tokenAddress == address(0) ? 18 : IERC20(tokenAddress).decimals();
-            uint256 refundAmount = denormalize(amounts[0], tokenDecimals);
-            
-            if (tokenAddress == address(0)) {
-                // Refund native ETH
-                (bool success, ) = recipient.call{value: refundAmount}("");
-                require(success, "ETH refund failed");
-            } else {
-                // Refund ERC20 token via listing template withdrawal
-                listingContract.withdrawToken(tokenAddress, refundAmount, recipient);
-            }
-        }
-        
-        // Update order status to cancelled
-        if (isBuy) {
-            ICCListing.BuyOrderUpdate[] memory buyUpdates = new ICCListing.BuyOrderUpdate[](1);
-            buyUpdates[0] = ICCListing.BuyOrderUpdate({
-                structId: 0,
-                orderId: orderId,
-                addresses: new address[](0),
-                prices: new uint256[](0),
-                amounts: new uint256[](0),
-                status: 0 // cancelled
-            });
-            listingContract.ccUpdate(
-                buyUpdates, 
-                new ICCListing.SellOrderUpdate[](0), 
-                new ICCListing.HistoricalUpdate[](0)
-            );
-        } else {
-            ICCListing.SellOrderUpdate[] memory sellUpdates = new ICCListing.SellOrderUpdate[](1);
-            sellUpdates[0] = ICCListing.SellOrderUpdate({
-                structId: 0,
-                orderId: orderId,
-                addresses: new address[](0),
-                prices: new uint256[](0),
-                amounts: new uint256[](0),
-                status: 0 // cancelled
-            });
-            listingContract.ccUpdate(
-                new ICCListing.BuyOrderUpdate[](0), 
-                sellUpdates, 
-                new ICCListing.HistoricalUpdate[](0)
-            );
-        }
-        
-        emit OrderCancelled(orderId, msg.sender, isBuy);
+    uint256 orderId,
+    bool isBuy
+) internal {
+    // Clears order data, refunds pending amounts, sets status to cancelled
+    require(listingTemplate != address(0), "Listing template not set");
+    ICCListing listingContract = ICCListing(listingTemplate);
+    
+    address[] memory addresses;
+    uint256[] memory amounts;
+    uint8 status;
+    if (isBuy) {
+        (addresses,, amounts, status) = listingContract.getBuyOrder(orderId);
+    } else {
+        (addresses,, amounts, status) = listingContract.getSellOrder(orderId);
     }
+    
+    require(addresses.length > 0, "Order not found");
+    require(addresses[0] == msg.sender, "Only maker can cancel");
+    
+    // Refund pending amount if order is pending or partially filled
+    if (amounts.length > 0 && amounts[0] > 0 && (status == 1 || status == 2)) {
+        address tokenAddress = addresses[2]; // startToken
+        address recipient = addresses[1];
+        
+        uint8 tokenDecimals = tokenAddress == address(0) ? 18 : IERC20(tokenAddress).decimals();
+        uint256 refundAmount = denormalize(amounts[0], tokenDecimals);
+
+        // FIX: Always use withdrawToken, even for ETH (address(0)). 
+        // The Listing Template holds the funds and handles the logic for both.
+        listingContract.withdrawToken(tokenAddress, refundAmount, recipient);
+    }
+    
+    // Update order status to cancelled
+    if (isBuy) {
+        ICCListing.BuyOrderUpdate[] memory buyUpdates = new ICCListing.BuyOrderUpdate[](1);
+        buyUpdates[0] = ICCListing.BuyOrderUpdate({
+            structId: 0,
+            orderId: orderId,
+            addresses: new address[](0),
+            prices: new uint256[](0),
+            amounts: new uint256[](0),
+            status: 0 // cancelled
+        });
+        listingContract.ccUpdate(
+            buyUpdates, 
+            new ICCListing.SellOrderUpdate[](0), 
+            new ICCListing.HistoricalUpdate[](0)
+        );
+    } else {
+        ICCListing.SellOrderUpdate[] memory sellUpdates = new ICCListing.SellOrderUpdate[](1);
+        sellUpdates[0] = ICCListing.SellOrderUpdate({
+            structId: 0,
+            orderId: orderId,
+            addresses: new address[](0),
+            prices: new uint256[](0),
+            amounts: new uint256[](0),
+            status: 0 // cancelled
+        });
+        listingContract.ccUpdate(
+            new ICCListing.BuyOrderUpdate[](0), 
+            sellUpdates, 
+            new ICCListing.HistoricalUpdate[](0)
+        );
+    }
+    
+    emit OrderCancelled(orderId, msg.sender, isBuy);
+}
 }
