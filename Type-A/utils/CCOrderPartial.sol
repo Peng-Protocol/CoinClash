@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.2.0
+// Version: 0.2.1
 // Changes:
-// - v0.2.0: Complete refactor for monolithic listing template compatibility (v0.4.2).
-// - Updated _executeSingleOrder to use array-based order structure with addresses[], prices[], amounts[].
-// - Added startToken/endToken to order structs, stored in addresses[2] and addresses[3].
-// - Updated _clearOrderData to work with array-based getBuyOrder/getSellOrder functions.
-// - Removed liquidity-related transfer functions (moved to separate liquidity router).
-// - Streamlined for consolidated order creation flow with single listing template.
-// Compatible with CCListingTemplate.sol (v0.4.2), CCOrderRouter.sol (v0.2.0).
+// - v0.2.1 (22/11/2025): Addee WETH stare variable and setter. 
 
 import "./CCMainPartial.sol";
 
@@ -19,6 +13,8 @@ contract CCOrderPartial is CCMainPartial {
     event OrderCancelled(uint256 indexed orderId, address indexed maker, bool isBuy);
 
     error InsufficientAllowance(address sender, address token, uint256 required, uint256 available);
+
+address public wethAddress; // New state variable
 
     struct OrderPrep {
         address maker;
@@ -31,6 +27,11 @@ contract CCOrderPartial is CCMainPartial {
         uint256 amountReceived;
         uint256 normalizedReceived;
     }
+    
+    function setWETH(address _weth) external onlyOwner {
+    // Simple setter to allow testing with MockWETH
+    wethAddress = _weth;
+}
 
     function _handleOrderPrep(
         address maker,

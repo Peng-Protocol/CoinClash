@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.2.0
+// Version: 0.2.1
 // Changes:
-// - v0.2.0: Major refactor for monolithic listing template compatibility.
-// - Consolidated createTokenBuyOrder/createNativeBuyOrder into createBuyOrder, and createTokenSellOrder/createNativeSellOrder into createSellOrder.
-// - Added Uniswap V2 pair validation via _validateUniswapPair to ensure liquidity exists before order creation.
-// - Streamlined _validateAndTransfer to handle both native and ERC20 transfers.
-// - Updated to work with array-based order structure (addresses[], prices[], amounts[]) and startToken/endToken fields.
-// Compatible with CCListingTemplate.sol (v0.4.2), CCOrderPartial.sol (v0.2.0), CCMainPartial.sol (v0.2.0).
+// - v0.2.1 (21/11/2025): Now uses dynamic WETH address, transfers principal to listing. 
 
 import "./utils/CCOrderPartial.sol";
 
@@ -98,31 +93,43 @@ contract CCOrderRouter is CCOrderPartial {
     }
 
     function _validateAndTransfer(
-        address token,
-        address from,
-        uint256 inputAmount,
-        bool isNative
-    ) internal returns (uint256 amountReceived, uint256 normalizedReceived) {
-        // Unified transfer validation for both native and ERC20 tokens
-        // Transfers to this contract, not to listing template
-        if (isNative) {
-            require(msg.value == inputAmount, "Incorrect ETH amount");
-            amountReceived = msg.value;
-            normalizedReceived = normalize(amountReceived, 18);
-            require(amountReceived > 0, "No ETH received");
-        } else {
-            require(token != address(0), "Token must be ERC20");
-            uint8 tokenDecimals = IERC20(token).decimals();
-            uint256 allowance = IERC20(token).allowance(from, address(this));
-            require(allowance >= inputAmount, "Insufficient token allowance");
-            uint256 preBalance = IERC20(token).balanceOf(address(this));
-            IERC20(token).transferFrom(from, address(this), inputAmount);
-            uint256 postBalance = IERC20(token).balanceOf(address(this));
-            amountReceived = postBalance > preBalance ? postBalance - preBalance : 0;
-            normalizedReceived = amountReceived > 0 ? normalize(amountReceived, tokenDecimals) : 0;
-            require(amountReceived > 0, "No tokens received");
-        }
+    address token,
+    address from,
+    uint256 inputAmount,
+    bool isNative
+) internal returns (uint256 amountReceived, uint256 normalizedReceived) {
+    // Unified transfer validation for both native and ERC20 tokens
+    // Transfers to this contract, AND forwards to listing template
+    if (isNative) {
+        require(msg.value == inputAmount, "Incorrect ETH amount");
+        amountReceived = msg.value;
+        normalizedReceived = normalize(amountReceived, 18);
+        require(amountReceived > 0, "No ETH received");
+
+        // FIX: Forward ETH to listing template so it holds the funds for refunds
+        (bool success,) = listingTemplate.call{value: amountReceived}("");
+        require(success, "ETH forwarding failed");
+    } else {
+        require(token != address(0), "Token must be ERC20");
+        uint8 tokenDecimals = IERC20(token).decimals();
+        
+        // Transfer from user to Router first
+        uint256 allowance = IERC20(token).allowance(from, address(this));
+        require(allowance >= inputAmount, "Insufficient token allowance");
+        
+        uint256 preBalance = IERC20(token).balanceOf(address(this));
+        IERC20(token).transferFrom(from, address(this), inputAmount);
+        uint256 postBalance = IERC20(token).balanceOf(address(this));
+        
+        amountReceived = postBalance > preBalance ? postBalance - preBalance : 0;
+        normalizedReceived = amountReceived > 0 ? normalize(amountReceived, tokenDecimals) : 0;
+        
+        require(amountReceived > 0, "No tokens received");
+
+        // FIX: Forward Tokens to listing template so it holds the funds for refunds
+        IERC20(token).transfer(listingTemplate, amountReceived);
     }
+}
 
     function _validateUniswapPair(address tokenA, address tokenB) internal view {
         // Validates that Uniswap V2 pair exists with non-zero reserves
@@ -143,10 +150,10 @@ contract CCOrderRouter is CCOrderPartial {
         require(reserve0 > 0 && reserve1 > 0, "Uniswap pair has no liquidity");
     }
 
-    function _getWETH() internal pure returns (address) {
-        // Returns WETH address - should be configurable per chain
-        return address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2); // Mainnet WETH
-    }
+    function _getWETH() internal view returns (address) {
+    // Returns configured WETH or defaults to Mainnet if not set
+    return wethAddress != address(0) ? wethAddress : address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+}
 
     function clearSingleOrder(uint256 orderIdentifier, bool isBuyOrder) 
         external 
