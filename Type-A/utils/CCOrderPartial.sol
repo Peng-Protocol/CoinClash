@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.2.2
+// Version: 0.2.3
 // Changes:
+// - v0.2.3 (22/11/2025): Cancellation logic; pass correct addresses. 
 // - v0.2.2 (22/11/2035): Adjusted ETH handling in order cancellation. 
 // - v0.2.1 (22/11/2025): Added WETH stare variable and setter. 
 
@@ -203,22 +204,21 @@ address public wethAddress; // New state variable
     if (amounts.length > 0 && amounts[0] > 0 && (status == 1 || status == 2)) {
         address tokenAddress = addresses[2]; // startToken
         address recipient = addresses[1];
-        
         uint8 tokenDecimals = tokenAddress == address(0) ? 18 : IERC20(tokenAddress).decimals();
         uint256 refundAmount = denormalize(amounts[0], tokenDecimals);
-
-        // FIX: Always use withdrawToken, even for ETH (address(0)). 
-        // The Listing Template holds the funds and handles the logic for both.
+        
+        // Withdraw from template (handles both ETH and Tokens)
         listingContract.withdrawToken(tokenAddress, refundAmount, recipient);
     }
     
     // Update order status to cancelled
+    // FIX: Pass the 'addresses' array back so the template knows which Maker to update!
     if (isBuy) {
         ICCListing.BuyOrderUpdate[] memory buyUpdates = new ICCListing.BuyOrderUpdate[](1);
         buyUpdates[0] = ICCListing.BuyOrderUpdate({
             structId: 0,
             orderId: orderId,
-            addresses: new address[](0),
+            addresses: addresses, // <--- CHANGED from new address[](0)
             prices: new uint256[](0),
             amounts: new uint256[](0),
             status: 0 // cancelled
@@ -233,7 +233,7 @@ address public wethAddress; // New state variable
         sellUpdates[0] = ICCListing.SellOrderUpdate({
             structId: 0,
             orderId: orderId,
-            addresses: new address[](0),
+            addresses: addresses, // <--- CHANGED from new address[](0)
             prices: new uint256[](0),
             amounts: new uint256[](0),
             status: 0 // cancelled
