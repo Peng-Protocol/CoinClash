@@ -137,10 +137,11 @@ contract SettlementTests {
         emit ContractsSet(_orderRouter, _settlementRouter, _listing);
     }
 
-    function initializeContracts() external {
+    function initializeContracts() external payable {
         require(msg.sender == owner, "Not owner");
         require(address(listingTemplate) != address(0), "Contracts not set");
         require(address(uniFactory) != address(0), "Uni mocks not deployed");
+        require(msg.value >= 2 ether, "Insufficient ETH sent");
 
         listingTemplate.addRouter(address(orderRouter));
         listingTemplate.addRouter(address(settlementRouter));
@@ -170,9 +171,14 @@ contract SettlementTests {
         listingTemplate.transferOwnership(msg.sender);
     }
 
-    function initiateTester() public {
+    function initiateTester() public payable {
         require(msg.sender == owner, "Not owner");
+        require(msg.value == 1 ether, "Send 1 ETH");
+        
         tester = new MockMailTester(address(this));
+        
+        // Fund tester with ETH
+        (bool success,) = address(tester).call{value: 1 ether}("");
         token18.mint(address(tester), TOKEN18_AMOUNT);
         token6.mint(address(tester), TOKEN6_AMOUNT);
     }

@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.4.0 (Monolithic Listing Alignment - Array-Based Interface)
+// Version: 0.4.1 (24/11/2025)
 // Changes:
-// - Aligned with monolithic listing template v0.4.2
-// - Updated to use array-based getBuyOrder/getSellOrder interface
-// - Orders carry token paths in addresses array: [maker, recipient, startToken, endToken]
-// - Removed individual getter calls (Core, Pricing, Amounts) - now single getBuyOrder/getSellOrder
-// - Settlement uses order-specific token information from addresses array
-// - Router expects pre-calculated amounts from off-chain in NORMALIZED (18 decimal) format
+// - (24/11/2035): Fixed pair fletching in _getPairAddress
 
 import "./utils/CCSettlementPartial.sol";
 
@@ -255,7 +250,7 @@ contract CCSettlementRouter is CCSettlementPartial {
     }
     
     /**
-     * @notice Gets Uniswap V2 pair address for token pair
+     * 0.4.1: Fetches from factory instead of deterministic calculation.
      */
     function _getPairAddress(
         ICCListing listingContract,
@@ -265,14 +260,21 @@ contract CCSettlementRouter is CCSettlementPartial {
         address factory = listingContract.uniswapV2Factory();
         require(factory != address(0), "Factory not set");
         
-        // Calculate pair address using Uniswap V2 formula
+        // Handle Native/WETH conversion if necessary for the lookup
+        // (Assuming factory uses WETH for native pairs)
+        // Check if tokens are address(0) and map to WETH if your factory expects that, 
+        // OR if your system handles address(0) explicitly before this call.
+        // Based on your context, tokens here seem to be actual ERC20s (WETH/Token) 
+        // derived from settlementContext.
+        
+        // Sort tokens just to be safe, though getPair usually handles it or doesn't care depending on implementation
         (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
-        address pair = address(uint160(uint256(keccak256(abi.encodePacked(
-            hex'ff',
-            factory,
-            keccak256(abi.encodePacked(token0, token1)),
-            hex'96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f' // Uniswap V2 init code hash
-        )))));
+
+        // DIRECT CALL TO FACTORY
+        address pair = IUniswapV2Factory(factory).getPair(token0, token1);
+        
+        // Ensure pair exists to avoid returning address(0) which causes the zero reserve error later
+        require(pair != address(0), "Pair does not exist");
         
         return pair;
     }
