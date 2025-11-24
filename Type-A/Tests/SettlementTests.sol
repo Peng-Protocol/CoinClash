@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.2 (23/11/2025)
-// 0.0.2 (23/11/2035): Comprehensive settlement testing with consolidated paths
-// Refactored to include "Seesaw" price impact testing and merged verification logic
+// File Version: 0.0.3 (24/11/2025)
+// 0.0.3 (24/11/2035): Added MockUniRouter state and setup. 
 
 import "./MockMAILToken.sol";
 import "./MockMailTester.sol";
-import "./MockUniFactory.sol";
-import "./MockUniPair.sol";
 import "./MockWETH.sol";
+import "./MockUniRouter.sol";
 
 interface ICCOrderRouter {
     function setListingTemplate(address) external;
@@ -69,6 +67,7 @@ contract SettlementTests {
     ICCListingTemplate public listingTemplate;
     MockUniFactory public uniFactory;
     MockWETH public weth;
+    MockUniRouter public uniRouter; // New state variable
     
     MockMAILToken public token18; // 18 decimals
     MockMAILToken public token6;  // 6 decimals
@@ -118,6 +117,8 @@ contract SettlementTests {
         require(msg.sender == owner, "Not owner");
         weth = new MockWETH();
         uniFactory = new MockUniFactory(address(weth));
+                // Deploy the new Router
+        uniRouter = new MockUniRouter(address(uniFactory), address(weth));
     }
 
     function setCCContracts(
@@ -152,7 +153,8 @@ contract SettlementTests {
         orderRouter.setWETH(address(weth));
         
         listingTemplate.setUniswapV2Factory(address(uniFactory));
-        listingTemplate.setUniswapV2Router(address(uniFactory));
+        // Correctly set the Router
+        listingTemplate.setUniswapV2Router(address(uniRouter)); 
 
         _createPairWithLiquidity();
     }

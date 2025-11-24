@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.1 (21/11/2025)
+// File Version: 0.0.2 (24/11/2025)
 // Changelog:
-// - 21/11/2025: Initial MockUniPair with simplified liquidity management
+// - 24/11/2025: Added Swap function
 
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -144,6 +144,38 @@ contract MockUniPair {
 
     function min(uint256 x, uint256 y) internal pure returns (uint256 z) {
         z = x < y ? x : y;
+    }
+    
+    // 0.0.2 : Added Swap function
+    
+    function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external {
+        require(amount0Out > 0 || amount1Out > 0, "MockPair: Insufficient output amount");
+        
+        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
+        require(amount0Out < _reserve0 && amount1Out < _reserve1, "MockPair: Insufficient liquidity");
+
+        uint balance0;
+        uint balance1;
+        { // scope for _token{0,1}, avoids stack too deep errors
+        address _token0 = token0;
+        address _token1 = token1;
+        require(to != _token0 && to != _token1, "MockPair: INVALID_TO");
+        
+        if (amount0Out > 0) {
+             if (_token0 == address(0)) payable(to).transfer(amount0Out);
+             else IERC20(_token0).transfer(to, amount0Out);
+        }
+        if (amount1Out > 0) {
+             if (_token1 == address(0)) payable(to).transfer(amount1Out);
+             else IERC20(_token1).transfer(to, amount1Out);
+        }
+        
+        balance0 = _token0 == address(0) ? address(this).balance : IERC20(_token0).balanceOf(address(this));
+        balance1 = _token1 == address(0) ? address(this).balance : IERC20(_token1).balanceOf(address(this));
+        }
+        
+        _update(balance0, balance1);
+        // Note: Sync/emit Swap event if needed, but not strictly required for this crash
     }
 
     receive() external payable {}

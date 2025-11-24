@@ -26,7 +26,7 @@
 
 ### Call these functions on the deployed `SettlementTests` contract
 9. **`deployUniMocks()`**  
-   Deploys `MockWETH` and `MockUniFactory`.
+   Deploys `MockWETH`, `MockUniFactory` and `MockUniRouter`.
 
 10. **`setCCContracts(orderRouterAddr, settlementRouterAddr, listingAddr)`**  
     Paste the exact deployed addresses of `CCOrderRouter`, `CCSettlementRouter`, and `CCListingTemplate`.
@@ -36,7 +36,7 @@
     - Sets WETH & Uniswap factory/router  
     - Creates and funds the Token18 ↔ Token6 liquidity pair
 
-12. **`initiateTester()`** (send ≥ 1 ETH value)  
+12. **`initiateTester()`** (send 1 ETH value)  
     - Deploys `MockMailTester` (the `tester` account used in all paths)  
     - Mints 1000 Token18 + 1000 Token6 to tester  
     - Funds tester with 1 ETH
