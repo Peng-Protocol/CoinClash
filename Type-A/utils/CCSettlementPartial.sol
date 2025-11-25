@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.4.0 (Monolithic Listing Alignment - Array-Based Interface)
+// Version: 0.4.1 (25/11/2025)
 // Changes:
-// - Aligned with monolithic listing template v0.4.2
-// - Updated to use array-based getBuyOrder/getSellOrder interface
-// - _checkPricing now takes token addresses and prices array as parameters
-// - Settlement uses order-specific token information from unified getter
-// - Removed individual Core/Pricing/Amounts getter calls
+// - (25/11/2025): Fixed buy side normalization source. 
 
 import "./CCUniPartial.sol";
 
@@ -44,35 +40,42 @@ contract CCSettlementPartial is CCUniPartial {
         return true;
     }
 
-    function _processBuyOrder(
-        address listingAddress,
-        uint256 orderIdentifier,
-        uint256 amountIn,
-        ICCListing listingContract,
-        SettlementContext memory settlementContext
-    ) internal returns (ICCListing.BuyOrderUpdate[] memory buyUpdates) {
-        // Get order data - amounts[0] = pending, amounts[1] = filled, amounts[2] = amountSent
-        (address[] memory addresses, , uint256[] memory amounts, uint8 status) = 
-            listingContract.getBuyOrder(orderIdentifier);
-        
-        uint256 pendingAmount = amounts[0]; // Normalized to 18 decimals
-        
-        if (status != 1 || pendingAmount == 0) {
-            emit OrderSkipped(orderIdentifier, "Invalid status or no pending amount");
-            return new ICCListing.BuyOrderUpdate[](0);
-        }
-        
-        if (amountIn == 0) {
-            emit OrderSkipped(orderIdentifier, "Zero swap amount");
-            return new ICCListing.BuyOrderUpdate[](0);
-        }
-        
-        // Denormalize amountIn for actual token transfer
-        _prepBuyOrderUpdate(listingAddress, orderIdentifier, denormalize(amountIn, settlementContext.decimalsB), settlementContext);
-        
-        // Execute swap and create updates
-        return _executePartialBuySwap(listingAddress, orderIdentifier, amountIn, pendingAmount, addresses, amounts, settlementContext);
+// 0.4.1 fixed normalization source
+
+function _processBuyOrder(
+    address listingAddress,
+    uint256 orderIdentifier,
+    uint256 amountIn,
+    ICCListing listingContract,
+    SettlementContext memory settlementContext
+) internal returns (ICCListing.BuyOrderUpdate[] memory buyUpdates) {
+    // Get order data - amounts[0] = pending, amounts[1] = filled, amounts[2] = amountSent
+    (address[] memory addresses, , uint256[] memory amounts, uint8 status) = 
+        listingContract.getBuyOrder(orderIdentifier);
+    
+    uint256 pendingAmount = amounts[0]; // Normalized to 18 decimals
+    
+    if (status != 1 || pendingAmount == 0) {
+        emit OrderSkipped(orderIdentifier, "Invalid status or no pending amount");
+        return new ICCListing.BuyOrderUpdate[](0);
     }
+    
+    if (amountIn == 0) {
+        emit OrderSkipped(orderIdentifier, "Zero swap amount");
+        return new ICCListing.BuyOrderUpdate[](0);
+    }
+    
+    // Denormalize amountIn for actual token transfer
+    // FIX: Use settlementContext.decimalsA, which is the decimals of the swap's input token (TokenA/Output Token)
+    _prepBuyOrderUpdate(
+        listingAddress, 
+        orderIdentifier, 
+        denormalize(amountIn, settlementContext.decimalsA), // <<< ADJUSTED LINE
+        settlementContext
+    );
+    // Execute swap and create updates
+    return _executePartialBuySwap(listingAddress, orderIdentifier, amountIn, pendingAmount, addresses, amounts, settlementContext);
+}
 
     function _processSellOrder(
         address listingAddress,
@@ -98,6 +101,7 @@ contract CCSettlementPartial is CCUniPartial {
         }
         
         // Execute swap and create updates
+        // Similar functionality to buy side equivalent  but delegated
         return _executePartialSellSwap(listingAddress, orderIdentifier, amountIn, pendingAmount, addresses, amounts, settlementContext);
     }
 }
