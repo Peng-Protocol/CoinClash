@@ -222,9 +222,4 @@ contract CCMainPartial is ReentrancyGuard {
         require(_listingTemplate != address(0), "Invalid template address");
         listingTemplate = _listingTemplate;
     }
-
-    function listingTemplateView() external view returns (address) {
-        // Returns listing template address
-        return listingTemplate;
-    }
 }
