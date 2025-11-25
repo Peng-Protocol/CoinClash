@@ -16,7 +16,7 @@
 5. Ensure the default account has **at least 5 ETH** (used for liquidity & tester funding).
 
 ### Deployment & Initialization Order
-6. Deploy the core system contracts (any order):
+6. If not already deployed, deploy the core system contracts (any order):
    - `CCListingTemplate`
    - `CCOrderRouter`
    - `CCSettlementRouter`
@@ -28,13 +28,18 @@
 9. **`deployUniMocks()`**  
    Deploys `MockWETH`, `MockUniFactory` and `MockUniRouter`.
 
-10. **`setCCContracts(orderRouterAddr, settlementRouterAddr, listingAddr)`**  
-    Paste the exact deployed addresses of `CCOrderRouter`, `CCSettlementRouter`, and `CCListingTemplate`.
+10. Call the **three new granular setters** on `SettlementTests` (in any order):
+  - setOrderRouter(CCOrderRouter address)
+  
+   - setSettlementRouter(CCSettlementRouter address)
+   - setListingTemplate(CCListingTemplate address)
 
-11. **`initializeContracts()`** (send ≥ 2 ETH value)  
-    - Links all contracts together  
-    - Sets WETH & Uniswap factory/router  
-    - Creates and funds the Token18 ↔ Token6 liquidity pair
+11. Call **`initializeContracts()`** → send **≥ 2 ETH**  
+    This function is now **state aware**:
+    - Adds routers to ListingTemplate only if missing
+    - Sets `listingTemplate`, `wethAddress`, factory, and router only if still zero
+    - Creates the Token18 ↔ Token6 pair only once
+    - Safe to call repeatedly (perfect for Remix pinning workflow).
 
 12. **`initiateTester()`** (send 1 ETH value)  
     - Deploys `MockMailTester` (the `tester` account used in all paths)  
