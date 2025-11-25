@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.4.1 (25/11/2025)
+// Version: 0.4.1 (26/11/2025)
 // Changes:
-// - (25/11/2025): Fixed buy side normalization source. 
+// - (26/11/2025): Removed erroneous settler billing in buy order settlement. 
 
 import "./CCUniPartial.sol";
 
@@ -40,12 +40,12 @@ contract CCSettlementPartial is CCUniPartial {
         return true;
     }
 
-// 0.4.1 fixed normalization source
+// 0.4.1 fixed billing, does not bill settler, uses listing template balance. 
 
 function _processBuyOrder(
     address listingAddress,
     uint256 orderIdentifier,
-    uint256 amountIn,
+    uint256 amountIn, // <--- NOW represents the normalized amount of Token B (Listing's/Buyer's token) to swap.
     ICCListing listingContract,
     SettlementContext memory settlementContext
 ) internal returns (ICCListing.BuyOrderUpdate[] memory buyUpdates) {
@@ -53,7 +53,7 @@ function _processBuyOrder(
     (address[] memory addresses, , uint256[] memory amounts, uint8 status) = 
         listingContract.getBuyOrder(orderIdentifier);
     
-    uint256 pendingAmount = amounts[0]; // Normalized to 18 decimals
+    uint256 pendingAmount = amounts[0]; // Normalized Token B pending
     
     if (status != 1 || pendingAmount == 0) {
         emit OrderSkipped(orderIdentifier, "Invalid status or no pending amount");
@@ -65,14 +65,8 @@ function _processBuyOrder(
         return new ICCListing.BuyOrderUpdate[](0);
     }
     
-    // Denormalize amountIn for actual token transfer
-    // FIX: Use settlementContext.decimalsA, which is the decimals of the swap's input token (TokenA/Output Token)
-    _prepBuyOrderUpdate(
-        listingAddress, 
-        orderIdentifier, 
-        denormalize(amountIn, settlementContext.decimalsA), // <<< ADJUSTED LINE
-        settlementContext
-    );
+    // CRITICAL CHANGE: Removed the call to _prepBuyOrderUpdate which incorrectly pulled Token A from the Settler.
+    
     // Execute swap and create updates
     return _executePartialBuySwap(listingAddress, orderIdentifier, amountIn, pendingAmount, addresses, amounts, settlementContext);
 }

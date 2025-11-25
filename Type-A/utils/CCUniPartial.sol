@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.4.3 (12/11)
+// Version: 0.4.4 (25/11/2025)
 // Changes:
-// - Fixed "Stack too deep" in _computeSwapImpact via helper structs + reduced local vars
-// - Aligned with monolithic listing template v0.4.2
-// - Updated to use array-based order data (addresses, prices, amounts)
-// - BuyOrderUpdate/SellOrderUpdate now use array structures
-// - Removed individual field access, using array indices instead
-// - MAINTAINED: All normalize/denormalize conversions
+// - Corrected buy order settlement path.
 
 import "./CCMainPartial.sol";
 
@@ -133,32 +128,23 @@ struct SwapMath {
     amountSent = address(this).balance - preBalance;
 }
 
+// (0.4.4) This function is now responsible for withdrawing the swap input token (Token B) from the Listing Template.
 function _prepBuyOrderUpdate(
     address listingAddress,
     uint256 orderIdentifier,
-    uint256 amountReceived,
+    uint256 denormAmountIn, // Denormalized Token B amount
     SettlementContext memory settlementContext
-) internal returns (uint256 amountSent) {
-    ICCListing listingContract = ICCListing(listingAddress);
+) internal {
+    // Set token context for withdrawal (Token B is the token being withdrawn from Listing)
+    address tokenToWithdraw = settlementContext.tokenB; 
     
-    // Get order amounts to verify pending
-    (, , uint256[] memory amounts, uint8 orderStatus) = listingContract.getBuyOrder(orderIdentifier);
-    if (amounts[0] == 0) revert(string(abi.encodePacked("No pending amount for buy order ", uint2str(orderIdentifier))));
-    if (orderStatus != 1) revert(string(abi.encodePacked("Invalid status for buy order ", uint2str(orderIdentifier), ": ", uint2str(orderStatus))));
-    
-    (address tokenAddress, ) = _getTokenAndDecimals(true, settlementContext);
-    uint256 preBalance = tokenAddress == address(0) ? address(this).balance : IERC20(tokenAddress).balanceOf(address(this));
-    
-    if (tokenAddress == address(0)) {
-        amountSent = _callWithdrawNative(listingContract, tokenAddress, amountReceived, preBalance);
-    } else {
-        try listingContract.withdrawToken(tokenAddress, amountReceived, address(this)) {
-            amountSent = IERC20(tokenAddress).balanceOf(address(this)) - preBalance;
-        } catch Error(string memory reason) {
-            revert(string(abi.encodePacked("Token transfer failed for buy order ", uint2str(orderIdentifier), ": ", reason)));
-        }
+    // Perform the transfer from the Listing address (must have approved this Router)
+    // to this contract (the Router) for the swap input.
+    if (!IERC20(tokenToWithdraw).transferFrom(listingAddress, address(this), denormAmountIn)) {
+        // Construct a specific revert message for clarity
+        string memory errorMessage = string(abi.encodePacked("Token transfer failed for buy order ", uint2str(orderIdentifier), ": Listing withdrawal failed"));
+        revert(errorMessage); 
     }
-    if (amountSent == 0) revert(string(abi.encodePacked("No tokens received for buy order ", uint2str(orderIdentifier))));
 }
 
 function _prepSellOrderUpdate(
@@ -243,34 +229,46 @@ function _computeSwapImpact(
     amountOut = denormalize(normalizedAmountOut, reserves.decimalsOut);
 }
 
-    function _prepareSwapData(
-        address listingAddress,
-        uint256 orderIdentifier,
-        uint256 amountIn,
-        address[] memory addresses,
-        SettlementContext memory settlementContext
-    ) internal view returns (SwapContext memory context, address[] memory path) {
-        ICCListing listingContract = ICCListing(listingAddress);
-        
-        // addresses[0] = maker, addresses[1] = recipient
-        context.makerAddress = addresses[0];
-        context.recipientAddress = addresses[1];
-        context.listingContract = listingContract;
-        context.tokenIn = settlementContext.tokenB;
-        context.tokenOut = settlementContext.tokenA;
-        context.decimalsIn = settlementContext.decimalsB;
-        context.decimalsOut = settlementContext.decimalsA;
-        
-        // Denormalize amountIn from 18 decimals to actual token decimals
-        context.denormAmountIn = denormalize(amountIn, context.decimalsIn);
-        
-        (context.price, context.expectedAmountOut) = _computeSwapImpact(context.denormAmountIn, true, settlementContext);
-        context.denormAmountOutMin = context.expectedAmountOut * 95 / 100;
-        
-        path = new address[](2);
-        path[0] = context.tokenIn;
-        path[1] = context.tokenOut;
+    // (0.4.4)
+
+function _prepareBuySwapData(
+    address listingAddress,
+    uint256 orderIdentifier,
+    uint256 amountIn, // Normalized amount of Token B (Swap Input)
+    address[] memory addresses,
+    SettlementContext memory settlementContext
+) internal view returns (SwapContext memory context, address[] memory path) {
+    // addresses[2] = Token A (Output), addresses[3] = Token B (Input)
+    context.listingContract = ICCListing(listingAddress);
+    context.makerAddress = addresses[0];
+    context.recipientAddress = addresses[1];
+    
+    // SWAP DIRECTION: Token B -> Token A (Buy order: pay B, receive A)
+    context.tokenIn = addresses[3];  // Token B
+    context.tokenOut = addresses[2]; // Token A
+
+    context.decimalsIn = settlementContext.decimalsB;
+    context.decimalsOut = settlementContext.decimalsA;
+
+    // Denormalize input amount for actual transfer/swap
+    context.denormAmountIn = denormalize(amountIn, context.decimalsIn); 
+
+    // === FIXED: Use correct on-chain swap impact calculation ===
+    (context.price, context.expectedAmountOut) = _computeSwapImpact(
+        context.denormAmountIn, true, settlementContext);
+
+    if (context.price == 0) {
+        revert("Invalid price from swap impact calculation");
     }
+
+    // Apply 5% slippage tolerance (95% of expected)
+    context.denormAmountOutMin = context.expectedAmountOut * 95 / 100;
+
+    // Simple direct path: Token B → Token A
+    path = new address[](2);
+    path[0] = context.tokenIn;
+    path[1] = context.tokenOut;
+}
 
     function _prepareSellSwapData(
         address listingAddress,
@@ -462,34 +460,54 @@ function _computeSwapImpact(
             buyUpdates = new ICCListing.BuyOrderUpdate[](0);
         }
     }
-
+ 
+// ADJUSTED (0.4.4) _executePartialBuySwap (Logic replaced to mirror Sell Order flow)
+  // – correct tuple unpacking
     function _executePartialBuySwap(
         address listingAddress,
         uint256 orderIdentifier,
-        uint256 amountIn,
-        uint256 pendingAmount,
+        uint256 amountIn,          // Normalized amount of Token B (Swap Input)
+        uint256 pendingAmount,     // Normalized pending amount of Token B
         address[] memory addresses,
         uint256[] memory amounts,
         SettlementContext memory settlementContext
     ) internal returns (ICCListing.BuyOrderUpdate[] memory buyUpdates) {
-        (SwapContext memory context, address[] memory path) = _prepareSwapData(listingAddress, orderIdentifier, amountIn, addresses, settlementContext);
+
+        settlementContext.tokenA = addresses[2]; 
+        settlementContext.tokenB = addresses[3]; 
+
+        (SwapContext memory context, address[] memory path) = _prepareBuySwapData(
+            listingAddress, 
+            orderIdentifier, 
+            amountIn,
+            addresses, 
+            settlementContext
+        );
+        
         if (context.price == 0) {
             emit OrderSkipped(orderIdentifier, "Zero price in swap data");
             return new ICCListing.BuyOrderUpdate[](0);
         }
         
-        uint256 amountOut = _performSwap(context, path, context.tokenIn == address(0), context.tokenOut == address(0));
+        _prepBuyOrderUpdate(listingAddress, orderIdentifier, context.denormAmountIn, settlementContext); 
+
+        uint256 amountOut = _performSwap(
+            context, 
+            path, 
+            context.tokenIn == address(0), 
+            context.tokenOut == address(0) 
+        );
         
-        // amounts[1] = filled, amounts[2] = priorAmountSent
-        (buyUpdates,) = _createOrderUpdates(
+        // FIXED: correctly unpack only the buy updates (discard sell updates)
+        (buyUpdates, ) = _createOrderUpdates(
             orderIdentifier,
             addresses,
             pendingAmount,
-            amounts[1],
+            amounts[1],      // filled
             amountIn,
             amountOut,
-            amounts[2],
-            true,
+            amounts[2],      // priorAmountSent
+            true,            // isBuyOrder
             context.decimalsOut
         );
     }
