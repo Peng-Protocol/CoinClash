@@ -169,7 +169,7 @@ interface ICCLiquidity {
 }
 
 contract CCMainPartial is ReentrancyGuard {
-    address internal listingTemplate; // Single monolithic listing template
+    address public listingTemplate; // Single monolithic listing template
 
     struct BuyOrderDetails {
         uint256 orderId;

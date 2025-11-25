@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.3 (24/11/2025)
-// 0.0.3 (24/11/2035): Added MockUniRouter state and setup. 
+// File Version: 0.0.4 (25/11/2025)
+// 0.0.4 (25/11/2025): Split setCCContracts into three granular setters + added initialization guards. Contracts can be dynamically pinned in Remix VM and reset in the test contract. 
 
 import "./MockMAILToken.sol";
 import "./MockMailTester.sol";
@@ -20,6 +20,9 @@ interface ICCOrderRouter {
         uint256 minPrice
     ) external payable;
     function setWETH(address) external;
+    
+    function listingTemplate() external view returns (address);
+    function wethAddress() external view returns (address);
 }
 
 interface ICCSettlementRouter {
@@ -30,6 +33,8 @@ interface ICCSettlementRouter {
         uint256[] calldata amountsIn,
         bool isBuyOrder
     ) external returns (string memory);
+    
+    function listingTemplate() external view returns (address);
 }
 
 interface ICCListingTemplate {
@@ -45,6 +50,9 @@ interface ICCListingTemplate {
     );
     function prices(address tokenA, address tokenB) external view returns (uint256);
     function transferOwnership(address) external;
+    function routerAddressesView() external view returns (address[] memory);
+    function uniswapV2Factory() external view returns (address);
+    function uniswapV2Router() external view returns (address);
 }
 
 interface IERC20Min {
@@ -91,6 +99,10 @@ contract SettlementTests {
     uint256 public p4_order3;
     uint256 public p5_orderId;
     uint256 public p6_orderId; // For Seesaw test
+    
+    bool private orderRouterInitialized;
+    bool private settlementRouterInitialized;
+    bool private listingTemplateInitialized;
 
     event ContractsSet(address orderRouter, address settlementRouter, address listing);
     event PairCreated(address pair);
@@ -121,42 +133,88 @@ contract SettlementTests {
         uniRouter = new MockUniRouter(address(uniFactory), address(weth));
     }
 
-    function setCCContracts(
-        address _orderRouter,
-        address _settlementRouter,
-        address _listing
-    ) external {
+    function setOrderRouter(address _orderRouter) external {
         require(msg.sender == owner, "Not owner");
         require(_orderRouter != address(0), "Invalid order router");
-        require(_settlementRouter != address(0), "Invalid settlement router");
-        require(_listing != address(0), "Invalid listing");
-
         orderRouter = ICCOrderRouter(_orderRouter);
-        settlementRouter = ICCSettlementRouter(_settlementRouter);
-        listingTemplate = ICCListingTemplate(_listing);
+        orderRouterInitialized = false; // allow re-init if address changes
+    }
 
-        emit ContractsSet(_orderRouter, _settlementRouter, _listing);
+    function setSettlementRouter(address _settlementRouter) external {
+        require(msg.sender == owner, "Not owner");
+        require(_settlementRouter != address(0), "Invalid settlement router");
+        settlementRouter = ICCSettlementRouter(_settlementRouter);
+        settlementRouterInitialized = false;
+    }
+
+    function setListingTemplate(address _listing) external {
+        require(msg.sender == owner, "Not owner");
+        require(_listing != address(0), "Invalid listing");
+        listingTemplate = ICCListingTemplate(_listing);
+        listingTemplateInitialized = false;
     }
 
     function initializeContracts() external payable {
         require(msg.sender == owner, "Not owner");
-        require(address(listingTemplate) != address(0), "Contracts not set");
         require(address(uniFactory) != address(0), "Uni mocks not deployed");
         require(msg.value >= 2 ether, "Insufficient ETH sent");
 
-        listingTemplate.addRouter(address(orderRouter));
-        listingTemplate.addRouter(address(settlementRouter));
-        
-        orderRouter.setListingTemplate(address(listingTemplate));
-        settlementRouter.setListingTemplate(address(listingTemplate));
+        // === 1. ListingTemplate: Add routers if not already present ===
+        address[] memory currentRouters = listingTemplate.routerAddressesView();
+        bool orderRouterAdded = false;
+        bool settlementRouterAdded = false;
 
-        orderRouter.setWETH(address(weth));
-        
-        listingTemplate.setUniswapV2Factory(address(uniFactory));
-        // Correctly set the Router
-        listingTemplate.setUniswapV2Router(address(uniRouter)); 
+        for (uint i = 0; i < currentRouters.length; i++) {
+            if (currentRouters[i] == address(orderRouter)) orderRouterAdded = true;
+            if (currentRouters[i] == address(settlementRouter)) settlementRouterAdded = true;
+        }
 
-        _createPairWithLiquidity();
+        if (!orderRouterAdded) listingTemplate.addRouter(address(orderRouter));
+        if (!settlementRouterAdded) listingTemplate.addRouter(address(settlementRouter));
+
+        // === 2. OrderRouter: Set listingTemplate & WETH only if not already set ===
+        if (address(orderRouter) != address(0)) {
+            // We detect via public listingTemplate variable in OrderRouter
+            // Assuming: address public listingTemplate; exists in CCOrderRouter
+            // We'll read it directly using inline interface call
+            (bool success, bytes memory data) = address(orderRouter).staticcall(
+                abi.encodeWithSignature("listingTemplate()")
+            );
+            if (success && abi.decode(data, (address)) == address(0)) {
+                orderRouter.setListingTemplate(address(listingTemplate));
+            }
+
+            (success, data) = address(orderRouter).staticcall(
+                abi.encodeWithSignature("wethAddress()")
+            );
+            if (success && abi.decode(data, (address)) == address(0)) {
+                orderRouter.setWETH(address(weth));
+            }
+        }
+
+        // === 3. SettlementRouter: Set listingTemplate only if not already set ===
+        if (address(settlementRouter) != address(0)) {
+            (bool success, bytes memory data) = address(settlementRouter).staticcall(
+                abi.encodeWithSignature("listingTemplate()")
+            );
+            if (success && abi.decode(data, (address)) == address(0)) {
+                settlementRouter.setListingTemplate(address(listingTemplate));
+            }
+        }
+
+        // === 4. ListingTemplate: Factory & Router only if not already set ===
+        if (listingTemplate.uniswapV2Factory() == address(0)) {
+            listingTemplate.setUniswapV2Factory(address(uniFactory));
+        }
+
+        if (listingTemplate.uniswapV2Router() == address(0)) {
+            listingTemplate.setUniswapV2Router(address(uniRouter));
+        }
+
+        // === 5. Create pair + liquidity (idempotent) ===
+        if (pairToken18Token6 == address(0)) {
+            _createPairWithLiquidity();
+        }
     }
 
     function _createPairWithLiquidity() internal {
