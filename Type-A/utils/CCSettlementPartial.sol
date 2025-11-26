@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.4.1 (26/11/2025)
+// Version: 0.4.2 (26/11/2025)
 // Changes:
-// - (26/11/2025): Removed erroneous settler billing in buy order settlement. 
+// - (26/11/2025): Ensured settlement of orders with status=2. 
 
 import "./CCUniPartial.sol";
 
@@ -40,12 +40,12 @@ contract CCSettlementPartial is CCUniPartial {
         return true;
     }
 
-// 0.4.1 fixed billing, does not bill settler, uses listing template balance. 
+// 0.4.2 aligned to allow settlement of orders with status=2
 
 function _processBuyOrder(
     address listingAddress,
     uint256 orderIdentifier,
-    uint256 amountIn, // <--- NOW represents the normalized amount of Token B (Listing's/Buyer's token) to swap.
+    uint256 amountIn, // Normalized amount of Token B to swap
     ICCListing listingContract,
     SettlementContext memory settlementContext
 ) internal returns (ICCListing.BuyOrderUpdate[] memory buyUpdates) {
@@ -55,8 +55,14 @@ function _processBuyOrder(
     
     uint256 pendingAmount = amounts[0]; // Normalized Token B pending
     
-    if (status != 1 || pendingAmount == 0) {
-        emit OrderSkipped(orderIdentifier, "Invalid status or no pending amount");
+    // CRITICAL FIX: Accept both status 1 (pending) and status 2 (partially filled)
+    if (pendingAmount == 0) {
+        emit OrderSkipped(orderIdentifier, "No pending amount");
+        return new ICCListing.BuyOrderUpdate[](0);
+    }
+    
+    if (status != 1 && status != 2) {
+        emit OrderSkipped(orderIdentifier, "Invalid status - must be pending or partially filled");
         return new ICCListing.BuyOrderUpdate[](0);
     }
     
@@ -65,37 +71,40 @@ function _processBuyOrder(
         return new ICCListing.BuyOrderUpdate[](0);
     }
     
-    // CRITICAL CHANGE: Removed the call to _prepBuyOrderUpdate which incorrectly pulled Token A from the Settler.
-    
     // Execute swap and create updates
     return _executePartialBuySwap(listingAddress, orderIdentifier, amountIn, pendingAmount, addresses, amounts, settlementContext);
 }
-
+    
     function _processSellOrder(
-        address listingAddress,
-        uint256 orderIdentifier,
-        uint256 amountIn,
-        ICCListing listingContract,
-        SettlementContext memory settlementContext
-    ) internal returns (ICCListing.SellOrderUpdate[] memory sellUpdates) {
-        // Get order data - amounts[0] = pending, amounts[1] = filled, amounts[2] = amountSent
-        (address[] memory addresses, , uint256[] memory amounts, uint8 status) = 
-            listingContract.getSellOrder(orderIdentifier);
-        
-        uint256 pendingAmount = amounts[0]; // Normalized to 18 decimals
-        
-        if (status != 1 || pendingAmount == 0) {
-            emit OrderSkipped(orderIdentifier, "Invalid status or no pending amount");
-            return new ICCListing.SellOrderUpdate[](0);
-        }
-        
-        if (amountIn == 0) {
-            emit OrderSkipped(orderIdentifier, "Zero swap amount");
-            return new ICCListing.SellOrderUpdate[](0);
-        }
-        
-        // Execute swap and create updates
-        // Similar functionality to buy side equivalent  but delegated
-        return _executePartialSellSwap(listingAddress, orderIdentifier, amountIn, pendingAmount, addresses, amounts, settlementContext);
+    address listingAddress,
+    uint256 orderIdentifier,
+    uint256 amountIn,
+    ICCListing listingContract,
+    SettlementContext memory settlementContext
+) internal returns (ICCListing.SellOrderUpdate[] memory sellUpdates) {
+    // Get order data - amounts[0] = pending, amounts[1] = filled, amounts[2] = amountSent
+    (address[] memory addresses, , uint256[] memory amounts, uint8 status) = 
+        listingContract.getSellOrder(orderIdentifier);
+    
+    uint256 pendingAmount = amounts[0]; // Normalized to 18 decimals
+    
+    // CRITICAL FIX: Accept both status 1 (pending) and status 2 (partially filled)
+    if (pendingAmount == 0) {
+        emit OrderSkipped(orderIdentifier, "No pending amount");
+        return new ICCListing.SellOrderUpdate[](0);
     }
+    
+    if (status != 1 && status != 2) {
+        emit OrderSkipped(orderIdentifier, "Invalid status - must be pending or partially filled");
+        return new ICCListing.SellOrderUpdate[](0);
+    }
+    
+    if (amountIn == 0) {
+        emit OrderSkipped(orderIdentifier, "Zero swap amount");
+        return new ICCListing.SellOrderUpdate[](0);
+    }
+    
+    // Execute swap and create updates
+    return _executePartialSellSwap(listingAddress, orderIdentifier, amountIn, pendingAmount, addresses, amounts, settlementContext);
+}
 }

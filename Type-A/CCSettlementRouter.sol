@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.4.1 (24/11/2025)
+// Version: 0.4.2 (26/11/2025)
 // Changes:
-// - (24/11/2035): Fixed pair fletching in _getPairAddress
+// - (26/11/2035): Fixed order status validation, status 1 & 2 are valid, only status 0 and 3 are to be skipped. 
 
 import "./utils/CCSettlementPartial.sol";
 
@@ -14,31 +14,38 @@ interface IUniswapV2Factory {
 contract CCSettlementRouter is CCSettlementPartial {
 
     function _validateOrder(
-        address listingAddress,
-        uint256 orderId,
-        bool isBuyOrder,
-        ICCListing listingContract
-    ) internal returns (bool valid) {
-        // Get order data using unified getter
-        (address[] memory addresses, uint256[] memory prices_, uint256[] memory amounts, uint8 status) = 
-            isBuyOrder ? listingContract.getBuyOrder(orderId) : listingContract.getSellOrder(orderId);
-        
-        // amounts[0] = pending (normalized to 18 decimals)
-        if (amounts[0] == 0 || status != 1) {
-            emit OrderSkipped(orderId, "No pending amount or invalid status");
-            return false;
-        }
-        
-        // Extract tokens from addresses array for pricing check
-        address startToken = addresses[2];
-        address endToken = addresses[3];
-        
-        if (!_checkPricing(listingAddress, orderId, isBuyOrder, startToken, endToken, prices_)) {
-            return false;
-        }
-        
-        return true;
+    address listingAddress,
+    uint256 orderId,
+    bool isBuyOrder,
+    ICCListing listingContract
+) internal returns (bool valid) {
+    // Get order data using unified getter
+    (address[] memory addresses, uint256[] memory prices_, uint256[] memory amounts, uint8 status) = 
+        isBuyOrder ? listingContract.getBuyOrder(orderId) : listingContract.getSellOrder(orderId);
+    
+    // CRITICAL FIX: Accept both status 1 (pending) and status 2 (partially filled)
+    // Status 0 = cancelled, 1 = pending, 2 = partially filled, 3 = filled
+    // amounts[0] = pending (normalized to 18 decimals)
+    if (amounts[0] == 0) {
+        emit OrderSkipped(orderId, "No pending amount");
+        return false;
     }
+    
+    if (status != 1 && status != 2) {
+        emit OrderSkipped(orderId, "Invalid status - must be pending or partially filled");
+        return false;
+    }
+    
+    // Extract tokens from addresses array for pricing check
+    address startToken = addresses[2];
+    address endToken = addresses[3];
+    
+    if (!_checkPricing(listingAddress, orderId, isBuyOrder, startToken, endToken, prices_)) {
+        return false;
+    }
+    
+    return true;
+}
 
     function _updateOrder(
         ICCListing listingContract,

@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.4.7 (25/11/2025)
+// Version: 0.4.9 (26/11/2025)
 // Changes:
-// - (25/11/2025): Added approval before uniswap call. 
-// - (25/11/2025): Removed incorrect token context flip in buy order settlement. 
-// - (25/11/2025): Corrected buy order settlement withdrawal call.
+// - (26/11/2025): Ensured successive order updates no not overwrite preceeding ones.
+// - (26/11/2025): Ensured correct status updates.
 
 import "./CCMainPartial.sol";
 
@@ -288,7 +287,6 @@ contract CCUniPartial is CCMainPartial {
         address router = ICCListing(listingTemplate).uniswapV2Router();
         require(router != address(0), "Router not set");
         
-        // [FIXED] Approve the Uniswap Router to spend tokens before swapping
         if (!isETHIn) {
             IERC20(context.tokenIn).approve(router, context.denormAmountIn);
         }
@@ -339,28 +337,25 @@ contract CCUniPartial is CCMainPartial {
     ) internal pure returns (ICCListing.BuyOrderUpdate memory upd) {
         upd.structId = structId;
         upd.orderId = ids.orderId;
+        
         upd.addresses = new address[](4);
         upd.addresses[0] = ids.maker;
         upd.addresses[1] = ids.recipient;
         upd.addresses[2] = ids.startToken;
         upd.addresses[3] = ids.endToken;
+        
         upd.prices = new uint256[](2);
         upd.prices[0] = 0;
         upd.prices[1] = 0;
         
-        if (structId == 2) {
-            upd.amounts = new uint256[](3);
-            upd.amounts[0] = newPending;
-            upd.amounts[1] = amounts.filled + amounts.amountIn;
-            upd.amounts[2] = state.priorSent + _normalizeOut(amounts.amountOut, state.decimalsOut);
-            upd.status = 1;
-        } else {
-            upd.amounts = new uint256[](3);
-            upd.amounts[0] = 0;
-            upd.amounts[1] = 0;
-            upd.amounts[2] = 0;
-            upd.status = newStatus;
-        }
+        // [FIX] Always populate amounts to prevent overwriting state with zeros
+        upd.amounts = new uint256[](3);
+        upd.amounts[0] = newPending;
+        upd.amounts[1] = amounts.filled + amounts.amountIn;
+        upd.amounts[2] = state.priorSent + _normalizeOut(amounts.amountOut, state.decimalsOut);
+        
+        // [FIX] Always use the calculated newStatus
+        upd.status = newStatus;
     }
 
     function _buildSellUpdate(
@@ -373,28 +368,25 @@ contract CCUniPartial is CCMainPartial {
     ) internal pure returns (ICCListing.SellOrderUpdate memory upd) {
         upd.structId = structId;
         upd.orderId = ids.orderId;
+        
         upd.addresses = new address[](4);
         upd.addresses[0] = ids.maker;
         upd.addresses[1] = ids.recipient;
         upd.addresses[2] = ids.startToken;
         upd.addresses[3] = ids.endToken;
+        
         upd.prices = new uint256[](2);
         upd.prices[0] = 0;
         upd.prices[1] = 0;
         
-        if (structId == 2) {
-            upd.amounts = new uint256[](3);
-            upd.amounts[0] = newPending;
-            upd.amounts[1] = amounts.filled + amounts.amountIn;
-            upd.amounts[2] = state.priorSent + _normalizeOut(amounts.amountOut, state.decimalsOut);
-            upd.status = 1;
-        } else {
-            upd.amounts = new uint256[](3);
-            upd.amounts[0] = 0;
-            upd.amounts[1] = 0;
-            upd.amounts[2] = 0;
-            upd.status = newStatus;
-        }
+        // [FIX] Always populate amounts to prevent overwriting state with zeros
+        upd.amounts = new uint256[](3);
+        upd.amounts[0] = newPending;
+        upd.amounts[1] = amounts.filled + amounts.amountIn;
+        upd.amounts[2] = state.priorSent + _normalizeOut(amounts.amountOut, state.decimalsOut);
+        
+        // [FIX] Always use the calculated newStatus
+        upd.status = newStatus;
     }
 
     function _createOrderUpdates(
