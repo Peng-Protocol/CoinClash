@@ -3,7 +3,7 @@ pragma solidity ^0.8.2;
 
 // Version: 0.4.9 (26/11/2025)
 // Changes:
-// - (26/11/2025): Ensured successive order updates no not overwrite preceeding ones.
+// - (26/11/2025): Ensured successive order updates do not overwrite preceeding ones.
 // - (26/11/2025): Ensured correct status updates.
 
 import "./CCMainPartial.sol";

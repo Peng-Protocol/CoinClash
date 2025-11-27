@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.4.2 (26/11/2025)
+// Version: 0.4.3 (27/11/2025)
 // Changes:
-// - (26/11/2035): Fixed order status validation, status 1 & 2 are valid, only status 0 and 3 are to be skipped. 
+// - (27/11/2025): Reordered settlement context to capture reserves for impact price calculation ..
+// - (26/11/2025): Fixed order status validation, status 1 & 2 are valid, only status 0 and 3 are to be skipped. 
 
 import "./utils/CCSettlementPartial.sol";
 
@@ -147,13 +148,8 @@ contract CCSettlementRouter is CCSettlementPartial {
         require(listingTemplate != address(0), "Listing template not set");
         require(listingAddress == listingTemplate, "Invalid listing address");
         
-        if (orderIds.length != amountsIn.length) {
-            revert("Order IDs and amounts length mismatch");
-        }
-        
-        if (orderIds.length == 0) {
-            revert("No orders to settle");
-        }
+        if (orderIds.length != amountsIn.length) revert("Order IDs and amounts length mismatch");
+        if (orderIds.length == 0) revert("No orders to settle");
         
         ICCListing listingContract = ICCListing(listingAddress);
         
@@ -163,25 +159,39 @@ contract CCSettlementRouter is CCSettlementPartial {
         bool hasTrackedPair = false;
         
         uint256 count = 0;
+        
         for (uint256 i = 0; i < orderIds.length; i++) {
-            if (!_validateOrder(listingAddress, orderIds[i], isBuyOrder, listingContract)) {
+            // 1. Retrieve Basic Order Data
+            (address[] memory addresses, uint256[] memory prices, uint256[] memory amounts, uint8 status) = 
+                isBuyOrder ? listingContract.getBuyOrder(orderIds[i]) : listingContract.getSellOrder(orderIds[i]);
+            
+            // Check Status (1=Pending, 2=Partial) and Pending Amount
+            if ((status != 1 && status != 2) || amounts[0] == 0) {
+                emit OrderSkipped(orderIds[i], "Invalid status or no pending amount");
                 continue;
             }
-            
-            // Retrieve order-specific token context
+
+            // 2. Retrieve Token Context (Pair Address, Decimals)
             SettlementContext memory settlementContext = _getOrderTokenContext(listingContract, orderIds[i], isBuyOrder);
-            
-            // Track first token pair for historical update
+
+            // 3. Perform Impact Pricing Check
+            // We pass amountsIn[i] to calculate specific impact of this chunk
+            if (!_checkPricing(orderIds[i], amountsIn[i], isBuyOrder, prices, settlementContext)) {
+                emit OrderSkipped(orderIds[i], "Impact Price out of bounds");
+                continue;
+            }
+
+            // 4. Track Pair for Historical Data (Optimized: only tracks first successful pair)
             if (!hasTrackedPair) {
                 firstStartToken = isBuyOrder ? settlementContext.tokenB : settlementContext.tokenA;
                 firstEndToken = isBuyOrder ? settlementContext.tokenA : settlementContext.tokenB;
                 hasTrackedPair = true;
             }
             
+            // 5. Process Swap
             OrderContext memory context;
             context.orderId = orderIds[i];
             
-            // amountsIn[i] is expected to be normalized (18 decimals)
             if (isBuyOrder) {
                 context.buyUpdates = _processBuyOrder(listingAddress, orderIds[i], amountsIn[i], listingContract, settlementContext);
             } else {
@@ -189,21 +199,22 @@ contract CCSettlementRouter is CCSettlementPartial {
             }
             
             (bool success, string memory updateReason) = _updateOrder(listingContract, context, isBuyOrder);
-            if (!success && bytes(updateReason).length > 0) {
-                revert(updateReason);
-            }
-            if (success) {
+            
+            if (!success) {
+                if (bytes(updateReason).length > 0) revert(updateReason);
+                // If silent fail, just continue
+            } else {
                 count++;
             }
         }
         
-        // Create historical entry for the token pair if any orders settled
+        // 6. Update History
         if (count > 0 && hasTrackedPair) {
             _createHistoricalEntry(listingContract, firstStartToken, firstEndToken);
         }
         
         if (count == 0) {
-            return "No orders settled: price out of range or swap failure";
+            return "No orders settled: price/impact check failed";
         }
         return "";
     }

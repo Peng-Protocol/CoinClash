@@ -1,42 +1,79 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.4.2 (26/11/2025)
+// Version: 0.4.3 (27/11/2025)
 // Changes:
+// - (27/11/2035): Replaced nominal price check with impact price check.
 // - (26/11/2025): Ensured settlement of orders with status=2. 
 
 import "./CCUniPartial.sol";
 
 contract CCSettlementPartial is CCUniPartial {
-    
+    /**
+     * (0.4.3) Checks if the trade causes an Impact Price violation.
+     * Uses linear estimation for output to calculate.
+     */
     function _checkPricing(
-        address listingAddress,
         uint256 orderIdentifier,
+        uint256 amountIn, // Normalized (18 decimals)
         bool isBuyOrder,
-        address startToken,
-        address endToken,
-        uint256[] memory orderPrices
-    ) internal returns (bool) {
-        ICCListing listingContract = ICCListing(listingAddress);
+        uint256[] memory orderPrices, // [0]=maxPrice, [1]=minPrice
+        SettlementContext memory ctx
+    ) internal view returns (bool) {
+        // 1. Load Current Reserves
+        // We use ctx.tokenA / ctx.tokenB which are mapped correctly for the pair
+        uint256 rA = normalize(IERC20(ctx.tokenA).balanceOf(ctx.uniswapV2Pair), ctx.decimalsA);
+        uint256 rB = normalize(IERC20(ctx.tokenB).balanceOf(ctx.uniswapV2Pair), ctx.decimalsB);
+
+        if (rA == 0 || rB == 0) return false;
+
+        // 2. Calculate Current Spot Price (Price = B / A)
+        // Note: We use high precision for internal calculation
+        uint256 currentPrice = (rB * 1e18) / rA;
+
+        // 3. Calculate Impact Reserves
+        uint256 impactResA;
+        uint256 impactResB;
         
-        // orderPrices[0] = maxPrice, orderPrices[1] = minPrice
+        // Note: We use the linear constant-price estimation for output as a conservative check.
+        // Real swaps have slippage (convexity), so real output < estimated output.
+        // This makes the check slightly stricter than reality, which is safer.
+        
+        if (isBuyOrder) {
+            // BUY: Input TokenB -> Output TokenA
+            // Estimated Output A = Input B / Price
+            uint256 estimatedOutA = (amountIn * 1e18) / currentPrice;
+
+            // Impact A = Reserve A - Out A
+            impactResA = rA > estimatedOutA ? rA - estimatedOutA : 1; // Prevent div by 0
+            
+            // Impact B = Reserve B + In B
+            impactResB = rB + amountIn;
+
+        } else {
+            // SELL: Input TokenA -> Output TokenB
+            // Estimated Output B = Input A * Price
+            uint256 estimatedOutB = (amountIn * currentPrice) / 1e18;
+
+            // Impact A = Reserve A + In A
+            impactResA = rA + amountIn;
+
+            // Impact B = Reserve B - Out B
+            impactResB = rB > estimatedOutB ? rB - estimatedOutB : 1; // Prevent div by 0
+        }
+
+        // 4. Calculate Impact Price
+        // Impact Price = ImpactResB / ImpactResA
+        uint256 impactPrice = (impactResB * 1e18) / impactResA;
+
+        // 5. Verify Bounds
         uint256 maxPrice = orderPrices[0];
         uint256 minPrice = orderPrices[1];
-        
-        // Get current price for this token pair
-        uint256 currentPrice = listingContract.prices(
-            isBuyOrder ? startToken : startToken,
-            isBuyOrder ? endToken : endToken
-        );
-        
-        if (currentPrice == 0) {
-            emit OrderSkipped(orderIdentifier, "Invalid current price");
+
+        if (impactPrice > maxPrice || impactPrice < minPrice) {
             return false;
         }
-        if (currentPrice < minPrice || currentPrice > maxPrice) {
-            emit OrderSkipped(orderIdentifier, "Price out of bounds");
-            return false;
-        }
+
         return true;
     }
 

@@ -34,17 +34,18 @@
    - setSettlementRouter(CCSettlementRouter address)
    - setListingTemplate(CCListingTemplate address)
 
-11. Call **`initializeContracts()`** → send **≥ 2 ETH**  
+11. Call **`initializeContracts()`**
     This function is now **state aware**:
     - Adds routers to ListingTemplate only if missing
     - Sets `listingTemplate`, `wethAddress`, factory, and router only if still zero
     - Creates the Token18 ↔ Token6 pair only once
     - Safe to call repeatedly (perfect for Remix pinning workflow).
 
-12. **`initiateTester()`** (send 1 ETH value)  
+12. **`initiateTester()`** (send 3 ETH value)  
     - Deploys `MockMailTester` (the `tester` account used in all paths)  
     - Mints 1000 Token18 + 1000 Token6 to tester  
-    - Funds tester with 1 ETH
+    - Funds tester with 2 ETH
+    - Keeps 1 ETH. 
 
 You are now ready to run settlement tests.
 
@@ -64,11 +65,11 @@ All settlement paths assume the above setup is complete.
 |      | `p4_2PartialSettleAll()` | Batch partial-settles (50% each) | All orders status 2 (Partial) |
 | **Path 5** | `p5_1CreateOrder()` | Creates large 100 Token6 order | Pending |
 |      | `p5_2Round1Settle()` → `p5_3Round2RecoverOriginal()` → `p5_4FinalSweep()` | Multi-round partial → final sweep | Progressively reduces pending, final sweep sets status 3 |
-| **Path 6 – Seesaw Price Impact** | `p6_1CreateRestrictedOrder()` | Creates Buy order with tight min/max price range (±10%) | Pending order with price bounds |
+| **Path 6 – Seesaw Price Impact** | `p6_1CreateRestrictedOrder()` | Creates Buy order with tight min/max price range (±25%) | Pending order with price bounds |
 |      | `p6_2CrashPriceAndFail()` | Dumps massive Token6 → price crashes below minPrice | Settlement skipped (order stays Pending) |
 |      | `p6_3RecoverPriceAndSucceed()` | Adds Token18 back → price recovers into range | Settlement succeeds → order Filled |
-| **Path 7 – Stress** | `p7_1CreateLargeBatch()` | Creates 5 alternating-maker orders | 5 pending orders |
-|      | `p7_2SettleBatch()` | Single batch call settles all 5 fully | All 5 orders status 3 |
+| **Path 7 – Impact ** | `p7_1CreateHighImpactOrder()` | Creates an order with relatively large principal | order cannot be settled fue to price impact |
+|      | `p7_2AttemptImpactSettlement()` | Attemps to settle the order expecting it to be skipped | Order still active, settlement degrades gracefully with error message |
 
 ### Running the Tests
 - Watch the Remix transaction logs for `TestPassed`, `OrderSettled`, and `DebugPrice` events.

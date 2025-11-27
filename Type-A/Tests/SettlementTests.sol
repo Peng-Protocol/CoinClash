@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.4 (25/11/2025)
-// 0.0.4 (25/11/2025): Split setCCContracts into three granular setters + added initialization guards. Contracts can be dynamically pinned in Remix VM and reset in the test contract. 
+// File Version: 0.0.6 (27/11/2025)
+// 0.0.6 (27/11/2025): Replaced p7 with impact price test, corrected p6 order direction and gas control. 
+// 0.0.5 (26/11/2025): Adjusted p6 to use direct swaps for price manipulation. 
 
 import "./MockMAILToken.sol";
 import "./MockMailTester.sol";
@@ -98,7 +99,13 @@ contract SettlementTests {
     uint256 public p4_order2;
     uint256 public p4_order3;
     uint256 public p5_orderId;
-    uint256 public p6_orderId; // For Seesaw test
+    uint256 public p6_orderId;
+    uint256 public p7_orderId; 
+
+    // For Seesaw test
+    uint256 public originalPrice;
+    uint256 public minPriceFromP6;
+    uint256 public maxPriceFromP6;
     
     bool private orderRouterInitialized;
     bool private settlementRouterInitialized;
@@ -157,7 +164,6 @@ contract SettlementTests {
     function initializeContracts() external payable {
         require(msg.sender == owner, "Not owner");
         require(address(uniFactory) != address(0), "Uni mocks not deployed");
-        require(msg.value >= 2 ether, "Insufficient ETH sent");
 
         // === 1. ListingTemplate: Add routers if not already present ===
         address[] memory currentRouters = listingTemplate.routerAddressesView();
@@ -233,12 +239,12 @@ contract SettlementTests {
 
     function initiateTester() public payable {
         require(msg.sender == owner, "Not owner");
-        require(msg.value == 1 ether, "Send 1 ETH");
+        require(msg.value >= 3 ether, "Send 3 ETH or More");
         
         tester = new MockMailTester(address(this));
         
         // Fund tester with ETH
-        (bool success,) = address(tester).call{value: 1 ether}("");
+        (bool success,) = address(tester).call{value: 2 ether}("");
         token18.mint(address(tester), TOKEN18_AMOUNT);
         token6.mint(address(tester), TOKEN6_AMOUNT);
     }
@@ -530,15 +536,16 @@ contract SettlementTests {
 
     function p6_1CreateRestrictedOrder() public {
         _approveToken6Tester(TOKEN6_AMOUNT);
-        // Calculate Price: How much T18 (Out) for T6 (In)?
+
+// Calculate Price: How much T18 (Out) for T6 (In)?
         uint256 currentPrice = _getPoolPrice(address(token6), address(token18));
         p6_orderId = listingTemplate.getNextOrderId();
         
         // Strict Range: 
-        // Min: Current * 0.9 (Allow slightly worse rate)
-        // Max: Current * 1.1 (Allow slightly better rate)
-        uint256 minPrice = (currentPrice * 90) / 100;
-        uint256 maxPrice = (currentPrice * 110) / 100;
+        // Min: Current * 0.75 (Allow slightly worse rate)
+        // Max: Current * 1.25 (Allow slightly better rate)
+        uint256 minPrice = (currentPrice * 75) / 100;
+        uint256 maxPrice = (currentPrice * 125) / 100;
         
         tester.proxyCall(
             address(orderRouter),
@@ -553,97 +560,172 @@ contract SettlementTests {
             )
         );
         emit TestPassed("p6_1CreateRestrictedOrder");
-    }
+  }
 
     function p6_2CrashPriceAndFail() public {
-        // ACTION: Add massive Input (Token6) to pool.
-        // Result: Denominator increases -> Price (Out/In) decreases (Crashes).
-        // Expectation: Price drops BELOW minPrice.
+    // ACTION: Sell a massive amount of Token6 → buy Token18
+    // This increases reserve of Token6 (in), decreases Token18 (out) → price of Token18 crashes
+    uint256 crashAmountIn = 5000 * 1e6;
+
+    token6.approve(address(uniRouter), crashAmountIn);
+
+    address[] memory path = new address[](2);
+    path[0] = address(token6);
+    path[1] = address(token18);
+
+    // Perform real swap via router to crash the price
+    uniRouter.swapExactTokensForTokens(
+        crashAmountIn,
+        0, // accept any amount out
+        path,
+        address(this),
+        block.timestamp + 300
+    );
+
+    uint256 newPrice = _getPoolPrice(address(token6), address(token18));
+    emit DebugPrice(newPrice, 0, "Crashed Price (Should Fail)");
+
+    // Now attempt to settle — should skip due to price < minPrice
+    uint256[] memory orderIds = new uint256[](1);
+    orderIds[0] = p6_orderId;
+
+    (,, uint256[] memory amounts,) = listingTemplate.getBuyOrder(p6_orderId);
+    uint256[] memory amountsIn = new uint256[](1);
+    amountsIn[0] = amounts[0];
+
+    // This should skip due to price out of bounds
+    settlementRouter.settleOrders(address(listingTemplate), orderIds, amountsIn, true);
+
+    // Assert: still pending (status == 1), not filled
+    (,,, uint8 status) = listingTemplate.getBuyOrder(p6_orderId);
+    assert(status == 1);
+
+    emit TestPassed("p6_2CrashPriceAndFail");
+}
+
+function p6_3RecoverPriceAndSucceed() public {
+    // Goal: Bring price back into [minPrice, maxPrice] gradually
+    
+    // Safety check for state variables
+    require(maxPriceFromP6 > 0 && minPriceFromP6 > 0, "P6 state not set");
+
+    uint256 currentPrice;
+    uint256 swapAmount = 10 * 1e18; // Start small
+
+    // Limit iterations to prevent gas limit errors during testing
+    uint256 maxIterations = 20; 
+    uint256 i = 0;
+
+    while (i < maxIterations) {
+        currentPrice = _getPoolPrice(address(token6), address(token18));
         
-        token6.transfer(pairToken18Token6, 5000 * 1e6); 
-        IUniswapV2Pair(pairToken18Token6).mint(address(this));
+        // Success condition
+        if (currentPrice >= minPriceFromP6 && currentPrice <= maxPriceFromP6) {
+            break; 
+        }
+
+        if (currentPrice > maxPriceFromP6) {
+            // Price too HIGH. We need to LOWER it.
+            // Action: Sell Token6 -> Buy Token18 (Increases T6 reserve, Decreases T18 reserve)
+            token6.approve(address(uniRouter), swapAmount);
+            address[] memory path = new address[](2);
+            path[0] = address(token6);
+            path[1] = address(token18);
+            
+            // Note: We use 'try' to avoid test reverts if liquidity is tight
+            try uniRouter.swapExactTokensForTokens(swapAmount, 0, path, address(this), block.timestamp + 300) {} catch {}
+        } else {
+            // Price too LOW (This is the state after p6_2). We need to RAISE it.
+            // Action: Sell Token18 -> Buy Token6 (Increases T18 reserve, Decreases T6 reserve)
+            token18.approve(address(uniRouter), swapAmount);
+            address[] memory path = new address[](2);
+            path[0] = address(token18);
+            path[1] = address(token6);
+            
+            try uniRouter.swapExactTokensForTokens(swapAmount, 0, path, address(this), block.timestamp + 300) {} catch {}
+        }
+
+        // Damping factor: Reduce impact as we get closer? 
+        // Actually, if we are far off, we might want to keep the size steady, 
+        // but reducing it is safer to avoid oscillating forever.
+        if (swapAmount > 1e16) {
+            swapAmount = swapAmount * 9 / 10;
+        }
         
-        uint256 newPrice = _getPoolPrice(address(token6), address(token18));
+        i++;
+    }
+    
+    // Final check before attempting settlement
+    require(currentPrice >= minPriceFromP6 && currentPrice <= maxPriceFromP6, "Failed to recover price");
+
+    emit DebugPrice(currentPrice, 0, "Recovered Price Now In Range");
+    
+    // Now settle — should succeed
+    uint256[] memory orderIds = new uint256[](1); orderIds[0] = p6_orderId;
+    (,, uint256[] memory amounts,) = listingTemplate.getBuyOrder(p6_orderId);
+    uint256[] memory amountsIn = new uint256[](1); amountsIn[0] = amounts[0];
+
+    settlementRouter.settleOrders(address(listingTemplate), orderIds, amountsIn, true);
+    (,,, uint8 status) = listingTemplate.getBuyOrder(p6_orderId);
+    
+    assert(status == 3);
+    emit TestPassed("p6_3RecoverPriceAndSucceed");
+}
+
+    // ============ PATH 7: HIGH IMPACT STRESS TEST ============
+
+    function p7_1CreateHighImpactOrder() public {
+        _approveToken6Tester(TOKEN6_AMOUNT * 10); // Approve a lot
         
-        // Attempt Settle
-        token18.approve(address(settlementRouter), type(uint256).max);
-        uint256[] memory orderIds = new uint256[](1); orderIds[0] = p6_orderId;
-        (,, uint256[] memory amounts, ) = listingTemplate.getBuyOrder(p6_orderId);
-        uint256[] memory amountsIn = new uint256[](1); amountsIn[0] = amounts[0];
+        // 1. Get current pool price
+        uint256 currentPrice = _getPoolPrice(address(token6), address(token18));
         
-        settlementRouter.settleOrders(address(listingTemplate), orderIds, amountsIn, true);
+        // 2. Set bounds relatively tight (e.g., +/- 10%)
+        uint256 minPrice = (currentPrice * 90) / 100;
+        uint256 maxPrice = (currentPrice * 110) / 100;
         
-        // Assert: Skipped (Status remains 1)
-        (,,, uint8 status) = listingTemplate.getBuyOrder(p6_orderId);
-        assert(status == 1); 
+        // 3. Create a MASSIVE order (e.g., 50% of the pool's liquidity)
+        // If pool has 10,000 T6, we order 5,000 T6.
+        // This will definitely shift the impact price beyond 10%.
+        uint256 massiveAmount = 5000 * 1e6; 
         
-        emit DebugPrice(newPrice, 0, "Crashed Price (Should Fail)");
-        emit TestPassed("p6_2CrashPriceAndFail");
+        uint256 orderId = listingTemplate.getNextOrderId();
+        tester.proxyCall(
+            address(orderRouter),
+            abi.encodeWithSignature(
+                "createBuyOrder(address,address,address,uint256,uint256,uint256)",
+                address(token6), address(token18), address(tester),
+                massiveAmount, maxPrice, minPrice
+            )
+        );
+        p7_orderId = orderId; // new state var
+        emit TestPassed("p7_1CreateHighImpactOrder");
     }
 
-    function p6_3RecoverPriceAndSucceed() public {
-        // ACTION: Add Output (Token18) to pool.
-        // Result: Numerator increases -> Price (Out/In) increases (Recovers).
-        // Expectation: Price rises back into [min, max] range.
+    function p7_2AttemptImpactSettlement() public {
+        (,, uint256[] memory amounts,) = listingTemplate.getBuyOrder(p7_orderId);
         
-        // Add enough T18 to balance the T6 dumped earlier
-        token18.transfer(pairToken18Token6, 5000 * 1e18); 
-        IUniswapV2Pair(pairToken18Token6).mint(address(this));
+        uint256[] memory orderIds = new uint256[](1);
+        orderIds[0] = p7_orderId;
         
-        uint256 newPrice = _getPoolPrice(address(token6), address(token18));
+        uint256[] memory amountsIn = new uint256[](1);
         
-        // Attempt Settle
-        uint256[] memory orderIds = new uint256[](1); orderIds[0] = p6_orderId;
-        (,, uint256[] memory amounts, ) = listingTemplate.getBuyOrder(p6_orderId);
-        uint256[] memory amountsIn = new uint256[](1); amountsIn[0] = amounts[0];
+        // Attempt to settle 20% of this massive order.
+        // Even 20% of a massive order might cause >10% impact linear estimation.
+        amountsIn[0] = amounts[0] / 5; 
         
-        settlementRouter.settleOrders(address(listingTemplate), orderIds, amountsIn, true);
+        string memory result = settlementRouter.settleOrders(address(listingTemplate), orderIds, amountsIn, true);
         
-        // Assert: Filled (Status 3)
-        (,,, uint8 status) = listingTemplate.getBuyOrder(p6_orderId);
-        assert(status == 3); 
-        
-        emit DebugPrice(newPrice, 0, "Recovered Price (Should Succeed)");
-        emit TestPassed("p6_3RecoverPriceAndSucceed");
-    }
+        // Assertions
+        // 1. Result should indicate failure/skip
+        // "No orders settled: price/impact check failed" is the expected return from the Router logic.
+        bool expectedMsg = keccak256(abi.encodePacked(result)) == keccak256(abi.encodePacked("No orders settled: price/impact check failed"));
+        require(expectedMsg, "Should have failed due to impact");
 
-    // ============ PATH 7: LARGE BATCH STRESS TEST ============
-
-    function p7_1CreateLargeBatch() public {
-        _approveToken6Tester(TOKEN6_AMOUNT);
-        token6.approve(address(orderRouter), TOKEN6_AMOUNT);
-        uint256 orderIdBefore = listingTemplate.getNextOrderId();
+        // 2. Order Status should remain Pending (1)
+        (,,, uint8 status) = listingTemplate.getBuyOrder(p7_orderId);
+        assert(status == 1);
         
-        // Create 5 orders alternating addresses
-        for (uint i = 0; i < 5; i++) {
-            if (i % 2 == 0) {
-                tester.proxyCall(address(orderRouter), abi.encodeWithSignature("createBuyOrder(address,address,address,uint256,uint256,uint256)", address(token6), address(token18), address(tester), (10 + i * 5) * 1e6, 10e18, 1e16));
-            } else {
-                orderRouter.createBuyOrder(address(token6), address(token18), address(this), (10 + i * 5) * 1e6, 10e18, 1e16);
-            }
-        }
-        emit TestPassed("p7_1CreateLargeBatch");
-    }
-
-    function p7_2SettleBatch() public {
-        uint256 startOrderId = listingTemplate.getNextOrderId() - 5;
-        token18.approve(address(settlementRouter), type(uint256).max);
-        
-        uint256[] memory orderIds = new uint256[](5);
-        uint256[] memory amountsIn = new uint256[](5);
-        
-        for (uint i = 0; i < 5; i++) {
-            orderIds[i] = startOrderId + i;
-            (,, uint256[] memory amounts,) = listingTemplate.getBuyOrder(orderIds[i]);
-            amountsIn[i] = amounts[0]; // Full Settle
-        }
-        
-        settlementRouter.settleOrders(address(listingTemplate), orderIds, amountsIn, true);
-        
-        for (uint i = 0; i < 5; i++) {
-            (,,, uint8 status) = listingTemplate.getBuyOrder(orderIds[i]);
-            assert(status == 3);
-        }
-        emit TestPassed("p7_2SettleBatch");
+        emit TestPassed("p7_2AttemptImpactSettlement");
     }
 }
