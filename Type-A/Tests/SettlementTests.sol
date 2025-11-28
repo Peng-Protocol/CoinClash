@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.8 (28/11/2025)
+// File Version: 0.0.9 (28/11/2025)
+// 0.0.9 (28/11/2025): Fixed normalization in p6_3.
 // 0.0.8 (28/11/2035): Adjusted p6_3 to use direct transfer and sync. 
 // 0.0.7 (28/11/2025): Added mint to tester in p7, initialized p6 state in p6_1. 
 // 0.0.6 (27/11/2025): Replaced p7 with impact price test, corrected p6 order direction and gas control. 
@@ -608,51 +609,57 @@ contract SettlementTests {
 }
 
 function p6_3RecoverPriceAndSucceed() public {
-        // 1. Identify current state
-        (uint112 res0, uint112 res1,) = IUniswapV2Pair(pairToken18Token6).getReserves();
-        address t0 = IUniswapV2Pair(pairToken18Token6).token0();
-        
-        // Identify which reserve corresponds to which token
-        uint256 resT6 = address(token6) == t0 ? uint256(res0) : uint256(res1);
-        uint256 resT18 = address(token18) == t0 ? uint256(res0) : uint256(res1);
+    // 1. Get Reserves
+    (uint112 res0, uint112 res1,) = IUniswapV2Pair(pairToken18Token6).getReserves();
+    address t0 = IUniswapV2Pair(pairToken18Token6).token0();
+    
+    // Identify which reserve corresponds to which token
+    uint256 resT6Raw = address(token6) == t0 ? uint256(res0) : uint256(res1);
+    uint256 resT18Raw = address(token18) == t0 ? uint256(res0) : uint256(res1);
 
-        // 2. Calculate discrepancy
-        // After the crash in p6_2, we expect resT6 (Sold In) > resT18 (Bought Out)
-        // To restore 1:1 price, we need to top up resT18 so it equals resT6.
-        require(resT6 > resT18, "State not crashed as expected");
-        uint256 amountNeeded = resT6 - resT18;
+    // 2. Normalize to compare "Value" (Standardize to 18 decimals)
+    // Token6 (6 decimals) -> Multiply by 1e12
+    uint256 normT6 = resT6Raw * 1e12;
+    uint256 normT18 = resT18Raw;
 
-        // 3. Fund this contract so it can donate
-        token18.mint(address(this), amountNeeded);
-        
-        // 4. Donate directly to pair (No Swap)
-        token18.transfer(pairToken18Token6, amountNeeded);
-        
-        // 5. Force Sync (Updates reserves to match the new balance)
-        // We use low-level call to avoid interface issues if you haven't updated the interface yet
-        (bool success,) = pairToken18Token6.call(abi.encodeWithSignature("sync()"));
-        require(success, "Sync failed");
+    // 3. Calculate Discrepancy
+    // After crash (Selling T6), the pool should be heavy on T6 (Value) and light on T18.
+    require(normT6 > normT18, "State not crashed as expected (Normalized)");
+    
+    // 4. Calculate amount needed to balance
+    // We want normT18 to equal normT6 so price = 1.0
+    // amountNeeded (in 18 decimals) = Target (normT6) - Current (normT18)
+    uint256 amountNeeded = normT6 - normT18;
 
-        // 6. Verify Price
-        uint256 currentPrice = _getPoolPrice(address(token6), address(token18));
-        emit DebugPrice(currentPrice, 0, "Recovered Price via Sync");
+    // 5. Fund and Donate
+    token18.mint(address(this), amountNeeded);
+    token18.transfer(pairToken18Token6, amountNeeded);
+    
+    // 6. Force Sync
+    (bool success,) = pairToken18Token6.call(abi.encodeWithSignature("sync()"));
+    require(success, "Sync failed");
 
-        require(currentPrice >= minPriceFromP6 && currentPrice <= maxPriceFromP6, "Price not recovered to range");
+    // 7. Verify Price recovered to ~1.0
+    uint256 currentPrice = _getPoolPrice(address(token6), address(token18));
+    // Debug print is helpful if it fails again
+    emit DebugPrice(currentPrice, 0, "Recovered Price");
 
-        // 7. Settle
-        uint256[] memory orderIds = new uint256[](1);
-        orderIds[0] = p6_orderId;
-        (,, uint256[] memory amounts,) = listingTemplate.getBuyOrder(p6_orderId);
-        
-        uint256[] memory amountsIn = new uint256[](1); 
-        amountsIn[0] = amounts[0]; // Full pending amount
+    require(currentPrice >= minPriceFromP6 && currentPrice <= maxPriceFromP6, "Price not recovered to range");
 
-        settlementRouter.settleOrders(address(listingTemplate), orderIds, amountsIn, true);
-        (,,, uint8 status) = listingTemplate.getBuyOrder(p6_orderId);
-        
-        assert(status == 3);
-        emit TestPassed("p6_3RecoverPriceAndSucceed");
-    }
+    // 8. Settle
+    uint256[] memory orderIds = new uint256[](1);
+    orderIds[0] = p6_orderId;
+    (,, uint256[] memory amounts,) = listingTemplate.getBuyOrder(p6_orderId);
+    
+    uint256[] memory amountsIn = new uint256[](1); 
+    amountsIn[0] = amounts[0]; 
+
+    settlementRouter.settleOrders(address(listingTemplate), orderIds, amountsIn, true);
+    (,,, uint8 status) = listingTemplate.getBuyOrder(p6_orderId);
+    
+    assert(status == 3);
+    emit TestPassed("p6_3RecoverPriceAndSucceed");
+}
 
     // ============ PATH 7: HIGH IMPACT STRESS TEST ============
 
