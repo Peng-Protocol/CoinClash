@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.2 (24/11/2025)
+// File Version: 0.0.3 (28/11/2025)
 // Changelog:
+// - 28/11/2025: Added Sync for price manipulation 
 // - 24/11/2025: Added Swap function
 
 interface IERC20 {
@@ -176,6 +177,13 @@ contract MockUniPair {
         
         _update(balance0, balance1);
         // Note: Sync/emit Swap event if needed, but not strictly required for this crash
+    }
+    
+    // Added for precise price manipulation
+    function sync() external {
+        uint256 balance0 = token0 == address(0) ? address(this).balance : IERC20(token0).balanceOf(address(this));
+        uint256 balance1 = token1 == address(0) ? address(this).balance : IERC20(token1).balanceOf(address(this));
+        _update(balance0, balance1);
     }
 
     receive() external payable {}

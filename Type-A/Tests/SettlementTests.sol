@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.6 (27/11/2025)
+// File Version: 0.0.8 (28/11/2025)
+// 0.0.8 (28/11/2035): Adjusted p6_3 to use direct transfer and sync. 
+// 0.0.7 (28/11/2025): Added mint to tester in p7, initialized p6 state in p6_1. 
 // 0.0.6 (27/11/2025): Replaced p7 with impact price test, corrected p6 order direction and gas control. 
 // 0.0.5 (26/11/2025): Adjusted p6 to use direct swaps for price manipulation. 
 
@@ -536,17 +538,19 @@ contract SettlementTests {
 
     function p6_1CreateRestrictedOrder() public {
         _approveToken6Tester(TOKEN6_AMOUNT);
-
-// Calculate Price: How much T18 (Out) for T6 (In)?
+        // Calculate Price: How much T18 (Out) for T6 (In)?
         uint256 currentPrice = _getPoolPrice(address(token6), address(token18));
         p6_orderId = listingTemplate.getNextOrderId();
         
         // Strict Range: 
-        // Min: Current * 0.75 (Allow slightly worse rate)
-        // Max: Current * 1.25 (Allow slightly better rate)
         uint256 minPrice = (currentPrice * 75) / 100;
         uint256 maxPrice = (currentPrice * 125) / 100;
         
+        // === FIX START: Update State Variables ===
+        minPriceFromP6 = minPrice;
+        maxPriceFromP6 = maxPrice;
+        // === FIX END ===
+
         tester.proxyCall(
             address(orderRouter),
             abi.encodeWithSignature(
@@ -604,89 +608,70 @@ contract SettlementTests {
 }
 
 function p6_3RecoverPriceAndSucceed() public {
-    // Goal: Bring price back into [minPrice, maxPrice] gradually
-    
-    // Safety check for state variables
-    require(maxPriceFromP6 > 0 && minPriceFromP6 > 0, "P6 state not set");
-
-    uint256 currentPrice;
-    uint256 swapAmount = 10 * 1e18; // Start small
-
-    // Limit iterations to prevent gas limit errors during testing
-    uint256 maxIterations = 20; 
-    uint256 i = 0;
-
-    while (i < maxIterations) {
-        currentPrice = _getPoolPrice(address(token6), address(token18));
+        // 1. Identify current state
+        (uint112 res0, uint112 res1,) = IUniswapV2Pair(pairToken18Token6).getReserves();
+        address t0 = IUniswapV2Pair(pairToken18Token6).token0();
         
-        // Success condition
-        if (currentPrice >= minPriceFromP6 && currentPrice <= maxPriceFromP6) {
-            break; 
-        }
+        // Identify which reserve corresponds to which token
+        uint256 resT6 = address(token6) == t0 ? uint256(res0) : uint256(res1);
+        uint256 resT18 = address(token18) == t0 ? uint256(res0) : uint256(res1);
 
-        if (currentPrice > maxPriceFromP6) {
-            // Price too HIGH. We need to LOWER it.
-            // Action: Sell Token6 -> Buy Token18 (Increases T6 reserve, Decreases T18 reserve)
-            token6.approve(address(uniRouter), swapAmount);
-            address[] memory path = new address[](2);
-            path[0] = address(token6);
-            path[1] = address(token18);
-            
-            // Note: We use 'try' to avoid test reverts if liquidity is tight
-            try uniRouter.swapExactTokensForTokens(swapAmount, 0, path, address(this), block.timestamp + 300) {} catch {}
-        } else {
-            // Price too LOW (This is the state after p6_2). We need to RAISE it.
-            // Action: Sell Token18 -> Buy Token6 (Increases T18 reserve, Decreases T6 reserve)
-            token18.approve(address(uniRouter), swapAmount);
-            address[] memory path = new address[](2);
-            path[0] = address(token18);
-            path[1] = address(token6);
-            
-            try uniRouter.swapExactTokensForTokens(swapAmount, 0, path, address(this), block.timestamp + 300) {} catch {}
-        }
+        // 2. Calculate discrepancy
+        // After the crash in p6_2, we expect resT6 (Sold In) > resT18 (Bought Out)
+        // To restore 1:1 price, we need to top up resT18 so it equals resT6.
+        require(resT6 > resT18, "State not crashed as expected");
+        uint256 amountNeeded = resT6 - resT18;
 
-        // Damping factor: Reduce impact as we get closer? 
-        // Actually, if we are far off, we might want to keep the size steady, 
-        // but reducing it is safer to avoid oscillating forever.
-        if (swapAmount > 1e16) {
-            swapAmount = swapAmount * 9 / 10;
-        }
+        // 3. Fund this contract so it can donate
+        token18.mint(address(this), amountNeeded);
         
-        i++;
+        // 4. Donate directly to pair (No Swap)
+        token18.transfer(pairToken18Token6, amountNeeded);
+        
+        // 5. Force Sync (Updates reserves to match the new balance)
+        // We use low-level call to avoid interface issues if you haven't updated the interface yet
+        (bool success,) = pairToken18Token6.call(abi.encodeWithSignature("sync()"));
+        require(success, "Sync failed");
+
+        // 6. Verify Price
+        uint256 currentPrice = _getPoolPrice(address(token6), address(token18));
+        emit DebugPrice(currentPrice, 0, "Recovered Price via Sync");
+
+        require(currentPrice >= minPriceFromP6 && currentPrice <= maxPriceFromP6, "Price not recovered to range");
+
+        // 7. Settle
+        uint256[] memory orderIds = new uint256[](1);
+        orderIds[0] = p6_orderId;
+        (,, uint256[] memory amounts,) = listingTemplate.getBuyOrder(p6_orderId);
+        
+        uint256[] memory amountsIn = new uint256[](1); 
+        amountsIn[0] = amounts[0]; // Full pending amount
+
+        settlementRouter.settleOrders(address(listingTemplate), orderIds, amountsIn, true);
+        (,,, uint8 status) = listingTemplate.getBuyOrder(p6_orderId);
+        
+        assert(status == 3);
+        emit TestPassed("p6_3RecoverPriceAndSucceed");
     }
-    
-    // Final check before attempting settlement
-    require(currentPrice >= minPriceFromP6 && currentPrice <= maxPriceFromP6, "Failed to recover price");
-
-    emit DebugPrice(currentPrice, 0, "Recovered Price Now In Range");
-    
-    // Now settle — should succeed
-    uint256[] memory orderIds = new uint256[](1); orderIds[0] = p6_orderId;
-    (,, uint256[] memory amounts,) = listingTemplate.getBuyOrder(p6_orderId);
-    uint256[] memory amountsIn = new uint256[](1); amountsIn[0] = amounts[0];
-
-    settlementRouter.settleOrders(address(listingTemplate), orderIds, amountsIn, true);
-    (,,, uint8 status) = listingTemplate.getBuyOrder(p6_orderId);
-    
-    assert(status == 3);
-    emit TestPassed("p6_3RecoverPriceAndSucceed");
-}
 
     // ============ PATH 7: HIGH IMPACT STRESS TEST ============
 
     function p7_1CreateHighImpactOrder() public {
-        _approveToken6Tester(TOKEN6_AMOUNT * 10); // Approve a lot
+        _approveToken6Tester(TOKEN6_AMOUNT * 10);
         
+        // === FIX START: Mint required tokens to tester ===
+        // The tester only has 1000e6 initially. We need 5000e6.
+        // We mint an extra 5000 to be safe.
+        token6.mint(address(tester), 5000 * 1e6);
+        // === FIX END ===
+
         // 1. Get current pool price
         uint256 currentPrice = _getPoolPrice(address(token6), address(token18));
-        
         // 2. Set bounds relatively tight (e.g., +/- 10%)
         uint256 minPrice = (currentPrice * 90) / 100;
         uint256 maxPrice = (currentPrice * 110) / 100;
         
         // 3. Create a MASSIVE order (e.g., 50% of the pool's liquidity)
-        // If pool has 10,000 T6, we order 5,000 T6.
-        // This will definitely shift the impact price beyond 10%.
         uint256 massiveAmount = 5000 * 1e6; 
         
         uint256 orderId = listingTemplate.getNextOrderId();
@@ -698,7 +683,7 @@ function p6_3RecoverPriceAndSucceed() public {
                 massiveAmount, maxPrice, minPrice
             )
         );
-        p7_orderId = orderId; // new state var
+        p7_orderId = orderId; 
         emit TestPassed("p7_1CreateHighImpactOrder");
     }
 
