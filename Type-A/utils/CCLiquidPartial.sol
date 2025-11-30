@@ -1,15 +1,13 @@
-/*
- SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
- Version: 0.1.0 (11/12/2025)
- Changes:
- - v0.1.0 (11/12): Complete refactor for monolithic architecture. Removed per-pair assumptions.
-   Updated to work with CCListingTemplate v0.4.2 and CCLiquidityTemplate v0.2.0.
-   Moved all interfaces from CCMainPartial. Orders now use startToken/endToken.
-   Removed volumeBalances calls (now queries Uniswap pair directly).
-   Updated fee computation to use token-specific liquidity amounts.
-*/
-
+// SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
+
+// Version: 0.1.2 (30/11/2025)
+// Changes:
+// - 30/11/2025: Resolved stack too deep in _executeSingleBuyLiquid and _executeSingleSellLiquid
+// - 30/11/2025: Fixed double-normalization in liquidity validation and updates.
+// - Added support for partially filled orders (status 2).
+// - Implemented split updates (StructID 2 & 0) to prevent overwriting.
+// - Corrected state calculation for pending/filled/sent amounts.
 
 import "../imports/IERC20.sol";
 import "../imports/ReentrancyGuard.sol";
@@ -99,6 +97,21 @@ interface IUniswapV2Factory {
 
 contract CCLiquidPartial is ReentrancyGuard {
     address internal listingAddress;
+    
+    // --- Structs for Calculation & Stack Management ---
+
+    struct ExecutionState {
+        uint256 orderId;
+        address[] addresses;
+        uint256[] amounts;
+        uint8 currentStatus;
+        uint256 amountIn;  // Normalized
+        uint256 amountOut; // Normalized
+        uint256 newPending;
+        uint256 newFilled;
+        uint256 newSent;
+        uint8 newStatus;
+    }
 
     struct OrderContext {
         ICCListing listingContract;
@@ -156,6 +169,23 @@ contract CCLiquidPartial is ReentrancyGuard {
         uint256 internalLiquidity;
     }
 
+    struct OrderLoad {
+        address[] addresses;
+        uint256[] amounts;
+        uint8 status;
+    }
+
+    struct OrderExtract {
+        address tokenIn;
+        address tokenOut;
+        uint256 pendingAmount;
+    }
+
+    struct PairValidation {
+        address pairAddress;
+        uint256 liquidOut;
+    }
+
     event FeeDeducted(address indexed listingAddress, uint256 orderId, bool isBuyOrder, uint256 feeAmount, uint256 netAmount);
     event PriceOutOfBounds(address indexed listingAddress, uint256 orderId, uint256 impactPrice, uint256 maxPrice, uint256 minPrice);
     event TokenTransferFailed(address indexed listingAddress, uint256 orderId, address token, string reason);
@@ -191,12 +221,9 @@ contract CCLiquidPartial is ReentrancyGuard {
         return token == address(0) ? 18 : IERC20(token).decimals();
     }
 
+    // ... [Swap/Fee/Liquidity Helper functions remain unchanged] ...
     function _getSwapReserves(address tokenIn, address tokenOut, address pairAddress) private view returns (SwapImpactContext memory context) {
         require(pairAddress != address(0), "Uniswap V2 pair not set");
-        IUniswapV2Pair pair = IUniswapV2Pair(pairAddress);
-        address token0 = pair.token0();
-        bool isToken0In = tokenIn == token0;
-        
         context.reserveIn = tokenIn == address(0) ? address(pairAddress).balance : IERC20(tokenIn).balanceOf(pairAddress);
         context.reserveOut = tokenOut == address(0) ? address(pairAddress).balance : IERC20(tokenOut).balanceOf(pairAddress);
         context.decimalsIn = _getTokenDecimals(tokenIn);
@@ -261,11 +288,10 @@ contract CCLiquidPartial is ReentrancyGuard {
         uint256 liquidIn = liquidityContract.liquidityAmounts(context.tokenIn);
         uint256 liquidOut = liquidityContract.liquidityAmounts(context.tokenOut);
         
-        uint256 normalizedPending = normalize(context.pendingAmount, context.decimalsIn);
-        uint256 normalizedSettle = normalize(context.amountOut, context.decimalsOut);
-        
+        uint256 normalizedPending = context.pendingAmount;
+        uint256 normalizedSettle = context.amountOut;
         FeeContext memory feeContext = _computeFee(liquidityContract, context.tokenIn, context.pendingAmount);
-        uint256 normalizedFee = normalize(feeContext.feeAmount, context.decimalsIn);
+        uint256 normalizedFee = feeContext.feeAmount; 
 
         require(liquidIn >= normalizedPending, "Insufficient input liquidity");
         require(liquidOut >= normalizedSettle, "Insufficient output liquidity");
@@ -297,12 +323,14 @@ contract CCLiquidPartial is ReentrancyGuard {
         _updateFees(liquidityContract, context.tokenIn, normalizedFee);
 
         ICCListing listingContract = ICCListing(listingAddress);
+        uint256 denormPending = denormalize(context.pendingAmount, context.decimalsIn);
+        
         if (context.tokenIn == address(0)) {
-            try listingContract.transactNative(context.pendingAmount, address(liquidityContract)) {} catch Error(string memory reason) {
+             try listingContract.transactNative(denormPending, address(liquidityContract)) {} catch Error(string memory reason) {
                 revert(string(abi.encodePacked("Native transfer failed: ", reason)));
-            }
+             }
         } else {
-            try listingContract.transactToken(context.tokenIn, context.pendingAmount, address(liquidityContract)) {} catch Error(string memory reason) {
+            try listingContract.transactToken(context.tokenIn, denormPending, address(liquidityContract)) {} catch Error(string memory reason) {
                 revert(string(abi.encodePacked("Token transfer failed: ", reason)));
             }
         }
@@ -333,20 +361,25 @@ contract CCLiquidPartial is ReentrancyGuard {
             timestamp: block.timestamp
         });
         
-        ICCListing.BuyOrderUpdate[] memory buyUpdates = new ICCListing.BuyOrderUpdate[](0);
-        ICCListing.SellOrderUpdate[] memory sellUpdates = new ICCListing.SellOrderUpdate[](0);
-        ICCListing.HistoricalUpdate[] memory historicalUpdates = new ICCListing.HistoricalUpdate[](1);
-        historicalUpdates[0] = update;
-        
-        try listingContract.ccUpdate(buyUpdates, sellUpdates, historicalUpdates) {
+        try listingContract.ccUpdate(
+            new ICCListing.BuyOrderUpdate[](0), 
+            new ICCListing.SellOrderUpdate[](0), 
+            _toHistoricalArray(update)
+        ) {
         } catch Error(string memory reason) {
             emit UpdateFailed(listingAddress, string(abi.encodePacked("Historical update failed: ", reason)));
         }
     }
 
+    function _toHistoricalArray(ICCListing.HistoricalUpdate memory update) private pure returns (ICCListing.HistoricalUpdate[] memory) {
+        ICCListing.HistoricalUpdate[] memory updates = new ICCListing.HistoricalUpdate[](1);
+        updates[0] = update;
+        return updates;
+    }
+
     function _executeOrderWithFees(uint256 orderIdentifier, bool isBuyOrder, FeeContext memory feeContext, address tokenIn, address tokenOut, address pairAddress) private returns (bool success) {
         ICCListing listingContract = ICCListing(listingAddress);
-        ICCLiquidity liquidityContract = ICCLiquidity(address(this)); // Assuming liquidity is managed here
+        ICCLiquidity liquidityContract = ICCLiquidity(address(this));
         
         emit FeeDeducted(listingAddress, orderIdentifier, isBuyOrder, feeContext.feeAmount, feeContext.netAmount);
         
@@ -365,32 +398,104 @@ contract CCLiquidPartial is ReentrancyGuard {
         _prepareLiquidityUpdates(liquidityContract, liquidityContext, pairAddress);
         _createHistoricalUpdate(listingContract, liquidityContract, tokenIn, tokenOut, pairAddress);
         
-        success = isBuyOrder ? _executeSingleBuyLiquid(orderIdentifier) : _executeSingleSellLiquid(orderIdentifier);
+        if (isBuyOrder) {
+            success = _executeSingleBuyLiquid(orderIdentifier, feeContext.netAmount, amountOut, liquidityContext.decimalsOut);
+        } else {
+            success = _executeSingleSellLiquid(orderIdentifier, feeContext.netAmount, amountOut, liquidityContext.decimalsOut);
+        }
         require(success, "Order execution failed");
     }
 
-    function _executeSingleBuyLiquid(uint256 orderIdentifier) internal returns (bool success) {
+    // --- HELPER: Calculate New State (Pending, Filled, Sent) ---
+    function _calculateNewState(ExecutionState memory state) private pure {
+        state.newPending = state.amounts[0] > state.amountIn ? state.amounts[0] - state.amountIn : 0;
+        state.newFilled = state.amounts[1] + state.amountIn;
+        state.newSent = state.amounts[2] + state.amountOut;
+        state.newStatus = state.newPending == 0 ? 3 : 2;
+    }
+
+    // --- HELPER: Create Buy Updates (Pure, avoids stack pressure) ---
+    function _createBuyUpdates(ExecutionState memory state) private pure returns (ICCListing.BuyOrderUpdate[] memory updates) {
+        updates = new ICCListing.BuyOrderUpdate[](2);
+        
+        // 1. Amounts Update (StructID 2)
+        updates[0] = ICCListing.BuyOrderUpdate({
+            structId: 2,
+            orderId: state.orderId,
+            addresses: state.addresses,
+            prices: new uint256[](0),
+            amounts: new uint256[](3),
+            status: 0
+        });
+        updates[0].amounts[0] = state.newPending;
+        updates[0].amounts[1] = state.newFilled;
+        updates[0].amounts[2] = state.newSent;
+
+        // 2. Status Update (StructID 0)
+        updates[1] = ICCListing.BuyOrderUpdate({
+            structId: 0,
+            orderId: state.orderId,
+            addresses: state.addresses,
+            prices: new uint256[](0),
+            amounts: new uint256[](0),
+            status: state.newStatus
+        });
+    }
+
+    // --- HELPER: Create Sell Updates (Pure, avoids stack pressure) ---
+    function _createSellUpdates(ExecutionState memory state) private pure returns (ICCListing.SellOrderUpdate[] memory updates) {
+        updates = new ICCListing.SellOrderUpdate[](2);
+        
+        // 1. Amounts Update (StructID 2)
+        updates[0] = ICCListing.SellOrderUpdate({
+            structId: 2,
+            orderId: state.orderId,
+            addresses: state.addresses,
+            prices: new uint256[](0),
+            amounts: new uint256[](3),
+            status: 0
+        });
+        updates[0].amounts[0] = state.newPending;
+        updates[0].amounts[1] = state.newFilled;
+        updates[0].amounts[2] = state.newSent;
+
+        // 2. Status Update (StructID 0)
+        updates[1] = ICCListing.SellOrderUpdate({
+            structId: 0,
+            orderId: state.orderId,
+            addresses: state.addresses,
+            prices: new uint256[](0),
+            amounts: new uint256[](0),
+            status: state.newStatus
+        });
+    }
+
+    // --- MAIN EXECUTION: Buy ---
+    function _executeSingleBuyLiquid(
+        uint256 orderIdentifier, 
+        uint256 amountIn, 
+        uint256 amountOut,
+        uint8 decimalsOut
+    ) internal returns (bool success) {
         ICCListing listingContract = ICCListing(listingAddress);
-        (address[] memory addresses, , uint256[] memory amounts, uint8 status) = listingContract.getBuyOrder(orderIdentifier);
+        ExecutionState memory state;
+        state.orderId = orderIdentifier;
+        state.amountIn = amountIn;
+        state.amountOut = amountOut;
+
+        (state.addresses, , state.amounts, state.currentStatus) = listingContract.getBuyOrder(orderIdentifier);
         
-        if (status != 1) return false;
+        if (state.currentStatus != 1 && state.currentStatus != 2) return false;
         
-        address recipient = addresses.length > 1 ? addresses[1] : addresses[0];
-        address tokenOut = addresses.length > 3 ? addresses[3] : address(0);
-        uint256 amountOut = amounts.length > 1 ? amounts[1] : 0;
-        
-        try listingContract.transactToken(tokenOut, amountOut, recipient) {
-            ICCListing.BuyOrderUpdate[] memory buyUpdates = new ICCListing.BuyOrderUpdate[](1);
-            buyUpdates[0] = ICCListing.BuyOrderUpdate({
-                structId: 0,
-                orderId: orderIdentifier,
-                addresses: addresses,
-                prices: new uint256[](0),
-                amounts: amounts,
-                status: 2
-            });
+        address recipient = state.addresses.length > 1 ? state.addresses[1] : state.addresses[0];
+        address tokenOut = state.addresses.length > 3 ? state.addresses[3] : address(0);
+        uint256 denormAmountOut = denormalize(amountOut, decimalsOut);
+
+        try listingContract.transactToken(tokenOut, denormAmountOut, recipient) {
+            _calculateNewState(state);
+            ICCListing.BuyOrderUpdate[] memory updates = _createBuyUpdates(state);
             
-            listingContract.ccUpdate(buyUpdates, new ICCListing.SellOrderUpdate[](0), new ICCListing.HistoricalUpdate[](0));
+            listingContract.ccUpdate(updates, new ICCListing.SellOrderUpdate[](0), new ICCListing.HistoricalUpdate[](0));
             return true;
         } catch Error(string memory reason) {
             emit TokenTransferFailed(listingAddress, orderIdentifier, tokenOut, reason);
@@ -398,28 +503,32 @@ contract CCLiquidPartial is ReentrancyGuard {
         }
     }
 
-    function _executeSingleSellLiquid(uint256 orderIdentifier) internal returns (bool success) {
+    // --- MAIN EXECUTION: Sell ---
+    function _executeSingleSellLiquid(
+        uint256 orderIdentifier, 
+        uint256 amountIn, 
+        uint256 amountOut,
+        uint8 decimalsOut
+    ) internal returns (bool success) {
         ICCListing listingContract = ICCListing(listingAddress);
-        (address[] memory addresses, , uint256[] memory amounts, uint8 status) = listingContract.getSellOrder(orderIdentifier);
+        ExecutionState memory state;
+        state.orderId = orderIdentifier;
+        state.amountIn = amountIn;
+        state.amountOut = amountOut;
+
+        (state.addresses, , state.amounts, state.currentStatus) = listingContract.getSellOrder(orderIdentifier);
         
-        if (status != 1) return false;
-        
-        address recipient = addresses.length > 1 ? addresses[1] : addresses[0];
-        address tokenOut = addresses.length > 3 ? addresses[3] : address(0);
-        uint256 amountOut = amounts.length > 1 ? amounts[1] : 0;
-        
-        try listingContract.transactToken(tokenOut, amountOut, recipient) {
-            ICCListing.SellOrderUpdate[] memory sellUpdates = new ICCListing.SellOrderUpdate[](1);
-            sellUpdates[0] = ICCListing.SellOrderUpdate({
-                structId: 0,
-                orderId: orderIdentifier,
-                addresses: addresses,
-                prices: new uint256[](0),
-                amounts: amounts,
-                status: 2
-            });
-            
-            listingContract.ccUpdate(new ICCListing.BuyOrderUpdate[](0), sellUpdates, new ICCListing.HistoricalUpdate[](0));
+        if (state.currentStatus != 1 && state.currentStatus != 2) return false;
+
+        address recipient = state.addresses.length > 1 ? state.addresses[1] : state.addresses[0];
+        address tokenOut = state.addresses.length > 3 ? state.addresses[3] : address(0);
+        uint256 denormAmountOut = denormalize(amountOut, decimalsOut);
+
+        try listingContract.transactToken(tokenOut, denormAmountOut, recipient) {
+            _calculateNewState(state);
+            ICCListing.SellOrderUpdate[] memory updates = _createSellUpdates(state);
+
+            listingContract.ccUpdate(new ICCListing.BuyOrderUpdate[](0), updates, new ICCListing.HistoricalUpdate[](0));
             return true;
         } catch Error(string memory reason) {
             emit TokenTransferFailed(listingAddress, orderIdentifier, tokenOut, reason);
@@ -430,8 +539,8 @@ contract CCLiquidPartial is ReentrancyGuard {
     function _validateLiquidity(ICCLiquidity liquidityContract, address tokenIn, address tokenOut, uint256 pendingAmount, uint256 amountOut) private returns (LiquidityValidationContext memory context) {
         context.liquidIn = liquidityContract.liquidityAmounts(tokenIn);
         context.liquidOut = liquidityContract.liquidityAmounts(tokenOut);
-        context.normalizedPending = normalize(pendingAmount, _getTokenDecimals(tokenIn));
-        context.normalizedSettle = normalize(amountOut, _getTokenDecimals(tokenOut));
+        context.normalizedPending = pendingAmount;
+        context.normalizedSettle = amountOut;
 
         if (context.liquidIn < context.normalizedPending) {
             emit InsufficientBalance(listingAddress, context.normalizedPending, context.liquidIn);
@@ -449,7 +558,6 @@ contract CCLiquidPartial is ReentrancyGuard {
         context.normalizedUniswapBalance = tokenOut == address(0) ? address(pairAddress).balance : IERC20(tokenOut).balanceOf(pairAddress);
         context.normalizedUniswapBalance = normalize(context.normalizedUniswapBalance, _getTokenDecimals(tokenOut));
         context.internalLiquidity = validationContext.liquidOut;
-        
         if (context.normalizedUniswapBalance > context.internalLiquidity) {
             emit UniswapLiquidityExcess(listingAddress, orderIdentifier, isBuyOrder, context.normalizedUniswapBalance, context.internalLiquidity);
             return false;
@@ -470,7 +578,6 @@ contract CCLiquidPartial is ReentrancyGuard {
 
     function _processSingleOrder(ICCLiquidity liquidityContract, uint256 orderIdentifier, bool isBuyOrder, uint256 pendingAmount, address tokenIn, address tokenOut, address tokenA, address tokenB, address pairAddress) internal returns (bool success) {
         OrderProcessingContext memory pricingContext = _validateOrderPricing(tokenA, tokenB, pendingAmount, tokenIn, tokenOut, pairAddress);
-        
         if (pricingContext.impactPrice == 0) {
             emit PriceOutOfBounds(listingAddress, orderIdentifier, pricingContext.impactPrice, pricingContext.maxPrice, pricingContext.minPrice);
             return false;
@@ -491,8 +598,7 @@ contract CCLiquidPartial is ReentrancyGuard {
         return _executeOrderWithFees(orderIdentifier, isBuyOrder, feeContext, tokenIn, tokenOut, pairAddress);
     }
     
-//  (0.1.2)
-  function _markPairProcessed(address tokenIn, address tokenOut) private {
+    function _markPairProcessed(address tokenIn, address tokenOut) private {
         bytes32 pairKey = keccak256(abi.encodePacked(tokenIn, tokenOut));
         processedPairsMap[pairKey] = true;
     }
@@ -502,14 +608,6 @@ contract CCLiquidPartial is ReentrancyGuard {
         return processedPairsMap[pairKey];
     }
 
-    /// Loads raw order data into a minimal struct (≤4 fields).
-    struct OrderLoad {
-        address[] addresses;
-        uint256[] amounts;
-        uint8 status;
-    }
-
-    /// Loads a single order from listing contract.
     function _loadOrderContext(
         ICCListing listingContract,
         uint256 orderId,
@@ -522,27 +620,14 @@ contract CCLiquidPartial is ReentrancyGuard {
         }
     }
 
-    /// Validates order structure and extracts tokenIn/tokenOut/pendingAmount.
-    struct OrderExtract {
-        address tokenIn;
-        address tokenOut;
-        uint256 pendingAmount;
-    }
-
     function _extractOrderTokens(
         OrderLoad memory load
     ) private pure returns (OrderExtract memory extract) {
-        if (load.addresses.length < 4) return extract; // zero values → skip
+        if (load.addresses.length < 4) return extract;
         extract.pendingAmount = load.amounts.length > 0 ? load.amounts[0] : 0;
         if (extract.pendingAmount == 0) return extract;
-        extract.tokenIn = load.addresses[2];   // startToken
-        extract.tokenOut = load.addresses[3];  // endToken
-    }
-
-    /// Validates pair existence and output liquidity.
-    struct PairValidation {
-        address pairAddress;
-        uint256 liquidOut;
+        extract.tokenIn = load.addresses[2]; 
+        extract.tokenOut = load.addresses[3]; 
     }
 
     function _validatePairAndLiquidity(
@@ -562,7 +647,6 @@ contract CCLiquidPartial is ReentrancyGuard {
         }
     }
 
-    /// Handles historical update once per unique pair in the batch.
     function _handleHistoricalOnce(
         ICCListing listingContract,
         ICCLiquidity liquidityContract,
@@ -586,17 +670,14 @@ contract CCLiquidPartial is ReentrancyGuard {
 
         address factory = listingContract.uniswapV2Factory();
         require(factory != address(0), "Factory not set");
-        
         for (uint256 i = step; i < orderIdentifiers.length; i++) {
-            // 1. Load order
             OrderLoad memory load = _loadOrderContext(listingContract, orderIdentifiers[i], isBuyOrder);
-            if (load.status != 1) continue; // only pending orders
+            
+            if (load.status != 1 && load.status != 2) continue;
 
-            // 2. Extract tokens & amount
             OrderExtract memory extract = _extractOrderTokens(load);
             if (extract.pendingAmount == 0) continue;
 
-            // 3. Validate pair & liquidity
             PairValidation memory validation = _validatePairAndLiquidity(
                 factory,
                 extract.tokenIn,
@@ -605,7 +686,6 @@ contract CCLiquidPartial is ReentrancyGuard {
             );
             if (validation.pairAddress == address(0) || validation.liquidOut == 0) continue;
 
-            // 4. Historical update (once per pair)
             _handleHistoricalOnce(
                 listingContract,
                 liquidityContract,
@@ -614,7 +694,6 @@ contract CCLiquidPartial is ReentrancyGuard {
                 validation.pairAddress
             );
 
-            // 5. Execute single order
             if (_processSingleOrder(
                 liquidityContract,
                 orderIdentifiers[i],
