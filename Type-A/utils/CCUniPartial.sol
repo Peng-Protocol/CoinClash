@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.4.9 (26/11/2025)
+// Version: 0.4.11 (30/11/2025)
 // Changes:
+// - (30/11/2025): Removed unnecessary normalization in order updates. 
+// - (29/11/2025): Adjusted order updates to remove redundant update arrays to prevent overwriting. 
 // - (26/11/2025): Ensured successive order updates do not overwrite preceeding ones.
 // - (26/11/2025): Ensured correct status updates.
 
@@ -321,186 +323,198 @@ contract CCUniPartial is CCMainPartial {
         newStatus = newPending == 0 ? 3 : 2;
     }
 
-    function _normalizeOut(uint256 amountOut, uint8 decimalsOut) 
-        internal pure returns (uint256 normalized) 
-    {
-        normalized = normalize(amountOut, decimalsOut);
-    }
-
     function _buildBuyUpdate(
-        uint8 structId,
-        UpdateIds memory ids,
-        UpdateAmounts memory amounts,
-        UpdateState memory state,
-        uint256 newPending,
-        uint8 newStatus
-    ) internal pure returns (ICCListing.BuyOrderUpdate memory upd) {
-        upd.structId = structId;
-        upd.orderId = ids.orderId;
-        
-        upd.addresses = new address[](4);
-        upd.addresses[0] = ids.maker;
-        upd.addresses[1] = ids.recipient;
-        upd.addresses[2] = ids.startToken;
-        upd.addresses[3] = ids.endToken;
-        
-        upd.prices = new uint256[](2);
-        upd.prices[0] = 0;
-        upd.prices[1] = 0;
-        
-        // [FIX] Always populate amounts to prevent overwriting state with zeros
+    uint8 structId,
+    UpdateIds memory ids,
+    UpdateAmounts memory amounts,
+    UpdateState memory state,
+    uint256 newPending,
+    uint8 newStatus
+) internal pure returns (ICCListing.BuyOrderUpdate memory upd) {
+    upd.structId = structId;
+    upd.orderId = ids.orderId;
+    
+    upd.addresses = new address[](4);
+    upd.addresses[0] = ids.maker;
+    upd.addresses[1] = ids.recipient;
+    upd.addresses[2] = ids.startToken;
+    upd.addresses[3] = ids.endToken;
+
+    upd.prices = new uint256[](0);
+
+    if (structId == 2) {
+        // === STRUCT ID 2: AMOUNTS ONLY ===
         upd.amounts = new uint256[](3);
         upd.amounts[0] = newPending;
         upd.amounts[1] = amounts.filled + amounts.amountIn;
-        upd.amounts[2] = state.priorSent + _normalizeOut(amounts.amountOut, state.decimalsOut);
+        upd.amounts[2] = state.priorSent + amounts.amountOut;  // *** FIXED: Removed _normalizeOut call ***
         
-        // [FIX] Always use the calculated newStatus
+        upd.status = 0;
+    } else {
+        // === STRUCT ID 0: CORE ONLY ===
+        upd.amounts = new uint256[](0);
         upd.status = newStatus;
     }
+}
 
     function _buildSellUpdate(
-        uint8 structId,
-        UpdateIds memory ids,
-        UpdateAmounts memory amounts,
-        UpdateState memory state,
-        uint256 newPending,
-        uint8 newStatus
-    ) internal pure returns (ICCListing.SellOrderUpdate memory upd) {
-        upd.structId = structId;
-        upd.orderId = ids.orderId;
-        
-        upd.addresses = new address[](4);
-        upd.addresses[0] = ids.maker;
-        upd.addresses[1] = ids.recipient;
-        upd.addresses[2] = ids.startToken;
-        upd.addresses[3] = ids.endToken;
-        
-        upd.prices = new uint256[](2);
-        upd.prices[0] = 0;
-        upd.prices[1] = 0;
-        
-        // [FIX] Always populate amounts to prevent overwriting state with zeros
+    uint8 structId,
+    UpdateIds memory ids,
+    UpdateAmounts memory amounts,
+    UpdateState memory state,
+    uint256 newPending,
+    uint8 newStatus
+) internal pure returns (ICCListing.SellOrderUpdate memory upd) {
+    upd.structId = structId;
+    upd.orderId = ids.orderId;
+    
+    upd.addresses = new address[](4);
+    upd.addresses[0] = ids.maker;
+    upd.addresses[1] = ids.recipient;
+    upd.addresses[2] = ids.startToken;
+    upd.addresses[3] = ids.endToken;
+
+    upd.prices = new uint256[](0); 
+
+    if (structId == 2) {
+        // === STRUCT ID 2: AMOUNTS ONLY ===
         upd.amounts = new uint256[](3);
         upd.amounts[0] = newPending;
         upd.amounts[1] = amounts.filled + amounts.amountIn;
-        upd.amounts[2] = state.priorSent + _normalizeOut(amounts.amountOut, state.decimalsOut);
+        upd.amounts[2] = state.priorSent + amounts.amountOut;  // *** FIXED: Removed _normalizeOut call ***
         
-        // [FIX] Always use the calculated newStatus
+        upd.status = 0;
+    } else {
+        // === STRUCT ID 0: CORE ONLY ===
+        upd.amounts = new uint256[](0);
         upd.status = newStatus;
     }
+}
 
     function _createOrderUpdates(
-        uint256 orderIdentifier,
-        address[] memory addresses,
-        uint256 pendingAmount,
-        uint256 filled,
-        uint256 amountIn,
-        uint256 amountOut,
-        uint256 priorAmountSent,
-        bool isBuyOrder,
-        uint8 decimalsOut
-    ) internal pure returns (
-        ICCListing.BuyOrderUpdate[] memory buyUpdates,
-        ICCListing.SellOrderUpdate[] memory sellUpdates
-    ) {
-        UpdateIds memory ids = UpdateIds(
-            orderIdentifier,
-            addresses[0],
-            addresses[1],
-            addresses[2],
-            addresses[3]
-        );
-        UpdateAmounts memory amounts = UpdateAmounts(pendingAmount, filled, amountIn, amountOut);
-        UpdateState memory state = UpdateState(priorAmountSent, decimalsOut, isBuyOrder);
-        (uint256 newPending, uint8 newStatus) = _computePendingAndStatus(pendingAmount, amountIn);
+    uint256 orderIdentifier,
+    address[] memory addresses,
+    uint256 pendingAmount,
+    uint256 filled,
+    uint256 amountIn,
+    uint256 amountOut,
+    uint256 priorAmountSent,
+    bool isBuyOrder,
+    uint8 decimalsOut
+) internal pure returns (
+    ICCListing.BuyOrderUpdate[] memory buyUpdates,
+    ICCListing.SellOrderUpdate[] memory sellUpdates
+) {
+    UpdateIds memory ids = UpdateIds(
+        orderIdentifier,
+        addresses[0],
+        addresses[1],
+        addresses[2],
+        addresses[3]
+    );
+    UpdateAmounts memory amounts = UpdateAmounts(pendingAmount, filled, amountIn, amountOut);
+    UpdateState memory state = UpdateState(priorAmountSent, decimalsOut, isBuyOrder);
+    (uint256 newPending, uint8 newStatus) = _computePendingAndStatus(pendingAmount, amountIn);
 
-        if (isBuyOrder) {
-            buyUpdates = new ICCListing.BuyOrderUpdate[](2);
-            buyUpdates[0] = _buildBuyUpdate(2, ids, amounts, state, newPending, newStatus); 
-            buyUpdates[1] = _buildBuyUpdate(0, ids, amounts, state, newPending, newStatus);
-            sellUpdates = new ICCListing.SellOrderUpdate[](0);
-        } else {
-            sellUpdates = new ICCListing.SellOrderUpdate[](2);
-            sellUpdates[0] = _buildSellUpdate(2, ids, amounts, state, newPending, newStatus); 
-            sellUpdates[1] = _buildSellUpdate(0, ids, amounts, state, newPending, newStatus);
-            buyUpdates = new ICCListing.BuyOrderUpdate[](0);
-        }
+    if (isBuyOrder) {
+        buyUpdates = new ICCListing.BuyOrderUpdate[](2);
+        // 1. Send Amounts (StructID 2) - Updates storage.amounts
+        buyUpdates[0] = _buildBuyUpdate(2, ids, amounts, state, newPending, newStatus); 
+        // 2. Send Core (StructID 0) - Updates storage.status (with empty amounts to avoid overwrite)
+        buyUpdates[1] = _buildBuyUpdate(0, ids, amounts, state, newPending, newStatus);
+        sellUpdates = new ICCListing.SellOrderUpdate[](0);
+    } else {
+        sellUpdates = new ICCListing.SellOrderUpdate[](2);
+        // 1. Send Amounts (StructID 2)
+        sellUpdates[0] = _buildSellUpdate(2, ids, amounts, state, newPending, newStatus); 
+        // 2. Send Core (StructID 0)
+        sellUpdates[1] = _buildSellUpdate(0, ids, amounts, state, newPending, newStatus);
+        buyUpdates = new ICCListing.BuyOrderUpdate[](0);
     }
+}
  
     function _executePartialBuySwap(
-        address listingAddress,
-        uint256 orderIdentifier,
-        uint256 amountIn,          
-        uint256 pendingAmount,     
-        address[] memory addresses,
-        uint256[] memory amounts,
-        SettlementContext memory settlementContext
-    ) internal returns (ICCListing.BuyOrderUpdate[] memory buyUpdates) {
+    address listingAddress,
+    uint256 orderIdentifier,
+    uint256 amountIn,          
+    uint256 pendingAmount,     
+    address[] memory addresses,
+    uint256[] memory amounts,
+    SettlementContext memory settlementContext
+) internal returns (ICCListing.BuyOrderUpdate[] memory buyUpdates) {
 
-        (SwapContext memory context, address[] memory path) = _prepareBuySwapData(
-            listingAddress, 
-            orderIdentifier, 
-            amountIn,
-            addresses, 
-            settlementContext
-        );
+    (SwapContext memory context, address[] memory path) = _prepareBuySwapData(
+        listingAddress, 
+        orderIdentifier, 
+        amountIn,
+        addresses, 
+        settlementContext
+    );
 
-        if (context.price == 0) {
-            emit OrderSkipped(orderIdentifier, "Zero price in swap data");
-            return new ICCListing.BuyOrderUpdate[](0);
-        }
-        
-        _prepBuyOrderUpdate(listingAddress, orderIdentifier, context.denormAmountIn, settlementContext);
-
-        uint256 amountOut = _performSwap(
-            context, 
-            path, 
-            context.tokenIn == address(0), 
-            context.tokenOut == address(0) 
-        );
-
-        (buyUpdates, ) = _createOrderUpdates(
-            orderIdentifier,
-            addresses,
-            pendingAmount,
-            amounts[1],      
-            amountIn,
-            amountOut,
-            amounts[2],      
-            true,            
-            context.decimalsOut
-        );
+    if (context.price == 0) {
+        emit OrderSkipped(orderIdentifier, "Zero price in swap data");
+        return new ICCListing.BuyOrderUpdate[](0);
     }
+    
+    _prepBuyOrderUpdate(listingAddress, orderIdentifier, context.denormAmountIn, settlementContext);
+
+    uint256 amountOut = _performSwap(
+        context, 
+        path, 
+        context.tokenIn == address(0), 
+        context.tokenOut == address(0) 
+    );
+
+    // *** FIX: Normalize amountOut before passing to _createOrderUpdates ***
+    uint256 normalizedAmountOut = normalize(amountOut, context.decimalsOut);
+
+    (buyUpdates, ) = _createOrderUpdates(
+        orderIdentifier,
+        addresses,
+        pendingAmount,
+        amounts[1],      
+        amountIn,
+        normalizedAmountOut,  // *** CHANGED: Pass normalized value ***
+        amounts[2],      
+        true,            
+        context.decimalsOut
+    );
+}
 
     function _executePartialSellSwap(
-        address listingAddress,
-        uint256 orderIdentifier,
-        uint256 amountIn,
-        uint256 pendingAmount,
-        address[] memory addresses,
-        uint256[] memory amounts,
-        SettlementContext memory settlementContext
-    ) internal returns (ICCListing.SellOrderUpdate[] memory sellUpdates) {
-        (SwapContext memory context, address[] memory path) = _prepareSellSwapData(listingAddress, orderIdentifier, amountIn, addresses, settlementContext);
-        if (context.price == 0) {
-            emit OrderSkipped(orderIdentifier, "Zero price in swap data");
-            return new ICCListing.SellOrderUpdate[](0);
-        }
-        
-        _prepSellOrderUpdate(listingAddress, orderIdentifier, context.denormAmountIn, settlementContext);
-        uint256 amountOut = _performSwap(context, path, context.tokenIn == address(0), context.tokenOut == address(0));
-        (,sellUpdates) = _createOrderUpdates(
-            orderIdentifier,
-            addresses,
-            pendingAmount,
-            amounts[1],
-            amountIn,
-            amountOut,
-            amounts[2],
-            false,
-            context.decimalsOut
-        );
+    address listingAddress,
+    uint256 orderIdentifier,
+    uint256 amountIn,
+    uint256 pendingAmount,
+    address[] memory addresses,
+    uint256[] memory amounts,
+    SettlementContext memory settlementContext
+) internal returns (ICCListing.SellOrderUpdate[] memory sellUpdates) {
+    (SwapContext memory context, address[] memory path) = _prepareSellSwapData(listingAddress, orderIdentifier, amountIn, addresses, settlementContext);
+    if (context.price == 0) {
+        emit OrderSkipped(orderIdentifier, "Zero price in swap data");
+        return new ICCListing.SellOrderUpdate[](0);
     }
+    
+    _prepSellOrderUpdate(listingAddress, orderIdentifier, context.denormAmountIn, settlementContext);
+    
+    uint256 amountOut = _performSwap(context, path, context.tokenIn == address(0), context.tokenOut == address(0));
+    
+    // *** FIX: Normalize amountOut before passing to _createOrderUpdates ***
+    uint256 normalizedAmountOut = normalize(amountOut, context.decimalsOut);
+    
+    (,sellUpdates) = _createOrderUpdates(
+        orderIdentifier,
+        addresses,
+        pendingAmount,
+        amounts[1],
+        amountIn,
+        normalizedAmountOut,  // *** CHANGED: Pass normalized value ***
+        amounts[2],
+        false,
+        context.decimalsOut
+    );
+}
 
     function uint2str(uint256 _i) internal pure returns (string memory str) {
         if (_i == 0) return "0";
