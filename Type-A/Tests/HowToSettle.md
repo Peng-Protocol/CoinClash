@@ -68,8 +68,9 @@ All settlement paths assume the above setup is complete.
 | **Path 6 – Seesaw Price Impact** | `p6_1CreateRestrictedOrder()` | Creates Buy order with tight min/max price range (±25%) | Pending order with price bounds |
 |      | `p6_2CrashPriceAndFail()` | Dumps massive Token6 → price crashes below minPrice | Settlement skipped (order stays Pending) |
 |      | `p6_3RecoverPriceAndSucceed()` | Adds Token18 back → price recovers into range | Settlement succeeds → order Filled |
-| **Path 7 – Impact ** | `p7_1CreateHighImpactOrder()` | Creates an order with relatively large principal | order cannot be settled fue to price impact |
-|      | `p7_2AttemptImpactSettlement()` | Attemps to settle the order expecting it to be skipped | Order still active, settlement degrades gracefully with error message |
+| **Path 7 – Impact ** | `p7_1CreateHighImpactOrder()` | Creates an order with relatively large principal | order cannot be settled due to price impact |
+|      | `p7_2AttemptImpactSettlement()` | Attempts to settle the order expecting it to be skipped | Order still active, settlement degrades gracefully with error message |
 
 ### Running the Tests
 - Watch the Remix transaction logs for `TestPassed`, `OrderSettled`, and `DebugPrice` events.
+- Manually inspect orders by fetching `p#_orderId` or `p#_order#` on `SettlementTests` then querying `getBuyOrder` or `getSellOrder` on the `CCListingTemplate`. 
