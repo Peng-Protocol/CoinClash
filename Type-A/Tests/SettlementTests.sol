@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.10 (28/11/2025)
+// File Version: 0.0.12 (30/11/2025)
+// 0.0.12 (30/11/2025): Fixed stack too deep in p6_3 with internal helpers and structs. 
+// 0.0.11 (30/11/2025): Fixed order state capture in p6_3.
 // 0.0.10 (28/11/2025): Refactored p6_3. 
 // 0.0.9 (28/11/2025): Fixed normalization in p6_3.
-// 0.0.8 (28/11/2035): Adjusted p6_3 to use direct transfer and sync. 
+// 0.0.8 (28/11/2025): Adjusted p6_3 to use direct transfer and sync. 
 // 0.0.7 (28/11/2025): Added mint to tester in p7, initialized p6 state in p6_1. 
 // 0.0.6 (27/11/2025): Replaced p7 with impact price test, corrected p6 order direction and gas control. 
 // 0.0.5 (26/11/2025): Adjusted p6 to use direct swaps for price manipulation. 
@@ -120,6 +122,26 @@ contract SettlementTests {
     event TestPassed(string testName);
     event OrderSettled(uint256 orderId, uint256 amountIn, uint256 pending, uint256 filled);
     event DebugPrice(uint256 price, uint256 maxPrice, string label);
+    
+   // P6 stack reduction state
+struct P6InitialState {
+    uint256 pending;
+    uint256 filled;
+    uint256 sent;
+}
+
+struct P6RecoveryParams {
+    uint256 crashedPrice;
+    uint256 targetPrice;
+    uint256 recoveredPrice;
+}
+
+struct P6ReserveData {
+    uint256 resT6Raw;
+    uint256 resT18Raw;
+    uint256 normResT6;
+    uint256 normResT18;
+}
 
     constructor() {
         owner = msg.sender;
@@ -610,47 +632,45 @@ contract SettlementTests {
 }
 
 function p6_3RecoverPriceAndSucceed() public {
-    // 1. Get current crashed price
+    // Capture initial state
+    P6InitialState memory initialState = _p6_captureInitialState();
+    
+    // Perform price recovery
+    _p6_recoverPrice();
+    
+    // Settle and verify
+    _p6_settleAndVerify(initialState);
+    
+    emit TestPassed("p6_3RecoverPriceAndSucceed");
+}
+
+function _p6_captureInitialState() internal view returns (P6InitialState memory state) {
+    (,, uint256[] memory amounts,) = listingTemplate.getBuyOrder(p6_orderId);
+    state.pending = amounts[0];
+    state.filled = amounts[1];
+    state.sent = amounts[2];
+}
+
+function _p6_recoverPrice() internal {
+    // Get current crashed price
     uint256 crashedPrice = _getPoolPrice(address(token6), address(token18));
     emit DebugPrice(crashedPrice, minPriceFromP6, "Crashed Price Before Recovery");
     
-    // 2. Calculate target price (middle of the allowed range)
+    // Calculate target price
     uint256 targetPrice = (minPriceFromP6 + maxPriceFromP6) / 2;
     
-    // 3. Get current reserves
-    (uint112 res0, uint112 res1,) = IUniswapV2Pair(pairToken18Token6).getReserves();
-    address t0 = IUniswapV2Pair(pairToken18Token6).token0();
+    // Calculate and add required liquidity
+    uint256 amountToAdd = _p6_calculateRequiredLiquidity(targetPrice);
     
-    // Identify which reserve corresponds to which token
-    uint256 resT6Raw = address(token6) == t0 ? uint256(res0) : uint256(res1);
-    uint256 resT18Raw = address(token18) == t0 ? uint256(res0) : uint256(res1);
-    
-    // 4. Normalize reserves to 18 decimals
-    uint256 normResT6 = resT6Raw * 1e12;  // 6 → 18 decimals
-    uint256 normResT18 = resT18Raw;       // Already 18 decimals
-    
-    // 5. Calculate required Token18 amount to reach target price
-    // Price = normResT18 / normResT6
-    // Target: targetPrice = (normResT18 + X) / normResT6
-    // Solving for X: X = (targetPrice * normResT6) - normResT18
-    uint256 requiredNormT18 = (targetPrice * normResT6) / 1e18;
-    
-    require(requiredNormT18 > normResT18, "Price already recovered or over-recovered");
-    
-    uint256 amountToAdd = requiredNormT18 - normResT18;
-    
-    // 6. Add safety margin (5% extra to ensure we're well within bounds)
-    amountToAdd = (amountToAdd * 105) / 100;
-    
-    // 7. Mint and transfer Token18 to pair
+    // Mint and add liquidity
     token18.mint(address(this), amountToAdd);
     token18.transfer(pairToken18Token6, amountToAdd);
     
-    // 8. Force sync to update reserves
+    // Force sync
     (bool success,) = pairToken18Token6.call(abi.encodeWithSignature("sync()"));
     require(success, "Sync failed");
     
-    // 9. Verify price is now within bounds
+    // Verify recovery
     uint256 recoveredPrice = _getPoolPrice(address(token6), address(token18));
     emit DebugPrice(recoveredPrice, targetPrice, "Recovered Price");
     
@@ -658,8 +678,34 @@ function p6_3RecoverPriceAndSucceed() public {
         recoveredPrice >= minPriceFromP6 && recoveredPrice <= maxPriceFromP6,
         "Price not within required bounds"
     );
+}
+
+function _p6_calculateRequiredLiquidity(uint256 targetPrice) internal view returns (uint256 amountToAdd) {
+    // Get current reserves
+    (uint112 res0, uint112 res1,) = IUniswapV2Pair(pairToken18Token6).getReserves();
+    address t0 = IUniswapV2Pair(pairToken18Token6).token0();
     
-    // 10. Now attempt settlement
+    P6ReserveData memory reserves;
+    reserves.resT6Raw = address(token6) == t0 ? uint256(res0) : uint256(res1);
+    reserves.resT18Raw = address(token18) == t0 ? uint256(res0) : uint256(res1);
+    
+    // Normalize reserves to 18 decimals
+    reserves.normResT6 = reserves.resT6Raw * 1e12;
+    reserves.normResT18 = reserves.resT18Raw;
+    
+    // Calculate required Token18 amount
+    uint256 requiredNormT18 = (targetPrice * reserves.normResT6) / 1e18;
+    
+    require(requiredNormT18 > reserves.normResT18, "Price already recovered or over-recovered");
+    
+    amountToAdd = requiredNormT18 - reserves.normResT18;
+    
+    // Add 5% safety margin
+    amountToAdd = (amountToAdd * 105) / 100;
+}
+
+function _p6_settleAndVerify(P6InitialState memory initialState) internal {
+    // Prepare settlement
     uint256[] memory orderIds = new uint256[](1);
     orderIds[0] = p6_orderId;
     
@@ -669,45 +715,42 @@ function p6_3RecoverPriceAndSucceed() public {
     uint256[] memory amountsIn = new uint256[](1);
     amountsIn[0] = amounts[0];
     
-    // 11. Settlement should now succeed
-    string memory result = settlementRouter.settleOrders(
+    // Execute settlement
+    settlementRouter.settleOrders(
         address(listingTemplate),
         orderIds,
         amountsIn,
         true
     );
     
-    // 12. Get initial amounts to verify correct updates
-    (,, uint256[] memory initialAmounts,) = listingTemplate.getBuyOrder(p6_orderId);
-    uint256 initialPending = initialAmounts[0];
-    uint256 initialFilled = initialAmounts[1];
-    uint256 initialSent = initialAmounts[2];
-    
-    // 13. Verify order was filled correctly
+    // Verify results
+    _p6_verifySettlement(initialState);
+}
+
+function _p6_verifySettlement(P6InitialState memory initialState) internal view {
     (,, uint256[] memory finalAmounts, uint8 finalStatus) = listingTemplate.getBuyOrder(p6_orderId);
     
     require(finalStatus == 3, "Order should be filled");
     require(finalAmounts[0] == 0, "Pending should be zero");
     
-    // Critical: Filled must increase by exactly the amount pending decreased
+    // Verify filled amount increased correctly
+    uint256 expectedFilled = initialState.filled + initialState.pending;
     require(
-        finalAmounts[1] == initialFilled + initialPending,
+        finalAmounts[1] == expectedFilled,
         "Filled must increase by exact pending amount"
     );
     
-    // Critical: AmountSent must be different from Filled (output != input due to swap)
+    // Verify amountSent is different from filled (swap output != input)
     require(
         finalAmounts[2] != finalAmounts[1],
         "AmountSent must differ from Filled (swap output != input)"
     );
     
-    // AmountSent should have increased from the swap
+    // Verify amountSent increased
     require(
-        finalAmounts[2] > initialSent,
+        finalAmounts[2] > initialState.sent,
         "AmountSent should have increased"
     );
-    
-    emit TestPassed("p6_3RecoverPriceAndSucceed");
 }
 
     // ============ PATH 7: HIGH IMPACT STRESS TEST ============
