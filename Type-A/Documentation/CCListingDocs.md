@@ -169,7 +169,7 @@ The `CCListingTemplate` contract (Solidity ^0.8.2) enables decentralized trading
 - **getHistoricalDataView(address tokenA, address tokenB, uint256 index)**: Returns `HistoricalData` at index for pair.
 - **historicalDataLengthView(address tokenA, address tokenB)**: Returns length of `_historicalData` for pair.
 - **getDayStartIndex(address tokenA, address tokenB, uint256 midnight)**: Returns index of first entry on that day.
-- **prices(address tokenA, address tokenB)**: Returns current price from Uniswap pair (tokenB/tokenA in 1e18).
+- **prices(address tokenA, address tokenB)**: Returns current price from Uniswap pair (tokenB/tokenA in 1e18). Uniswap v2 pairs are undirected, `getPair(tokenA, tokenB)` is identical to `getPair(tokenB, tokenA)`, and returns the same pair address. The `prices` calculation yields "tokenB per tokenA" relative to whichever token is stated as tokenB, normalized to 1e18 precision. 
 - **floorToMidnightView(uint256)**, **isSameDayView(uint256, uint256)**: Utility timestamp functions.
 
 > **Note**: `volumeBalances()` has been **removed**. Use `prices()` or direct `IERC20.balanceOf` on the Uniswap pair for real-time reserves.
