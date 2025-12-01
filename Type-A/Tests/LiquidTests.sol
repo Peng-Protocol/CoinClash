@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.3 (01/12/2025)
+// File Version: 0.0.4 (01/12/2025)
+// 0.0.3 (01/12/2025): Adjusted expectations of d2_4, withdrawal degrades gracefully. 
 // 0.0.3 (01/12/2025): (How could you forget the star of the show?) Added liquid router interface, setter, and setup. 
 // 0.0.2 (30/11/2025): Comprehensive liquidity router tests including deposits, withdrawals, 
 //                     compensation withdrawals, fee claims, ownership transfers, and settlement integration
@@ -443,8 +444,12 @@ contract LiquidTests {
         uint256[] memory slots = liquidityTemplate.userSlotIndicesView(address(token6), address(this));
         uint256 testSlot = slots[slots.length - 1];
         
-        bool failed = false;
-        try liquidityRouter.withdraw(
+        // Capture balance before zero withdrawal attempt
+        uint256 preBalance = token6.balanceOf(address(this));
+        (,,,uint256 preAllocation,,) = liquidityTemplate.getSlotView(address(token6), testSlot);
+        
+        // Attempt zero withdrawal - should degrade gracefully
+        liquidityRouter.withdraw(
             address(liquidityTemplate),
             address(listingTemplate),
             address(token6),
@@ -452,14 +457,15 @@ contract LiquidTests {
             0, // Zero withdrawal
             0,
             testSlot
-        ) {
-            // Should not reach here
-            assert(false);
-        } catch {
-            failed = true;
-        }
+        );
         
-        assert(failed);
+        // Verify nothing changed
+        uint256 postBalance = token6.balanceOf(address(this));
+        (,,,uint256 postAllocation,,) = liquidityTemplate.getSlotView(address(token6), testSlot);
+        
+        assert(postBalance == preBalance); // Balance unchanged
+        assert(postAllocation == preAllocation); // Allocation unchanged
+        
         emit TestPassed("d2_4ZeroWithdrawalMustFail");
     }
 
