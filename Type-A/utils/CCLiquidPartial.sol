@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.1.2 (30/11/2025)
+// Version: 0.1.3 (01/12/2025)
 // Changes:
+// - 01/12/2025: Added correct impact price restriction. 
 // - 30/11/2025: Resolved stack too deep in _executeSingleBuyLiquid and _executeSingleSellLiquid
 // - 30/11/2025: Fixed double-normalization in liquidity validation and updates.
 // - Added support for partially filled orders (status 2).
@@ -113,15 +114,6 @@ contract CCLiquidPartial is ReentrancyGuard {
         uint8 newStatus;
     }
 
-    struct OrderContext {
-        ICCListing listingContract;
-        ICCLiquidity liquidityContract;
-        address tokenIn;
-        address tokenOut;
-        uint8 decimalsIn;
-        uint8 decimalsOut;
-    }
-
     struct SwapImpactContext {
         uint256 reserveIn;
         uint256 reserveOut;
@@ -137,13 +129,6 @@ contract CCLiquidPartial is ReentrancyGuard {
         uint256 netAmount;
         uint256 liquidityAmount;
         uint8 decimals;
-    }
-
-    struct OrderProcessingContext {
-        uint256 maxPrice;
-        uint256 minPrice;
-        uint256 currentPrice;
-        uint256 impactPrice;
     }
 
     struct LiquidityUpdateContext {
@@ -221,7 +206,6 @@ contract CCLiquidPartial is ReentrancyGuard {
         return token == address(0) ? 18 : IERC20(token).decimals();
     }
 
-    // ... [Swap/Fee/Liquidity Helper functions remain unchanged] ...
     function _getSwapReserves(address tokenIn, address tokenOut, address pairAddress) private view returns (SwapImpactContext memory context) {
         require(pairAddress != address(0), "Uniswap V2 pair not set");
         context.reserveIn = tokenIn == address(0) ? address(pairAddress).balance : IERC20(tokenIn).balanceOf(pairAddress);
@@ -238,6 +222,7 @@ contract CCLiquidPartial is ReentrancyGuard {
         return balanceA == 0 ? 0 : (balanceB * 1e18) / balanceA;
     }
 
+    // Standard swap output calculation for execution
     function _computeSwapImpact(address tokenIn, address tokenOut, uint256 amountIn, address pairAddress) private view returns (uint256 price, uint256 amountOut) {
         SwapImpactContext memory context = _getSwapReserves(tokenIn, tokenOut, pairAddress);
         uint256 amountInWithFee = (amountIn * 997) / 1000;
@@ -414,11 +399,10 @@ contract CCLiquidPartial is ReentrancyGuard {
         state.newStatus = state.newPending == 0 ? 3 : 2;
     }
 
-    // --- HELPER: Create Buy Updates (Pure, avoids stack pressure) ---
+    // --- HELPER: Create Buy Updates ---
     function _createBuyUpdates(ExecutionState memory state) private pure returns (ICCListing.BuyOrderUpdate[] memory updates) {
         updates = new ICCListing.BuyOrderUpdate[](2);
         
-        // 1. Amounts Update (StructID 2)
         updates[0] = ICCListing.BuyOrderUpdate({
             structId: 2,
             orderId: state.orderId,
@@ -431,7 +415,6 @@ contract CCLiquidPartial is ReentrancyGuard {
         updates[0].amounts[1] = state.newFilled;
         updates[0].amounts[2] = state.newSent;
 
-        // 2. Status Update (StructID 0)
         updates[1] = ICCListing.BuyOrderUpdate({
             structId: 0,
             orderId: state.orderId,
@@ -442,11 +425,10 @@ contract CCLiquidPartial is ReentrancyGuard {
         });
     }
 
-    // --- HELPER: Create Sell Updates (Pure, avoids stack pressure) ---
+    // --- HELPER: Create Sell Updates ---
     function _createSellUpdates(ExecutionState memory state) private pure returns (ICCListing.SellOrderUpdate[] memory updates) {
         updates = new ICCListing.SellOrderUpdate[](2);
         
-        // 1. Amounts Update (StructID 2)
         updates[0] = ICCListing.SellOrderUpdate({
             structId: 2,
             orderId: state.orderId,
@@ -459,7 +441,6 @@ contract CCLiquidPartial is ReentrancyGuard {
         updates[0].amounts[1] = state.newFilled;
         updates[0].amounts[2] = state.newSent;
 
-        // 2. Status Update (StructID 0)
         updates[1] = ICCListing.SellOrderUpdate({
             structId: 0,
             orderId: state.orderId,
@@ -565,21 +546,89 @@ contract CCLiquidPartial is ReentrancyGuard {
         return true;
     }
 
-    function _validateOrderPricing(address tokenA, address tokenB, uint256 pendingAmount, address tokenIn, address tokenOut, address pairAddress) private view returns (OrderProcessingContext memory context) {
-        context.currentPrice = _computeCurrentPrice(tokenA, tokenB, pairAddress);
-        (, context.impactPrice) = _computeSwapImpact(tokenIn, tokenOut, pendingAmount, pairAddress);
-        context.maxPrice = (context.currentPrice * 110) / 100;
-        context.minPrice = (context.currentPrice * 90) / 100;
+    // --- NEW: Calculate Impact Price (Based on formula) ---
+    function _calculateImpactPrice(
+        address tokenA, 
+        address tokenB, 
+        address pairAddress, 
+        uint256 amountIn, 
+        bool isBuyOrder
+    ) private view returns (uint256) {
+        // Load Reserves (Normalized)
+        uint256 rA = normalize(tokenA == address(0) ? address(pairAddress).balance : IERC20(tokenA).balanceOf(pairAddress), _getTokenDecimals(tokenA));
+        uint256 rB = normalize(tokenB == address(0) ? address(pairAddress).balance : IERC20(tokenB).balanceOf(pairAddress), _getTokenDecimals(tokenB));
         
-        if (context.impactPrice > context.maxPrice || context.impactPrice < context.minPrice || context.impactPrice == 0) {
-            context.impactPrice = 0;
+        if (rA == 0 || rB == 0) return 0;
+        
+        uint256 currentPrice = (rB * 1e18) / rA;
+        uint256 impactResA;
+        uint256 impactResB;
+
+        // Formula Implementation 
+        if (isBuyOrder) {
+            // Buy: Input TokenB -> Output TokenA
+            // Estimated Output A = Input B / Price
+            uint256 estimatedOutA = (amountIn * 1e18) / currentPrice;
+            
+            // Impact A = Reserve A - Out A
+            impactResA = rA > estimatedOutA ? rA - estimatedOutA : 1;
+            // Impact B = Reserve B + In B
+            impactResB = rB + amountIn;
+        } else {
+            // Sell: Input TokenA -> Output TokenB
+            // Estimated Output B = Input A * Price
+            uint256 estimatedOutB = (amountIn * currentPrice) / 1e18;
+            
+            // Impact A = Reserve A + In A
+            impactResA = rA + amountIn;
+            // Impact B = Reserve B - Out B
+            impactResB = rB > estimatedOutB ? rB - estimatedOutB : 1;
         }
+
+        // Impact Price = ImpactResB / ImpactResA
+        return (impactResB * 1e18) / impactResA;
+    }
+
+    // --- UPDATED: Validate against Order Constraints ---
+    function _validateOrderPricing(
+        uint256 orderId,
+        ICCListing listingContract,
+        address tokenA, 
+        address tokenB, 
+        uint256 amountIn, 
+        bool isBuyOrder, 
+        address pairAddress
+    ) private view returns (bool) {
+        // 1. Calculate Impact Price
+        uint256 impactPrice = _calculateImpactPrice(tokenA, tokenB, pairAddress, amountIn, isBuyOrder);
+        
+        if (impactPrice == 0) {
+             return false;
+        }
+
+        // 2. Load Order Limits
+        uint256[] memory prices;
+        if (isBuyOrder) {
+             (, prices, , ) = listingContract.getBuyOrder(orderId);
+        } else {
+             (, prices, , ) = listingContract.getSellOrder(orderId);
+        }
+
+        // 3. Verify Bounds (maxPrice = prices[0], minPrice = prices[1])
+        if (impactPrice > prices[0] || impactPrice < prices[1]) {
+            return false;
+        }
+
+        return true;
     }
 
     function _processSingleOrder(ICCLiquidity liquidityContract, uint256 orderIdentifier, bool isBuyOrder, uint256 pendingAmount, address tokenIn, address tokenOut, address tokenA, address tokenB, address pairAddress) internal returns (bool success) {
-        OrderProcessingContext memory pricingContext = _validateOrderPricing(tokenA, tokenB, pendingAmount, tokenIn, tokenOut, pairAddress);
-        if (pricingContext.impactPrice == 0) {
-            emit PriceOutOfBounds(listingAddress, orderIdentifier, pricingContext.impactPrice, pricingContext.maxPrice, pricingContext.minPrice);
+        ICCListing listingContract = ICCListing(listingAddress);
+        
+        // FIX: Use new Impact Price Logic and Validate against Order Constraints
+        if (!_validateOrderPricing(orderIdentifier, listingContract, tokenA, tokenB, pendingAmount, isBuyOrder, pairAddress)) {
+            // We emit generic price fail here, could be refined
+            emit PriceOutOfBounds(listingAddress, orderIdentifier, 0, 0, 0); 
             return false;
         }
 

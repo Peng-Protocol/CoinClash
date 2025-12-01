@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.2 (30/11/2025)
+// File Version: 0.0.3 (01/12/2025)
+// 0.0.3 (01/12/2025): (How could you forget the star of the show?) Added liquid router interface, setter, and setup. 
 // 0.0.2 (30/11/2025): Comprehensive liquidity router tests including deposits, withdrawals, 
 //                     compensation withdrawals, fee claims, ownership transfers, and settlement integration
 // 0.0.1 (30/11/2025): Initial liquid router test suite based on SettlementTests.sol
@@ -10,6 +11,12 @@ import "./MockMAILToken.sol";
 import "./MockMailTester.sol";
 import "./MockWETH.sol";
 import "./MockUniRouter.sol";
+
+interface ICCLiquidRouter {
+    function setListingAddress(address _listingAddress) external;
+    function settleBuyLiquid(uint256 step) external;
+    function settleSellLiquid(uint256 step) external;
+}
 
 interface ICCOrderRouter {
     function setListingTemplate(address) external;
@@ -32,11 +39,6 @@ interface ICCSettlementRouter {
         uint256[] calldata amountsIn,
         bool isBuyOrder
     ) external returns (string memory);
-}
-
-interface ICCLiquidRouter {
-    function settleBuyLiquid(uint256 step) external;
-    function settleSellLiquid(uint256 step) external;
 }
 
 interface ICCLiquidityRouter {
@@ -97,8 +99,8 @@ interface IUniswapV2Pair {
 
 contract LiquidTests {
     ICCOrderRouter public orderRouter;
-    ICCSettlementRouter public settlementRouter;
-    ICCLiquidRouter public liquidRouter;
+    ICCSettlementRouter public settlementRouter; // Standard Settlement
+    ICCLiquidRouter public liquidRouter; // Liquid Settlement
     ICCLiquidityRouter public liquidityRouter;
     ICCListingTemplate public listingTemplate;
     ICCLiquidityTemplate public liquidityTemplate;
@@ -166,6 +168,7 @@ contract LiquidTests {
 
     function setLiquidRouter(address _liquidRouter) external {
         require(msg.sender == owner, "Not owner");
+        require(_liquidRouter != address(0), "Invalid liquid router");
         liquidRouter = ICCLiquidRouter(_liquidRouter);
     }
 
@@ -190,38 +193,49 @@ contract LiquidTests {
 
         // Add routers to listing template
         address[] memory currentRouters = listingTemplate.routerAddressesView();
-        bool orderAdded = false;
-        bool settlementAdded = false;
-        bool liquidAdded = false;
+        bool orderRouterAdded = false;
+        bool settlementRouterAdded = false;
+        bool liquidRouterAdded = false;
 
         for (uint i = 0; i < currentRouters.length; i++) {
-            if (currentRouters[i] == address(orderRouter)) orderAdded = true;
-            if (currentRouters[i] == address(settlementRouter)) settlementAdded = true;
-            if (currentRouters[i] == address(liquidRouter)) liquidAdded = true;
+            if (currentRouters[i] == address(orderRouter)) orderRouterAdded = true;
+            if (currentRouters[i] == address(settlementRouter)) settlementRouterAdded = true;
+            if (currentRouters[i] == address(liquidRouter)) liquidRouterAdded = true;
         }
 
-        if (!orderAdded) listingTemplate.addRouter(address(orderRouter));
-        if (!settlementAdded) listingTemplate.addRouter(address(settlementRouter));
-        if (!liquidAdded) listingTemplate.addRouter(address(liquidRouter));
+        if (!orderRouterAdded) listingTemplate.addRouter(address(orderRouter));
+        if (!settlementRouterAdded && address(settlementRouter) != address(0)) {
+            listingTemplate.addRouter(address(settlementRouter));
+        }
+        if (!liquidRouterAdded && address(liquidRouter) != address(0)) {
+            listingTemplate.addRouter(address(liquidRouter));
+        }
 
         // Add routers to liquidity template
         liquidityTemplate.addRouter(address(liquidRouter));
         liquidityTemplate.addRouter(address(liquidityRouter));
 
-        // Set listing template for routers
+        // Set listing template for order router
         (bool success, bytes memory data) = address(orderRouter).staticcall(abi.encodeWithSignature("listingTemplate()"));
         if (success && abi.decode(data, (address)) == address(0)) {
             orderRouter.setListingTemplate(address(listingTemplate));
         }
 
+        // Set WETH for order router
         (success, data) = address(orderRouter).staticcall(abi.encodeWithSignature("wethAddress()"));
         if (success && abi.decode(data, (address)) == address(0)) {
             orderRouter.setWETH(address(weth));
         }
 
+        // Set listing template for settlement router
         (success, data) = address(settlementRouter).staticcall(abi.encodeWithSignature("listingTemplate()"));
         if (success && abi.decode(data, (address)) == address(0)) {
             settlementRouter.setListingTemplate(address(listingTemplate));
+        }
+
+        // Initialize Liquid Router - This fixes the "Listing not set" error
+        if (address(liquidRouter) != address(0)) {
+            liquidRouter.setListingAddress(address(listingTemplate));
         }
 
         // Set factory and router
@@ -233,7 +247,7 @@ contract LiquidTests {
             listingTemplate.setUniswapV2Router(address(uniRouter));
         }
 
-        // Create pair
+        // Create pair with liquidity
         if (pairToken18Token6 == address(0)) {
             _createPairWithLiquidity();
         }

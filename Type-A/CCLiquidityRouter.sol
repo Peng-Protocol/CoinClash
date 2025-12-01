@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.2.1
+// Version: 0.2.2 (01/12/2025)
 // Changes:
+// - v0.2.2: Updated withdraw function to pass listingAddress to _executeWithdrawal
 // - v0.2.1: Added compensationToken parameter to withdraw function. Router now verifies pair exists
 //           between withdrawal token and compensation token, and calculates conversion using prices.
 // - v0.2.0: Refactored for monolithic template structure. Added token parameters to all functions.
@@ -45,8 +46,10 @@ contract CCLiquidityRouter is CCLiquidityPartial {
             compensationAmount, 
             index
         );
-        _executeWithdrawal(liquidityAddress, token, compensationToken, msg.sender, index, withdrawal);
+        // FIXED: Now passing listingAddress to _executeWithdrawal
+        _executeWithdrawal(liquidityAddress, listingAddress, token, compensationToken, msg.sender, index, withdrawal);
     }
+
 
     function claimFees(address liquidityAddress, address token, uint256 liquidityIndex) external nonReentrant {
         // Claims fees from liquidity pool for msg.sender

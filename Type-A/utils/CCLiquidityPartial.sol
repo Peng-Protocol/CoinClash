@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.2.2 (11/11)
+// Version: 0.2.3 (01/12)
 // Changes:
+// - v0.2.3: Adjusted compensation calculation to fetch listingAddress and use correct conversions. 
 // - v0.2.2: Refactored _prepWithdrawal to resolve stack-too-deep error via call-tree decomposition.
 //           Split validation, pair check, price fetch, and conversion into isolated internal helpers.
 //           All state passed explicitly via structs; no function exceeds 16 stack slots.
@@ -74,17 +75,18 @@ contract CCLiquidityPartial is ReentrancyGuard {
     event TransferSuccessful(address indexed depositor, address indexed liquidityAddress, address indexed token, uint256 index, uint256 amount);
 
     struct WithdrawalContext {
-        address liquidityAddress;
-        address token;
-        address compensationToken;
-        address depositor;
-        uint256 index;
-        uint256 primaryAmount;
-        uint256 compensationAmount;
-        uint256 currentAllocation;
-        uint256 totalAllocationDeduct;
-        uint256 price;
-    }
+    address liquidityAddress;
+    address listingAddress; // Added
+    address token;
+    address compensationToken;
+    address depositor;
+    uint256 index;
+    uint256 primaryAmount;
+    uint256 compensationAmount;
+    uint256 currentAllocation;
+    uint256 totalAllocationDeduct;
+    uint256 price;
+}
 
     struct DepositContext {
         address liquidityAddress;
@@ -357,30 +359,31 @@ contract CCLiquidityPartial is ReentrancyGuard {
     }
 
     function _executeWithdrawal(
-        address liquidityAddress, 
-        address token,
-        address compensationToken,
-        address depositor, 
-        uint256 index, 
-        ICCLiquidity.PreparedWithdrawal memory withdrawal
-    ) internal {
-        WithdrawalContext memory context = WithdrawalContext({
-            liquidityAddress: liquidityAddress,
-            token: token,
-            compensationToken: compensationToken,
-            depositor: depositor,
-            index: index,
-            primaryAmount: withdrawal.primaryAmount,
-            compensationAmount: withdrawal.compensationAmount,
-            currentAllocation: 0,
-            totalAllocationDeduct: 0,
-            price: 0
-        });
-
-        if (!_fetchWithdrawalData(context)) return;
-        _transferWithdrawalAmount(context);
-        if (!_updateWithdrawalAllocation(context)) return;
-    }
+    address liquidityAddress, 
+    address listingAddress, // Added argument
+    address token,
+    address compensationToken,
+    address depositor, 
+    uint256 index, 
+    ICCLiquidity.PreparedWithdrawal memory withdrawal
+) internal {
+    WithdrawalContext memory context = WithdrawalContext({
+        liquidityAddress: liquidityAddress,
+        listingAddress: listingAddress, // Set here
+        token: token,
+        compensationToken: compensationToken,
+        depositor: depositor,
+        index: index,
+        primaryAmount: withdrawal.primaryAmount,
+        compensationAmount: withdrawal.compensationAmount,
+        currentAllocation: 0,
+        totalAllocationDeduct: 0,
+        price: 0
+    });
+    if (!_fetchWithdrawalData(context)) return;
+    _transferWithdrawalAmount(context);
+    if (!_updateWithdrawalAllocation(context)) return;
+}
 
     function _fetchWithdrawalData(WithdrawalContext memory context) internal view returns (bool) {
         ICCLiquidity liquidityContract = ICCLiquidity(context.liquidityAddress);
@@ -391,41 +394,53 @@ contract CCLiquidityPartial is ReentrancyGuard {
         return true;
     }
 
-    function _updateWithdrawalAllocation(WithdrawalContext memory context) internal returns (bool) {
-        context.totalAllocationDeduct = context.primaryAmount;
-        
-        if (context.compensationAmount > 0) {
-            // Note: Price conversion already done in _prepWithdrawal, we just need to account for it here
-            // This is stored for the allocation update calculation done in _prepWithdrawal
-            // We need to recalculate to get the exact conversion for allocation deduction
-            uint256 convertedCompensation = context.compensationAmount; // Already validated in prep
-            // The conversion needs to be redone - we should pass it through context
-            // For now, we'll trust the prep validation and recalculate
-            
-            emit CompensationCalculated(context.depositor, context.liquidityAddress, context.token, context.compensationToken, context.primaryAmount, context.compensationAmount);
+   function _updateWithdrawalAllocation(WithdrawalContext memory context) internal returns (bool) {
+    // Calculate deduction in terms of Primary Token
+    uint256 totalDeduct = context.primaryAmount;
+
+    if (context.compensationAmount > 0) {
+        // Fetch price again to ensure accurate allocation update
+        ICCListing listing = ICCListing(context.listingAddress);
+        try listing.prices(context.token, context.compensationToken) returns (uint256 _price) {
+            context.price = _price;
+        } catch {
+            emit WithdrawalFailed(context.depositor, context.liquidityAddress, context.token, context.index, context.primaryAmount, "Price fetch failed during update");
+            return false;
         }
 
-        if (context.totalAllocationDeduct > 0 || context.compensationAmount > 0) {
-            // We need to get the price again to calculate the exact allocation deduction
-            uint256 allocationDeduct = context.primaryAmount;
-            
-            if (context.compensationAmount > 0) {
-                // This is a duplicate of prep logic - should be refactored to pass through context
-                // For now, keeping it simple: allocation already validated in prep, so we can trust it won't fail
-                allocationDeduct = context.currentAllocation - context.primaryAmount - context.compensationAmount;
-                allocationDeduct = context.currentAllocation - allocationDeduct; // Gets the actual deduction amount
-            }
-            
-            ICCLiquidity.UpdateType[] memory updates = new ICCLiquidity.UpdateType[](1);
-            updates[0] = ICCLiquidity.UpdateType(2, context.token, context.index, context.currentAllocation - allocationDeduct, context.depositor, address(0));
-            try ICCLiquidity(context.liquidityAddress).ccUpdate(context.depositor, updates) {
-            } catch (bytes memory reason) {
-                emit WithdrawalFailed(context.depositor, context.liquidityAddress, context.token, context.index, context.primaryAmount, string(abi.encodePacked("Slot update failed: ", reason)));
-                return false;
-            }
+        if (context.price == 0) {
+             emit WithdrawalFailed(context.depositor, context.liquidityAddress, context.token, context.index, context.primaryAmount, "Zero price during update");
+             return false;
         }
-        return true;
+
+        // Convert Compensation (Token B) -> Equivalent Primary (Token A)
+        // Price = Token B / Token A  =>  Token A = Token B / Price
+        // Both sides normalized to 1e18 by helper, so standard formula applies
+        uint256 compensationInPrimary = (context.compensationAmount * 1e18) / context.price;
+        
+        totalDeduct += compensationInPrimary;
+        
+        emit CompensationCalculated(context.depositor, context.liquidityAddress, context.token, context.compensationToken, context.primaryAmount, context.compensationAmount);
     }
+
+    // Safety check to prevent underflow if price fluctuated wildly between prep and execute
+    if (totalDeduct > context.currentAllocation) {
+         emit WithdrawalFailed(context.depositor, context.liquidityAddress, context.token, context.index, context.primaryAmount, "Allocation underflow during update");
+         return false;
+    }
+
+    if (totalDeduct > 0) {
+        ICCLiquidity.UpdateType[] memory updates = new ICCLiquidity.UpdateType[](1);
+        updates[0] = ICCLiquidity.UpdateType(2, context.token, context.index, context.currentAllocation - totalDeduct, context.depositor, address(0));
+        
+        try ICCLiquidity(context.liquidityAddress).ccUpdate(context.depositor, updates) {
+        } catch (bytes memory reason) {
+            emit WithdrawalFailed(context.depositor, context.liquidityAddress, context.token, context.index, context.primaryAmount, string(abi.encodePacked("Slot update failed: ", reason)));
+            return false;
+        }
+    }
+    return true;
+}
 
     function _transferWithdrawalAmount(WithdrawalContext memory context) internal {
         ICCLiquidity liquidityTemplate = ICCLiquidity(context.liquidityAddress);
