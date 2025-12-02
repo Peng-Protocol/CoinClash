@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.1.3 (01/12/2025)
-// Changes:
+// Version: 0.1.4 (02/12/2025)
+// Changes: 
+// - v0.1.4 (02/12): Used correct liquidity template address, not address(this). 
 // - 01/12/2025: Added correct impact price restriction. 
 // - 30/11/2025: Resolved stack too deep in _executeSingleBuyLiquid and _executeSingleSellLiquid
 // - 30/11/2025: Fixed double-normalization in liquidity validation and updates.
@@ -180,6 +181,15 @@ contract CCLiquidPartial is ReentrancyGuard {
     event NoPendingOrders(address indexed listingAddress, bool isBuyOrder);
     
     mapping(bytes32 => bool) internal processedPairsMap;
+    
+// Liquidity variable 
+address public liquidityAddress;
+
+// Liquidity  setter (owner-only)
+function setLiquidityAddress(address _liquidityAddress) external onlyOwner {
+    require(_liquidityAddress != address(0), "Invalid liquidity address");
+    liquidityAddress = _liquidityAddress;
+}
 
     function normalize(uint256 amount, uint8 decimals) internal pure returns (uint256) {
         if (decimals == 18) return amount;
@@ -270,56 +280,55 @@ contract CCLiquidPartial is ReentrancyGuard {
     }
 
     function _prepareLiquidityUpdates(ICCLiquidity liquidityContract, LiquidityUpdateContext memory context, address pairAddress) private {
-        uint256 liquidIn = liquidityContract.liquidityAmounts(context.tokenIn);
-        uint256 liquidOut = liquidityContract.liquidityAmounts(context.tokenOut);
-        
-        uint256 normalizedPending = context.pendingAmount;
-        uint256 normalizedSettle = context.amountOut;
-        FeeContext memory feeContext = _computeFee(liquidityContract, context.tokenIn, context.pendingAmount);
-        uint256 normalizedFee = feeContext.feeAmount; 
+    uint256 liquidIn = liquidityContract.liquidityAmounts(context.tokenIn);
+    uint256 liquidOut = liquidityContract.liquidityAmounts(context.tokenOut);
+    
+    uint256 normalizedPending = context.pendingAmount;
+    uint256 normalizedSettle = context.amountOut;
+    FeeContext memory feeContext = _computeFee(liquidityContract, context.tokenIn, context.pendingAmount);
+    uint256 normalizedFee = feeContext.feeAmount; 
 
-        require(liquidIn >= normalizedPending, "Insufficient input liquidity");
-        require(liquidOut >= normalizedSettle, "Insufficient output liquidity");
+    require(liquidIn >= normalizedPending, "Insufficient input liquidity");
+    require(liquidOut >= normalizedSettle, "Insufficient output liquidity");
 
-        ICCLiquidity.UpdateType memory update = ICCLiquidity.UpdateType({
-            updateType: 0,
-            token: context.tokenIn,
-            index: 0,
-            value: liquidIn + normalizedPending,
-            addr: address(this),
-            recipient: address(0)
-        });
-        try liquidityContract.ccUpdate(address(this), _toSingleUpdateArray(update)) {} catch Error(string memory reason) {
-            revert(string(abi.encodePacked("Incoming liquidity update failed: ", reason)));
-        }
-
-        update = ICCLiquidity.UpdateType({
-            updateType: 0,
-            token: context.tokenOut,
-            index: 0,
-            value: liquidOut - normalizedSettle,
-            addr: address(this),
-            recipient: address(0)
-        });
-        try liquidityContract.ccUpdate(address(this), _toSingleUpdateArray(update)) {} catch Error(string memory reason) {
-            revert(string(abi.encodePacked("Outgoing liquidity update failed: ", reason)));
-        }
-
-        _updateFees(liquidityContract, context.tokenIn, normalizedFee);
-
-        ICCListing listingContract = ICCListing(listingAddress);
-        uint256 denormPending = denormalize(context.pendingAmount, context.decimalsIn);
-        
-        if (context.tokenIn == address(0)) {
-             try listingContract.transactNative(denormPending, address(liquidityContract)) {} catch Error(string memory reason) {
-                revert(string(abi.encodePacked("Native transfer failed: ", reason)));
-             }
-        } else {
-            try listingContract.transactToken(context.tokenIn, denormPending, address(liquidityContract)) {} catch Error(string memory reason) {
-                revert(string(abi.encodePacked("Token transfer failed: ", reason)));
-            }
-        }
+    // Update incoming liquidity (add)
+    ICCLiquidity.UpdateType memory update = ICCLiquidity.UpdateType({
+        updateType: 0,
+        token: context.tokenIn,
+        index: 0,
+        value: liquidIn + normalizedPending,
+        addr: address(this),
+        recipient: address(0)
+    });
+    try liquidityContract.ccUpdate(address(this), _toSingleUpdateArray(update)) {} catch Error(string memory reason) {
+        revert(string(abi.encodePacked("Incoming liquidity update failed: ", reason)));
     }
+
+    // Update outgoing liquidity (subtract)
+    update = ICCLiquidity.UpdateType({
+        updateType: 0,
+        token: context.tokenOut,
+        index: 0,
+        value: liquidOut - normalizedSettle,
+        addr: address(this),
+        recipient: address(0)
+    });
+    try liquidityContract.ccUpdate(address(this), _toSingleUpdateArray(update)) {} catch Error(string memory reason) {
+        revert(string(abi.encodePacked("Outgoing liquidity update failed: ", reason)));
+    }
+
+    // Update fees
+    _updateFees(liquidityContract, context.tokenIn, normalizedFee);
+
+    // **FIX: Transfer from Listing -> Liquidity using withdrawToken**
+    ICCListing listingContract = ICCListing(listingAddress);
+    uint256 denormPending = denormalize(context.pendingAmount, context.decimalsIn);
+    
+    // Use listing's withdrawToken to transfer to liquidity template
+    try listingContract.withdrawToken(context.tokenIn, denormPending, address(liquidityContract)) {} catch Error(string memory reason) {
+        revert(string(abi.encodePacked("Transfer from listing to liquidity failed: ", reason)));
+    }
+}
 
     function _createHistoricalUpdate(ICCListing listingContract, ICCLiquidity liquidityContract, address tokenA, address tokenB, address pairAddress) private {
         uint256 xBalance = tokenA == address(0) ? address(pairAddress).balance : IERC20(tokenA).balanceOf(pairAddress);
@@ -364,7 +373,7 @@ contract CCLiquidPartial is ReentrancyGuard {
 
     function _executeOrderWithFees(uint256 orderIdentifier, bool isBuyOrder, FeeContext memory feeContext, address tokenIn, address tokenOut, address pairAddress) private returns (bool success) {
         ICCListing listingContract = ICCListing(listingAddress);
-        ICCLiquidity liquidityContract = ICCLiquidity(address(this));
+        ICCLiquidity liquidityContract = ICCLiquidity(liquidityAddress);
         
         emit FeeDeducted(listingAddress, orderIdentifier, isBuyOrder, feeContext.feeAmount, feeContext.netAmount);
         

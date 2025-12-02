@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.4 (01/12/2025)
-// 0.0.3 (01/12/2025): Adjusted expectations of d2_4, withdrawal degrades gracefully. 
+// File Version: 0.0.5 (02/12/2025)
+// 0.0.5 (02/12/2025): Fixed liquid router setup, use new liquidity template setup. 
+// 0.0.4 (01/12/2025): Adjusted expectations of d2_4, withdrawal degrades gracefully. 
 // 0.0.3 (01/12/2025): (How could you forget the star of the show?) Added liquid router interface, setter, and setup. 
 // 0.0.2 (30/11/2025): Comprehensive liquidity router tests including deposits, withdrawals, 
 //                     compensation withdrawals, fee claims, ownership transfers, and settlement integration
@@ -17,6 +18,7 @@ interface ICCLiquidRouter {
     function setListingAddress(address _listingAddress) external;
     function settleBuyLiquid(uint256 step) external;
     function settleSellLiquid(uint256 step) external;
+    function setLiquidityAddress(address _liquidityAddress) external;
 }
 
 interface ICCOrderRouter {
@@ -82,6 +84,7 @@ interface ICCLiquidityTemplate {
         uint256 timestamp
     );
     function getActiveSlots(address token) external view returns (uint256[] memory);
+    function routerAddressesView() external view returns (address[] memory);
 }
 
 interface IERC20Min {
@@ -183,76 +186,104 @@ contract LiquidTests {
         listingTemplate = ICCListingTemplate(_listing);
     }
 
-    function setLiquidityTemplate(address _liquidity) external {
+    function setLiquidityAddress(address _liquidity) external {
         require(msg.sender == owner, "Not owner");
         liquidityTemplate = ICCLiquidityTemplate(_liquidity);
     }
 
     function initializeContracts() external payable {
-        require(msg.sender == owner, "Not owner");
-        require(address(uniFactory) != address(0), "Uni mocks not deployed");
+    require(msg.sender == owner, "Not owner");
+    require(address(uniFactory) != address(0), "Uni mocks not deployed");
 
-        // Add routers to listing template
-        address[] memory currentRouters = listingTemplate.routerAddressesView();
-        bool orderRouterAdded = false;
-        bool settlementRouterAdded = false;
-        bool liquidRouterAdded = false;
+    // Add routers to listing template
+    address[] memory currentRouters = listingTemplate.routerAddressesView();
+    bool orderRouterAdded = false;
+    bool settlementRouterAdded = false;
+    bool liquidRouterAdded = false;
 
-        for (uint i = 0; i < currentRouters.length; i++) {
-            if (currentRouters[i] == address(orderRouter)) orderRouterAdded = true;
-            if (currentRouters[i] == address(settlementRouter)) settlementRouterAdded = true;
-            if (currentRouters[i] == address(liquidRouter)) liquidRouterAdded = true;
-        }
+    for (uint i = 0; i < currentRouters.length; i++) {
+        if (currentRouters[i] == address(orderRouter)) orderRouterAdded = true;
+        if (currentRouters[i] == address(settlementRouter)) settlementRouterAdded = true;
+        if (currentRouters[i] == address(liquidRouter)) liquidRouterAdded = true;
+    }
 
-        if (!orderRouterAdded) listingTemplate.addRouter(address(orderRouter));
-        if (!settlementRouterAdded && address(settlementRouter) != address(0)) {
-            listingTemplate.addRouter(address(settlementRouter));
-        }
-        if (!liquidRouterAdded && address(liquidRouter) != address(0)) {
-            listingTemplate.addRouter(address(liquidRouter));
-        }
+    if (!orderRouterAdded) listingTemplate.addRouter(address(orderRouter));
+    if (!settlementRouterAdded && address(settlementRouter) != address(0)) {
+        listingTemplate.addRouter(address(settlementRouter));
+    }
+    if (!liquidRouterAdded && address(liquidRouter) != address(0)) {
+        listingTemplate.addRouter(address(liquidRouter));
+    }
 
-        // Add routers to liquidity template
+    // **FIX: Add routers to liquidity template**
+    address[] memory liquidityRouters = new address[](0);
+    // Query existing routers if possible, or just add them
+    try liquidityTemplate.routerAddressesView() returns (address[] memory existing) {
+        liquidityRouters = existing;
+    } catch {}
+    
+    bool liquidRouterInLiquidity = false;
+    bool liquidityRouterInLiquidity = false;
+    for (uint i = 0; i < liquidityRouters.length; i++) {
+        if (liquidityRouters[i] == address(liquidRouter)) liquidRouterInLiquidity = true;
+        if (liquidityRouters[i] == address(liquidityRouter)) liquidityRouterInLiquidity = true;
+    }
+    
+    if (!liquidRouterInLiquidity && address(liquidRouter) != address(0)) {
         liquidityTemplate.addRouter(address(liquidRouter));
+    }
+    if (!liquidityRouterInLiquidity) {
         liquidityTemplate.addRouter(address(liquidityRouter));
+    }
 
-        // Set listing template for order router
-        (bool success, bytes memory data) = address(orderRouter).staticcall(abi.encodeWithSignature("listingTemplate()"));
-        if (success && abi.decode(data, (address)) == address(0)) {
-            orderRouter.setListingTemplate(address(listingTemplate));
-        }
+    // Set listing template for order router
+    (bool success, bytes memory data) = address(orderRouter).staticcall(abi.encodeWithSignature("listingTemplate()"));
+    if (success && abi.decode(data, (address)) == address(0)) {
+        orderRouter.setListingTemplate(address(listingTemplate));
+    }
 
-        // Set WETH for order router
-        (success, data) = address(orderRouter).staticcall(abi.encodeWithSignature("wethAddress()"));
-        if (success && abi.decode(data, (address)) == address(0)) {
-            orderRouter.setWETH(address(weth));
-        }
+    // Set WETH for order router
+    (success, data) = address(orderRouter).staticcall(abi.encodeWithSignature("wethAddress()"));
+    if (success && abi.decode(data, (address)) == address(0)) {
+        orderRouter.setWETH(address(weth));
+    }
 
-        // Set listing template for settlement router
+    // Set listing template for settlement router
+    if (address(settlementRouter) != address(0)) {
         (success, data) = address(settlementRouter).staticcall(abi.encodeWithSignature("listingTemplate()"));
         if (success && abi.decode(data, (address)) == address(0)) {
             settlementRouter.setListingTemplate(address(listingTemplate));
         }
+    }
 
-        // Initialize Liquid Router - This fixes the "Listing not set" error
-        if (address(liquidRouter) != address(0)) {
+    // **FIX: Initialize Liquid Router with BOTH listing AND liquidity**
+    if (address(liquidRouter) != address(0)) {
+        (success, data) = address(liquidRouter).staticcall(abi.encodeWithSignature("listingAddressView()"));
+        if (success && abi.decode(data, (address)) == address(0)) {
             liquidRouter.setListingAddress(address(listingTemplate));
         }
-
-        // Set factory and router
-        if (listingTemplate.uniswapV2Factory() == address(0)) {
-            listingTemplate.setUniswapV2Factory(address(uniFactory));
-        }
-
-        if (listingTemplate.uniswapV2Router() == address(0)) {
-            listingTemplate.setUniswapV2Router(address(uniRouter));
-        }
-
-        // Create pair with liquidity
-        if (pairToken18Token6 == address(0)) {
-            _createPairWithLiquidity();
+        
+        // **NEW: Set liquidity template**
+        (success, data) = address(liquidRouter).staticcall(abi.encodeWithSignature("liquidityAddressView()"));
+        if (success && abi.decode(data, (address)) == address(0)) {
+            liquidRouter.setLiquidityAddress(address(liquidityTemplate));
         }
     }
+
+    // Set factory and router
+    if (listingTemplate.uniswapV2Factory() == address(0)) {
+        listingTemplate.setUniswapV2Factory(address(uniFactory));
+    }
+
+    if (listingTemplate.uniswapV2Router() == address(0)) {
+        listingTemplate.setUniswapV2Router(address(uniRouter));
+    }
+
+    // Create pair with liquidity
+    if (pairToken18Token6 == address(0)) {
+        _createPairWithLiquidity();
+    }
+}
 
     function _createPairWithLiquidity() internal {
         pairToken18Token6 = payable(uniFactory.createPair(address(token18), address(token6)));
