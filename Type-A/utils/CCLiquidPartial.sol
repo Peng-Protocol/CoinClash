@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.1.4 (02/12/2025)
+// Version: 0.1.6 (02/12/2025)
 // Changes: 
+// - v0.1.6 (02/12): Fixed _executeSingleBuyLiquid and _executeSingleSellLiquid to withdraw from LIQUIDITY template
+// - Added liquidity update to deduct the settled amount from liquids
+// v0.1.5 (02/12): Fixed interface and calls, no longer using transactToken, instead withdrawToken. 
 // - v0.1.4 (02/12): Used correct liquidity template address, not address(this). 
 // - 01/12/2025: Added correct impact price restriction. 
 // - 30/11/2025: Resolved stack too deep in _executeSingleBuyLiquid and _executeSingleSellLiquid
@@ -66,14 +69,12 @@ interface ICCListing {
     function getSellOrder(uint256 orderId) external view returns (address[] memory addresses, uint256[] memory prices_, uint256[] memory amounts, uint8 status);
     function getHistoricalDataView(address tokenA, address tokenB, uint256 index) external view returns (HistoricalData memory);
     function historicalDataLengthView(address tokenA, address tokenB) external view returns (uint256);
-    function transactToken(address token, uint256 amount, address recipient) external;
-    function transactNative(uint256 amount, address recipient) external payable;
+    function withdrawToken(address token, uint256 amount, address recipient) external;
     function ccUpdate(
         BuyOrderUpdate[] calldata buyUpdates,
         SellOrderUpdate[] calldata sellUpdates,
         HistoricalUpdate[] calldata historicalUpdates
     ) external;
-    function withdrawToken(address token, uint256 amount, address recipient) external;
 }
 
 interface ICCLiquidity {
@@ -91,6 +92,7 @@ interface ICCLiquidity {
     function ccUpdate(address depositor, UpdateType[] memory updates) external;
     function transactToken(address depositor, address token, uint256 amount, address recipient) external;
     function transactNative(address depositor, uint256 amount, address recipient) external;
+    function withdrawToken(address token, uint256 amount, address recipient) external;
 }
 
 interface IUniswapV2Factory {
@@ -183,13 +185,17 @@ contract CCLiquidPartial is ReentrancyGuard {
     mapping(bytes32 => bool) internal processedPairsMap;
     
 // Liquidity variable 
-address public liquidityAddress;
+address internal liquidityAddress;
 
 // Liquidity  setter (owner-only)
 function setLiquidityAddress(address _liquidityAddress) external onlyOwner {
     require(_liquidityAddress != address(0), "Invalid liquidity address");
     liquidityAddress = _liquidityAddress;
 }
+
+function liquidityAddressView() external view returns (address) {
+        return liquidityAddress;
+    }
 
     function normalize(uint256 amount, uint8 decimals) internal pure returns (uint256) {
         if (decimals == 18) return amount;
@@ -460,71 +466,113 @@ function setLiquidityAddress(address _liquidityAddress) external onlyOwner {
         });
     }
 
-    // --- MAIN EXECUTION: Buy ---
-    function _executeSingleBuyLiquid(
-        uint256 orderIdentifier, 
-        uint256 amountIn, 
-        uint256 amountOut,
-        uint8 decimalsOut
-    ) internal returns (bool success) {
-        ICCListing listingContract = ICCListing(listingAddress);
-        ExecutionState memory state;
-        state.orderId = orderIdentifier;
-        state.amountIn = amountIn;
-        state.amountOut = amountOut;
+// --- FIXED (0.1.6): Buy Order Settlement ---
+function _executeSingleBuyLiquid(
+    uint256 orderIdentifier, 
+    uint256 amountIn, 
+    uint256 amountOut,
+    uint8 decimalsOut
+) internal returns (bool success) {
+    ICCListing listingContract = ICCListing(listingAddress);
+    ICCLiquidity liquidityContract = ICCLiquidity(liquidityAddress);
+    
+    ExecutionState memory state;
+    state.orderId = orderIdentifier;
+    state.amountIn = amountIn;
+    state.amountOut = amountOut;
 
-        (state.addresses, , state.amounts, state.currentStatus) = listingContract.getBuyOrder(orderIdentifier);
-        
-        if (state.currentStatus != 1 && state.currentStatus != 2) return false;
-        
-        address recipient = state.addresses.length > 1 ? state.addresses[1] : state.addresses[0];
-        address tokenOut = state.addresses.length > 3 ? state.addresses[3] : address(0);
-        uint256 denormAmountOut = denormalize(amountOut, decimalsOut);
+    (state.addresses, , state.amounts, state.currentStatus) = listingContract.getBuyOrder(orderIdentifier);
+    if (state.currentStatus != 1 && state.currentStatus != 2) return false;
+    
+    address recipient = state.addresses.length > 1 ? state.addresses[1] : state.addresses[0];
+    address tokenOut = state.addresses.length > 3 ? state.addresses[3] : address(0);
+    uint256 denormAmountOut = denormalize(amountOut, decimalsOut);
 
-        try listingContract.transactToken(tokenOut, denormAmountOut, recipient) {
+    // FIX: Withdraw from LIQUIDITY template, not listing
+    try liquidityContract.withdrawToken(tokenOut, denormAmountOut, recipient) {
+        // FIX: Update liquidity to deduct settled amount
+        uint256 currentLiquid = liquidityContract.liquidityAmounts(tokenOut);
+        require(currentLiquid >= amountOut, "Insufficient liquidity for settlement");
+        
+        ICCLiquidity.UpdateType memory liquidUpdate = ICCLiquidity.UpdateType({
+            updateType: 0,
+            token: tokenOut,
+            index: 0,
+            value: currentLiquid - amountOut, // Deduct settled amount
+            addr: address(this),
+            recipient: address(0)
+        });
+        
+        try liquidityContract.ccUpdate(address(this), _toSingleUpdateArray(liquidUpdate)) {
+            // Update order state
             _calculateNewState(state);
             ICCListing.BuyOrderUpdate[] memory updates = _createBuyUpdates(state);
             
             listingContract.ccUpdate(updates, new ICCListing.SellOrderUpdate[](0), new ICCListing.HistoricalUpdate[](0));
             return true;
         } catch Error(string memory reason) {
-            emit TokenTransferFailed(listingAddress, orderIdentifier, tokenOut, reason);
+            emit UpdateFailed(listingAddress, string(abi.encodePacked("Liquidity update failed: ", reason)));
             return false;
         }
+    } catch Error(string memory reason) {
+        emit TokenTransferFailed(listingAddress, orderIdentifier, tokenOut, reason);
+        return false;
     }
+}
 
-    // --- MAIN EXECUTION: Sell ---
-    function _executeSingleSellLiquid(
-        uint256 orderIdentifier, 
-        uint256 amountIn, 
-        uint256 amountOut,
-        uint8 decimalsOut
-    ) internal returns (bool success) {
-        ICCListing listingContract = ICCListing(listingAddress);
-        ExecutionState memory state;
-        state.orderId = orderIdentifier;
-        state.amountIn = amountIn;
-        state.amountOut = amountOut;
+// --- FIXED (0.1.6): Sell Order Settlement ---
+function _executeSingleSellLiquid(
+    uint256 orderIdentifier, 
+    uint256 amountIn, 
+    uint256 amountOut,
+    uint8 decimalsOut
+) internal returns (bool success) {
+    ICCListing listingContract = ICCListing(listingAddress);
+    ICCLiquidity liquidityContract = ICCLiquidity(liquidityAddress);
+    
+    ExecutionState memory state;
+    state.orderId = orderIdentifier;
+    state.amountIn = amountIn;
+    state.amountOut = amountOut;
 
-        (state.addresses, , state.amounts, state.currentStatus) = listingContract.getSellOrder(orderIdentifier);
+    (state.addresses, , state.amounts, state.currentStatus) = listingContract.getSellOrder(orderIdentifier);
+    if (state.currentStatus != 1 && state.currentStatus != 2) return false;
+
+    address recipient = state.addresses.length > 1 ? state.addresses[1] : state.addresses[0];
+    address tokenOut = state.addresses.length > 3 ? state.addresses[3] : address(0);
+    uint256 denormAmountOut = denormalize(amountOut, decimalsOut);
+
+    // FIX: Withdraw from LIQUIDITY template, not listing
+    try liquidityContract.withdrawToken(tokenOut, denormAmountOut, recipient) {
+        // FIX: Update liquidity to deduct settled amount
+        uint256 currentLiquid = liquidityContract.liquidityAmounts(tokenOut);
+        require(currentLiquid >= amountOut, "Insufficient liquidity for settlement");
         
-        if (state.currentStatus != 1 && state.currentStatus != 2) return false;
-
-        address recipient = state.addresses.length > 1 ? state.addresses[1] : state.addresses[0];
-        address tokenOut = state.addresses.length > 3 ? state.addresses[3] : address(0);
-        uint256 denormAmountOut = denormalize(amountOut, decimalsOut);
-
-        try listingContract.transactToken(tokenOut, denormAmountOut, recipient) {
+        ICCLiquidity.UpdateType memory liquidUpdate = ICCLiquidity.UpdateType({
+            updateType: 0,
+            token: tokenOut,
+            index: 0,
+            value: currentLiquid - amountOut, // Deduct settled amount
+            addr: address(this),
+            recipient: address(0)
+        });
+        
+        try liquidityContract.ccUpdate(address(this), _toSingleUpdateArray(liquidUpdate)) {
+            // Update order state
             _calculateNewState(state);
             ICCListing.SellOrderUpdate[] memory updates = _createSellUpdates(state);
 
             listingContract.ccUpdate(new ICCListing.BuyOrderUpdate[](0), updates, new ICCListing.HistoricalUpdate[](0));
             return true;
         } catch Error(string memory reason) {
-            emit TokenTransferFailed(listingAddress, orderIdentifier, tokenOut, reason);
+            emit UpdateFailed(listingAddress, string(abi.encodePacked("Liquidity update failed: ", reason)));
             return false;
         }
+    } catch Error(string memory reason) {
+        emit TokenTransferFailed(listingAddress, orderIdentifier, tokenOut, reason);
+        return false;
     }
+}
 
     function _validateLiquidity(ICCLiquidity liquidityContract, address tokenIn, address tokenOut, uint256 pendingAmount, uint256 amountOut) private returns (LiquidityValidationContext memory context) {
         context.liquidIn = liquidityContract.liquidityAmounts(tokenIn);

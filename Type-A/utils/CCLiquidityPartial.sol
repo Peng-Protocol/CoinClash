@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.2.3 (01/12)
+// Version: 0.2.4 (02/12)
 // Changes:
+// - v0.2.4: Take denormalized input and normalize internally. 
 // - v0.2.3: Adjusted compensation calculation to fetch listingAddress and use correct conversions. 
 // - v0.2.2: Refactored _prepWithdrawal to resolve stack-too-deep error via call-tree decomposition.
 //           Split validation, pair check, price fetch, and conversion into isolated internal helpers.
@@ -305,57 +306,42 @@ contract CCLiquidityPartial is ReentrancyGuard {
         return needed;
     }
 
-    function _prepWithdrawal(
-        address liquidityAddress, 
-        address listingAddress,
-        address token,
-        address compensationToken,
-        address depositor, 
-        uint256 outputAmount, 
-        uint256 compensationAmount, 
-        uint256 index
-    ) internal returns (ICCLiquidity.PreparedWithdrawal memory) {
-        WithdrawalPrepCore memory core = WithdrawalPrepCore({
-            liquidityAddress: liquidityAddress,
-            listingAddress: listingAddress,
-            token: token,
-            compensationToken: compensationToken,
-            depositor: depositor,
-            outputAmount: outputAmount,
-            compensationAmount: compensationAmount,
-            index: index
-        });
+    // (0.2.4)
 
-        ICCLiquidity.Slot memory slot = _validateWithdrawalSlot(core);
-        if (slot.depositor == address(0) || slot.allocation == 0) {
-            return ICCLiquidity.PreparedWithdrawal(0, 0);
-        }
+function _prepWithdrawal(
+    address liquidityAddress, 
+    address listingAddress,
+    address token,
+    address compensationToken,
+    address depositor, 
+    uint256 outputAmount, 
+    uint256 compensationAmount, 
+    uint256 index
+) internal returns (ICCLiquidity.PreparedWithdrawal memory) {
+    
+    // --- PATCH START: Normalize compensation input ---
+    uint256 normalizedCompensation = compensationAmount;
+    if (compensationAmount > 0) {
+        uint8 decimals = compensationToken == address(0) ? 18 : IERC20(compensationToken).decimals();
+        normalizedCompensation = normalize(compensationAmount, decimals);
+    }
+    // --- PATCH END ---
 
-        WithdrawalPrepState memory state;
-        state.hasCompensation = compensationAmount > 0;
+    WithdrawalPrepCore memory core = WithdrawalPrepCore({
+        liquidityAddress: liquidityAddress,
+        listingAddress: listingAddress,
+        token: token,
+        compensationToken: compensationToken,
+        depositor: depositor,
+        outputAmount: outputAmount,
+        compensationAmount: normalizedCompensation, // Use the normalized value here
+        index: index
+    });
 
-        if (state.hasCompensation) {
-            require(compensationToken != address(0) || token != address(0), "Cannot compensate between two native tokens");
-            require(compensationToken != token, "Compensation token must differ from withdrawal token");
-
-            if (!_checkCompensationPair(core, state)) {
-                return ICCLiquidity.PreparedWithdrawal(0, 0);
-            }
-            if (!_fetchCompensationPrice(core, state)) {
-                return ICCLiquidity.PreparedWithdrawal(0, 0);
-            }
-        }
-
-        uint256 totalNeeded = _calculateAllocationNeeded(core, state, slot);
-        if (totalNeeded == type(uint256).max || totalNeeded > slot.allocation) {
-            emit ValidationFailed(depositor, liquidityAddress, token, index, "Insufficient allocation for output and compensation");
-            return ICCLiquidity.PreparedWithdrawal(0, 0);
-        }
-
-        return ICCLiquidity.PreparedWithdrawal({
-            primaryAmount: outputAmount,
-            compensationAmount: compensationAmount
-        });
+    ICCLiquidity.Slot memory slot = _validateWithdrawalSlot(core);
+    if (slot.depositor == address(0) || slot.allocation == 0) {
+        return ICCLiquidity.PreparedWithdrawal(0, 0);
+    }
     }
 
     function _executeWithdrawal(
