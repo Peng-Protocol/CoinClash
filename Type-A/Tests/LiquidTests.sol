@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.8 (03/12/2025)
+// File Version: 0.0.9 (03/12/2025)
+// - (03/12): Added more assertions in test7 to check for amountSent correctness. 
 // - (03/12): Added token6 deposit before compensation test. 
 // Streamlined version with external MockDeployer to reduce init code size
 // LiquidTests calls create functions on MockDeployer which returns addresses
@@ -451,7 +452,9 @@ contract LiquidTests {
 
     // Test 7: Complete settlement via liquid router
     function test7_LiquidSettlement() public {
+        (,, uint256[] memory amountsBefore,) = listingTemplate.getBuyOrder(orderId);
         (uint256 feesBefore,,) = liquidityTemplate.liquidityDetailsView(token6);
+        uint256 testerBalBefore = IERC20Min(token18).balanceOf(tester);
         
         IMockTester(tester).proxyCall(
             address(liquidRouter),
@@ -460,9 +463,14 @@ contract LiquidTests {
         
         (,, uint256[] memory amountsAfter, uint8 statusAfter) = listingTemplate.getBuyOrder(orderId);
         (uint256 feesAfter,,) = liquidityTemplate.liquidityDetailsView(token6);
+        uint256 testerBalAfter = IERC20Min(token18).balanceOf(tester);
         
         assert(amountsAfter[0] == 0); // Pending = 0
         assert(statusAfter == 3); // Filled
+        assert(amountsAfter[2] > 0); // amountSent must be non-zero
+        assert(amountsAfter[2] != amountsAfter[1]); // amountSent != filled (different tokens)
+        assert(amountsAfter[2] > amountsBefore[2]); // amountSent increased from partial settlement
+        assert(testerBalAfter > testerBalBefore); // Tester received tokens
         assert(feesAfter > feesBefore); // Fees generated
         
         emit TestPassed("test7_LiquidSettlement");
