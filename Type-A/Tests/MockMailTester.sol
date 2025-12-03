@@ -14,7 +14,6 @@ contract MockMailTester {
     event ProxyError(string reason);
 
     function proxyCall(address target, bytes memory data) external payable {
-    require(msg.sender == owner, "Not owner");
     (bool success, bytes memory returnData) = target.call{value: msg.value}(data);
     if (!success) {
         if (returnData.length > 0) {
