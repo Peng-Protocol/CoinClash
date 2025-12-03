@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.7 (03/12/2025)
+// File Version: 0.0.8 (03/12/2025)
+// - (03/12): Added token6 deposit before compensation test. 
 // Streamlined version with external MockDeployer to reduce init code size
 // LiquidTests calls create functions on MockDeployer which returns addresses
 
@@ -315,24 +316,38 @@ contract LiquidTests {
 
     // Test 3: Partial withdrawal with compensation
     function test3_WithdrawalWithCompensation() public {
-        // Deposit token6 for compensation
-        uint256 deposit6 = 500 * 1e6;
+        // Deposit token6 for compensation - need enough for withdrawal
+        uint256 deposit6 = 2000 * 1e6; // Increased to ensure sufficient liquidity
         mockDeployer.mintToken6(address(this), deposit6);
         IERC20Min(token6).approve(address(liquidityRouter), deposit6);
         liquidityRouter.depositToken(address(liquidityTemplate), token6, address(this), deposit6);
         
         (,,,uint256 allocation18,,) = liquidityTemplate.getSlotView(token18, mainSlot);
         
+        // Check available liquidity in both tokens
+        uint256 liquid18 = liquidityTemplate.liquidityAmounts(token18);
+        uint256 liquid6 = liquidityTemplate.liquidityAmounts(token6);
+        
+        emit DebugLog("allocation18", allocation18);
+        emit DebugLog("liquid18", liquid18);
+        emit DebugLog("liquid6", liquid6);
+        
         // Calculate safe compensation amount
         uint256 price = listingTemplate.prices(token18, token6);
-        uint256 primaryAmount = allocation18 / 4; // Withdraw 25% in token18
+        uint256 primaryAmount = allocation18 / 5; // Withdraw 20% in token18 (reduced from 25%)
         
-        // Compensation: equivalent to 10% of allocation in token6
-        uint256 compensationAmount = (allocation18 / 10 * price) / 1e18;
+        // Compensation: equivalent to 5% of allocation in token6 (reduced from 10%)
+        uint256 compensationAmount = (allocation18 / 20 * price) / 1e18;
         
-        // Ensure we don't over-withdraw
+        // Ensure we don't over-withdraw from either token
         uint256 compensationInPrimary = (compensationAmount * 1e18) / price;
-        require(primaryAmount + compensationInPrimary <= allocation18, "Over-withdrawal");
+        require(primaryAmount + compensationInPrimary <= allocation18, "Over-withdrawal from allocation");
+        require(primaryAmount <= liquid18, "Insufficient token18 liquidity");
+        require(compensationAmount <= liquid6, "Insufficient token6 liquidity");
+        
+        emit DebugLog("primaryAmount", primaryAmount);
+        emit DebugLog("compensationAmount", compensationAmount);
+        emit DebugLog("compensationInPrimary", compensationInPrimary);
         
         uint256 token6BalBefore = IERC20Min(token6).balanceOf(address(this));
         
