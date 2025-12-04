@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.1.6 (02/12/2025)
+// Version: 0.1.7 (04/12/2025)
 // Changes: 
+// - v0.1.7 (04)12): Fixed impact price direction. 
 // - v0.1.6 (02/12): Fixed _executeSingleBuyLiquid and _executeSingleSellLiquid to withdraw from LIQUIDITY template
 // - Added liquidity update to deduct the settled amount from liquids
 // v0.1.5 (02/12): Fixed interface and calls, no longer using transactToken, instead withdrawToken. 
@@ -173,6 +174,25 @@ contract CCLiquidPartial is ReentrancyGuard {
         address pairAddress;
         uint256 liquidOut;
     }
+    
+    struct OrderValidationContext {
+    uint256 orderIdentifier;
+    bool isBuyOrder;
+    address tokenIn;
+    address tokenOut;
+    address pairAddress;
+    uint256 normalizedPending;
+}
+
+struct OrderExecutionContext {
+    uint256 orderIdentifier;
+    bool isBuyOrder;
+    address tokenIn;
+    address tokenOut;
+    address pairAddress;
+    uint256 normalizedPending;
+    uint256 amountOut;
+}
 
     event FeeDeducted(address indexed listingAddress, uint256 orderId, bool isBuyOrder, uint256 feeAmount, uint256 netAmount);
     event PriceOutOfBounds(address indexed listingAddress, uint256 orderId, uint256 impactPrice, uint256 maxPrice, uint256 minPrice);
@@ -603,106 +623,202 @@ function _executeSingleSellLiquid(
         return true;
     }
 
-    // --- NEW: Calculate Impact Price (Based on formula) ---
-    function _calculateImpactPrice(
-        address tokenA, 
-        address tokenB, 
-        address pairAddress, 
-        uint256 amountIn, 
-        bool isBuyOrder
-    ) private view returns (uint256) {
-        // Load Reserves (Normalized)
-        uint256 rA = normalize(tokenA == address(0) ? address(pairAddress).balance : IERC20(tokenA).balanceOf(pairAddress), _getTokenDecimals(tokenA));
-        uint256 rB = normalize(tokenB == address(0) ? address(pairAddress).balance : IERC20(tokenB).balanceOf(pairAddress), _getTokenDecimals(tokenB));
+// --- FIXED(0.1.7): Calculate Impact Price ---
+// --- FIXED: Calculate Impact Price (Follows Exact Formula) ---
+function _calculateImpactPrice(
+    address tokenA, 
+    address tokenB, 
+    address pairAddress, 
+    uint256 amountIn,  // NORMALIZED (1e18)
+    bool isBuyOrder
+) private view returns (uint256) {
+    // Load reserves (normalized to 1e18)
+    uint256 rA = normalize(
+        tokenA == address(0) ? address(pairAddress).balance : IERC20(tokenA).balanceOf(pairAddress),
+        _getTokenDecimals(tokenA)
+    );
+    uint256 rB = normalize(
+        tokenB == address(0) ? address(pairAddress).balance : IERC20(tokenB).balanceOf(pairAddress),
+        _getTokenDecimals(tokenB)
+    );
+    
+    if (rA == 0 || rB == 0) return 0;
+    
+    // Get current price using prices(tokenA, tokenB) - NEVER flip tokens
+    ICCListing listingContract = ICCListing(listingAddress);
+    uint256 currentPrice = listingContract.prices(tokenA, tokenB); // Returns tokenB/tokenA
+    
+    if (currentPrice == 0) return 0;
+    
+    uint256 impactResA;
+    uint256 impactResB;
+    
+    if (isBuyOrder) {
+        // Buy: Input TokenB -> Output TokenA
+        // Formula:
+        // [TokenB] swap amount / current price = [TokenA] output
+        // [TokenA] Liquidity - [TokenA] output = [TokenA] impact
+        // [TokenB] Liquidity + [TokenB] swap amount = [TokenB] impact
+        // Impact Price = [TokenB] impact / [TokenA] impact
         
-        if (rA == 0 || rB == 0) return 0;
+        uint256 estimatedOutA = (amountIn * 1e18) / currentPrice; // amountIn is TokenB
+        impactResA = rA > estimatedOutA ? rA - estimatedOutA : 1;
+        impactResB = rB + amountIn;
         
-        uint256 currentPrice = (rB * 1e18) / rA;
-        uint256 impactResA;
-        uint256 impactResB;
+    } else {
+        // Sell: Input TokenA -> Output TokenB
+        // Formula:
+        // [TokenA] swap amount * price = [TokenB] output
+        // [TokenB] Liquidity - [TokenB] output = [TokenB] impact
+        // [TokenA] Liquidity + [TokenA] swap amount = [TokenA] impact
+        // Impact Price = [TokenB] impact / [TokenA] impact
+        
+        uint256 estimatedOutB = (amountIn * currentPrice) / 1e18; // amountIn is TokenA
+        impactResB = rB > estimatedOutB ? rB - estimatedOutB : 1;
+        impactResA = rA + amountIn;
+    }
+    
+    // Impact Price = ImpactResB / ImpactResA
+    return (impactResB * 1e18) / impactResA;
+}
 
-        // Formula Implementation 
-        if (isBuyOrder) {
-            // Buy: Input TokenB -> Output TokenA
-            // Estimated Output A = Input B / Price
-            uint256 estimatedOutA = (amountIn * 1e18) / currentPrice;
-            
-            // Impact A = Reserve A - Out A
-            impactResA = rA > estimatedOutA ? rA - estimatedOutA : 1;
-            // Impact B = Reserve B + In B
-            impactResB = rB + amountIn;
-        } else {
-            // Sell: Input TokenA -> Output TokenB
-            // Estimated Output B = Input A * Price
-            uint256 estimatedOutB = (amountIn * currentPrice) / 1e18;
-            
-            // Impact A = Reserve A + In A
-            impactResA = rA + amountIn;
-            // Impact B = Reserve B - Out B
-            impactResB = rB > estimatedOutB ? rB - estimatedOutB : 1;
-        }
-
-        // Impact Price = ImpactResB / ImpactResA
-        return (impactResB * 1e18) / impactResA;
+// --- UPDATED (0.1.7): Validate against Order Constraints ---
+function _validateOrderPricing(
+    uint256 orderId,
+    ICCListing listingContract,
+    address tokenA, 
+    address tokenB, 
+    uint256 amountIn,  // NOW RECEIVES NORMALIZED AMOUNT
+    bool isBuyOrder, 
+    address pairAddress
+) private view returns (bool) {
+    // 1. Calculate Impact Price (now expects normalized input)
+    uint256 impactPrice = _calculateImpactPrice(tokenA, tokenB, pairAddress, amountIn, isBuyOrder);
+    
+    if (impactPrice == 0) {
+        return false;
     }
 
-    // --- UPDATED: Validate against Order Constraints ---
-    function _validateOrderPricing(
-        uint256 orderId,
-        ICCListing listingContract,
-        address tokenA, 
-        address tokenB, 
-        uint256 amountIn, 
-        bool isBuyOrder, 
-        address pairAddress
-    ) private view returns (bool) {
-        // 1. Calculate Impact Price
-        uint256 impactPrice = _calculateImpactPrice(tokenA, tokenB, pairAddress, amountIn, isBuyOrder);
-        
-        if (impactPrice == 0) {
-             return false;
-        }
-
-        // 2. Load Order Limits
-        uint256[] memory prices;
-        if (isBuyOrder) {
-             (, prices, , ) = listingContract.getBuyOrder(orderId);
-        } else {
-             (, prices, , ) = listingContract.getSellOrder(orderId);
-        }
-
-        // 3. Verify Bounds (maxPrice = prices[0], minPrice = prices[1])
-        if (impactPrice > prices[0] || impactPrice < prices[1]) {
-            return false;
-        }
-
-        return true;
+    // 2. Load Order Limits
+    uint256[] memory prices;
+    if (isBuyOrder) {
+        (, prices, , ) = listingContract.getBuyOrder(orderId);
+    } else {
+        (, prices, , ) = listingContract.getSellOrder(orderId);
     }
 
-    function _processSingleOrder(ICCLiquidity liquidityContract, uint256 orderIdentifier, bool isBuyOrder, uint256 pendingAmount, address tokenIn, address tokenOut, address tokenA, address tokenB, address pairAddress) internal returns (bool success) {
-        ICCListing listingContract = ICCListing(listingAddress);
-        
-        // FIX: Use new Impact Price Logic and Validate against Order Constraints
-        if (!_validateOrderPricing(orderIdentifier, listingContract, tokenA, tokenB, pendingAmount, isBuyOrder, pairAddress)) {
-            // We emit generic price fail here, could be refined
-            emit PriceOutOfBounds(listingAddress, orderIdentifier, 0, 0, 0); 
-            return false;
-        }
-
-        (, uint256 amountOut) = _computeSwapImpact(tokenIn, tokenOut, pendingAmount, pairAddress);
-        LiquidityValidationContext memory validationContext = _validateLiquidity(liquidityContract, tokenIn, tokenOut, pendingAmount, amountOut);
-        
-        if (validationContext.normalizedPending == 0 || validationContext.normalizedSettle == 0) {
-            return false;
-        }
-
-        if (!_checkUniswapBalance(tokenOut, orderIdentifier, isBuyOrder, pairAddress, validationContext)) {
-            return false;
-        }
-
-        FeeContext memory feeContext = _computeFee(liquidityContract, tokenIn, pendingAmount);
-        return _executeOrderWithFees(orderIdentifier, isBuyOrder, feeContext, tokenIn, tokenOut, pairAddress);
+    // 3. Verify Bounds (maxPrice = prices[0], minPrice = prices[1])
+    if (impactPrice > prices[0] || impactPrice < prices[1]) {
+        return false;
     }
+
+    return true;
+}
+
+// (0.1.7)
+    function _processSingleOrder(
+    ICCLiquidity liquidityContract, 
+    uint256 orderIdentifier, 
+    bool isBuyOrder, 
+    uint256 pendingAmount,
+    address tokenIn, 
+    address tokenOut, 
+    address tokenA, 
+    address tokenB, 
+    address pairAddress
+) internal returns (bool success) {
+    // Step 1: Normalize and validate pricing
+    OrderValidationContext memory ctx = OrderValidationContext({
+        orderIdentifier: orderIdentifier,
+        isBuyOrder: isBuyOrder,
+        tokenIn: tokenIn,
+        tokenOut: tokenOut,
+        pairAddress: pairAddress,
+        normalizedPending: normalize(pendingAmount, _getTokenDecimals(tokenIn))
+    });
+    
+    if (!_validatePricingStep(ctx, tokenA, tokenB)) {
+        return false;
+    }
+    
+    // Step 2: Execute order
+    return _executeOrderStep(liquidityContract, ctx);
+}
+
+function _validatePricingStep(
+    OrderValidationContext memory ctx,
+    address tokenA,
+    address tokenB
+) private returns (bool) {
+    ICCListing listingContract = ICCListing(listingAddress);
+    
+    if (!_validateOrderPricing(
+        ctx.orderIdentifier,
+        listingContract,
+        tokenA,
+        tokenB,
+        ctx.normalizedPending,
+        ctx.isBuyOrder,
+        ctx.pairAddress
+    )) {
+        emit PriceOutOfBounds(listingAddress, ctx.orderIdentifier, 0, 0, 0);
+        return false;
+    }
+    
+    return true;
+}
+
+function _executeOrderStep(
+    ICCLiquidity liquidityContract,
+    OrderValidationContext memory ctx
+) private returns (bool) {
+    // Compute swap output
+    (, uint256 amountOut) = _computeSwapImpact(
+        ctx.tokenIn,
+        ctx.tokenOut,
+        ctx.normalizedPending,
+        ctx.pairAddress
+    );
+    
+    // Validate liquidity
+    LiquidityValidationContext memory validationContext = _validateLiquidity(
+        liquidityContract,
+        ctx.tokenIn,
+        ctx.tokenOut,
+        ctx.normalizedPending,
+        amountOut
+    );
+    
+    if (validationContext.normalizedPending == 0 || validationContext.normalizedSettle == 0) {
+        return false;
+    }
+    
+    if (!_checkUniswapBalance(
+        ctx.tokenOut,
+        ctx.orderIdentifier,
+        ctx.isBuyOrder,
+        ctx.pairAddress,
+        validationContext
+    )) {
+        return false;
+    }
+    
+    // Execute with fees
+    FeeContext memory feeContext = _computeFee(
+        liquidityContract,
+        ctx.tokenIn,
+        ctx.normalizedPending
+    );
+    
+    return _executeOrderWithFees(
+        ctx.orderIdentifier,
+        ctx.isBuyOrder,
+        feeContext,
+        ctx.tokenIn,
+        ctx.tokenOut,
+        ctx.pairAddress
+    );
+}
     
     function _markPairProcessed(address tokenIn, address tokenOut) private {
         bytes32 pairKey = keccak256(abi.encodePacked(tokenIn, tokenOut));

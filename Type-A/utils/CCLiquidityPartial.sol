@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.2.4 (02/12)
+// Version: 0.2.6 (04/12)
 // Changes:
+// - v0.2.6: Corrected compensation calculation to always use canonical pair order (A, B). 
+// - v0.2.5: Fixed empty withdrawal prep return statement, added correct setup. 
 // - v0.2.4: Take denormalized input and normalize internally. 
 // - v0.2.3: Adjusted compensation calculation to fetch listingAddress and use correct conversions. 
 // - v0.2.2: Refactored _prepWithdrawal to resolve stack-too-deep error via call-tree decomposition.
@@ -145,6 +147,13 @@ contract CCLiquidityPartial is ReentrancyGuard {
         else if (decimals < 18) return amount / 10 ** (uint256(18) - uint256(decimals));
         else return amount * 10 ** (uint256(decimals) - uint256(18));
     }
+    
+    // (0.2.6) For fetching canonical pair
+
+function _getTokenPair(address tokenA, address tokenB) internal pure returns (address token0, address token1) {
+    require(tokenA != tokenB, "Identical tokens");
+    (token0, token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+}
 
     function _validateDeposit(address liquidityAddress, address token, address depositor, uint256 inputAmount) internal view returns (DepositContext memory) {
         ICCLiquidity liquidityContract = ICCLiquidity(liquidityAddress);
@@ -269,44 +278,63 @@ contract CCLiquidityPartial is ReentrancyGuard {
         return true;
     }
 
-    // Helper: price fetch
-    function _fetchCompensationPrice(WithdrawalPrepCore memory core, WithdrawalPrepState memory state) internal returns (bool) {
-        if (!state.hasCompensation) return true;
+// (0.2.6) Canonical price calculation
+// Helper: price fetch - always fetch prices(A,B) where A < B canonically
+function _fetchCompensationPrice(WithdrawalPrepCore memory core, WithdrawalPrepState memory state) internal returns (bool) {
+    if (!state.hasCompensation) return true;
 
-        ICCListing listingContract = ICCListing(core.listingAddress);
-        try listingContract.prices(core.token, core.compensationToken) returns (uint256 _price) {
-            state.price = _price;
-        } catch (bytes memory reason) {
-            emit ValidationFailed(core.depositor, core.liquidityAddress, core.token, core.index,
-                string(abi.encodePacked("Price fetch failed: ", reason)));
-            return false;
-        }
-
-        if (state.price == 0) {
-            emit ValidationFailed(core.depositor, core.liquidityAddress, core.token, core.index, "Price is zero");
-            return false;
-        }
-        return true;
+    // Get canonical ordering: token0 < token1
+    (address token0, address token1) = _getTokenPair(core.token, core.compensationToken);
+    
+    ICCListing listingContract = ICCListing(core.listingAddress);
+    // Always fetch prices(token0, token1) = token1/token0
+    try listingContract.prices(token0, token1) returns (uint256 _price) {
+        state.price = _price;
+    } catch (bytes memory reason) {
+        emit ValidationFailed(core.depositor, core.liquidityAddress, core.token, core.index,
+            string(abi.encodePacked("Price fetch failed: ", reason)));
+        return false;
     }
 
-    // Helper: allocation calculation with compensation conversion
-    function _calculateAllocationNeeded(WithdrawalPrepCore memory core, WithdrawalPrepState memory state, ICCLiquidity.Slot memory slot) internal pure returns (uint256) {
-        uint256 needed = core.outputAmount;
+    if (state.price == 0) {
+        emit ValidationFailed(core.depositor, core.liquidityAddress, core.token, core.index, "Price is zero");
+        return false;
+    }
+    return true;
+}
 
-        if (state.hasCompensation) {
-            // price = compensationToken / token  =>  token_equiv = compensationAmount / price
+// (0.2.6)
+// Helper: allocation calculation with compensation conversion
+// price from prices(A,B) = B/A
+// Convert B to A: A_output = B_amount / price
+// Convert A to B: B_output = A_amount * price
+function _calculateAllocationNeeded(WithdrawalPrepCore memory core, WithdrawalPrepState memory state, ICCLiquidity.Slot memory slot) internal pure returns (uint256) {
+    uint256 needed = core.outputAmount;
+
+    if (state.hasCompensation) {
+        (address token0, address token1) = _getTokenPair(core.token, core.compensationToken);
+        // price = token1/token0
+        
+        if (core.compensationToken == token1) {
+            // Converting token1 (B) to token0 (A): A = B / price
             uint256 converted = (core.compensationAmount * 1e18) / state.price;
             needed += converted;
+        } else {
+            // Converting token0 (A) to token1 (B): B = A * price
+            uint256 converted = (core.compensationAmount * state.price) / 1e18;
+            needed += converted;
         }
-
-        if (needed > slot.allocation) {
-            // Emit will be handled by caller; here we just return oversized value
-            return type(uint256).max;
-        }
-        return needed;
     }
 
-    // (0.2.4)
+    if (needed > slot.allocation) {
+        return type(uint256).max;
+    }
+    return needed;
+}
+
+    // (0.2.5)
+
+// FIXED empty return statement and setup. 
 
 function _prepWithdrawal(
     address liquidityAddress, 
@@ -334,15 +362,44 @@ function _prepWithdrawal(
         compensationToken: compensationToken,
         depositor: depositor,
         outputAmount: outputAmount,
-        compensationAmount: normalizedCompensation, // Use the normalized value here
+        compensationAmount: normalizedCompensation,
         index: index
     });
 
+    // Validate slot ownership and allocation
     ICCLiquidity.Slot memory slot = _validateWithdrawalSlot(core);
     if (slot.depositor == address(0) || slot.allocation == 0) {
         return ICCLiquidity.PreparedWithdrawal(0, 0);
     }
+
+    // Initialize state
+    WithdrawalPrepState memory state;
+    state.slot = slot;
+    state.hasCompensation = (compensationToken != address(0) && normalizedCompensation > 0);
+
+    // Check pair if compensation is involved
+    if (!_checkCompensationPair(core, state)) {
+        return ICCLiquidity.PreparedWithdrawal(0, 0);
     }
+
+    // Fetch price if compensation is involved
+    if (!_fetchCompensationPrice(core, state)) {
+        return ICCLiquidity.PreparedWithdrawal(0, 0);
+    }
+
+    // Calculate total allocation needed
+    state.totalAllocationNeeded = _calculateAllocationNeeded(core, state, slot);
+    if (state.totalAllocationNeeded == type(uint256).max) {
+        emit ValidationFailed(core.depositor, core.liquidityAddress, core.token, core.index, "Insufficient allocation");
+        return ICCLiquidity.PreparedWithdrawal(0, 0);
+    }
+
+    // RETURN THE PREPARED WITHDRAWAL
+    return ICCLiquidity.PreparedWithdrawal({
+        primaryAmount: core.outputAmount,
+        compensationAmount: normalizedCompensation
+    });
+}
 
     function _executeWithdrawal(
     address liquidityAddress, 
@@ -380,14 +437,18 @@ function _prepWithdrawal(
         return true;
     }
 
-   function _updateWithdrawalAllocation(WithdrawalContext memory context) internal returns (bool) {
-    // Calculate deduction in terms of Primary Token
+   // (0.2.6)
+
+function _updateWithdrawalAllocation(WithdrawalContext memory context) internal returns (bool) {
     uint256 totalDeduct = context.primaryAmount;
 
     if (context.compensationAmount > 0) {
-        // Fetch price again to ensure accurate allocation update
+        // Get canonical ordering and fetch price
+        (address token0, address token1) = _getTokenPair(context.token, context.compensationToken);
+        
         ICCListing listing = ICCListing(context.listingAddress);
-        try listing.prices(context.token, context.compensationToken) returns (uint256 _price) {
+        // Always fetch prices(token0, token1) = token1/token0
+        try listing.prices(token0, token1) returns (uint256 _price) {
             context.price = _price;
         } catch {
             emit WithdrawalFailed(context.depositor, context.liquidityAddress, context.token, context.index, context.primaryAmount, "Price fetch failed during update");
@@ -399,17 +460,23 @@ function _prepWithdrawal(
              return false;
         }
 
-        // Convert Compensation (Token B) -> Equivalent Primary (Token A)
-        // Price = Token B / Token A  =>  Token A = Token B / Price
-        // Both sides normalized to 1e18 by helper, so standard formula applies
-        uint256 compensationInPrimary = (context.compensationAmount * 1e18) / context.price;
+        // Convert compensation to primary token equivalent
+        // price = token1/token0
+        uint256 compensationInPrimary;
+        
+        if (context.compensationToken == token1) {
+            // Converting token1 (B) to token0 (A): A = B / price
+            compensationInPrimary = (context.compensationAmount * 1e18) / context.price;
+        } else {
+            // Converting token0 (A) to token1 (B): B = A * price
+            compensationInPrimary = (context.compensationAmount * context.price) / 1e18;
+        }
         
         totalDeduct += compensationInPrimary;
         
         emit CompensationCalculated(context.depositor, context.liquidityAddress, context.token, context.compensationToken, context.primaryAmount, context.compensationAmount);
     }
 
-    // Safety check to prevent underflow if price fluctuated wildly between prep and execute
     if (totalDeduct > context.currentAllocation) {
          emit WithdrawalFailed(context.depositor, context.liquidityAddress, context.token, context.index, context.primaryAmount, "Allocation underflow during update");
          return false;

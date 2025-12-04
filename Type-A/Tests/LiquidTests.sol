@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.9 (03/12/2025)
+// File Version: 0.0.11 (04/12/2025)
+// - (04/12): Added error logging in test 6. 
+// - (04/12): Fixed test3 compensation estimate. 
 // - (03/12): Added more assertions in test7 to check for amountSent correctness. 
 // - (03/12): Added token6 deposit before compensation test. 
 // Streamlined version with external MockDeployer to reduce init code size
@@ -315,58 +317,78 @@ contract LiquidTests {
         emit TestPassed("test2_PartialWithdrawal");
     }
 
-    // Test 3: Partial withdrawal with compensation
-    function test3_WithdrawalWithCompensation() public {
-        // Deposit token6 for compensation - need enough for withdrawal
-        uint256 deposit6 = 2000 * 1e6; // Increased to ensure sufficient liquidity
-        mockDeployer.mintToken6(address(this), deposit6);
-        IERC20Min(token6).approve(address(liquidityRouter), deposit6);
-        liquidityRouter.depositToken(address(liquidityTemplate), token6, address(this), deposit6);
-        
-        (,,,uint256 allocation18,,) = liquidityTemplate.getSlotView(token18, mainSlot);
-        
-        // Check available liquidity in both tokens
-        uint256 liquid18 = liquidityTemplate.liquidityAmounts(token18);
-        uint256 liquid6 = liquidityTemplate.liquidityAmounts(token6);
-        
-        emit DebugLog("allocation18", allocation18);
-        emit DebugLog("liquid18", liquid18);
-        emit DebugLog("liquid6", liquid6);
-        
-        // Calculate safe compensation amount
-        uint256 price = listingTemplate.prices(token18, token6);
-        uint256 primaryAmount = allocation18 / 5; // Withdraw 20% in token18 (reduced from 25%)
-        
-        // Compensation: equivalent to 5% of allocation in token6 (reduced from 10%)
-        uint256 compensationAmount = (allocation18 / 20 * price) / 1e18;
-        
-        // Ensure we don't over-withdraw from either token
-        uint256 compensationInPrimary = (compensationAmount * 1e18) / price;
-        require(primaryAmount + compensationInPrimary <= allocation18, "Over-withdrawal from allocation");
-        require(primaryAmount <= liquid18, "Insufficient token18 liquidity");
-        require(compensationAmount <= liquid6, "Insufficient token6 liquidity");
-        
-        emit DebugLog("primaryAmount", primaryAmount);
-        emit DebugLog("compensationAmount", compensationAmount);
-        emit DebugLog("compensationInPrimary", compensationInPrimary);
-        
-        uint256 token6BalBefore = IERC20Min(token6).balanceOf(address(this));
-        
-        liquidityRouter.withdraw(
-            address(liquidityTemplate),
-            address(listingTemplate),
-            token18,
-            token6,
-            primaryAmount,
-            compensationAmount,
-            mainSlot
-        );
-        
-        uint256 token6BalAfter = IERC20Min(token6).balanceOf(address(this));
-        assert(token6BalAfter > token6BalBefore);
-        
-        emit TestPassed("test3_WithdrawalWithCompensation");
+//  (0.0.10) Use correct pair conversion, fixed direction. 
+
+function test3_WithdrawalWithCompensation() public {
+    // Deposit token6 for compensation - need enough for withdrawal
+    uint256 deposit6 = 2000 * 1e6;
+    mockDeployer.mintToken6(address(this), deposit6);
+    IERC20Min(token6).approve(address(liquidityRouter), deposit6);
+    liquidityRouter.depositToken(address(liquidityTemplate), token6, address(this), deposit6);
+    
+    (,,,uint256 allocation18,,) = liquidityTemplate.getSlotView(token18, mainSlot);
+    
+    // Check available liquidity in both tokens
+    uint256 liquid18 = liquidityTemplate.liquidityAmounts(token18);
+    uint256 liquid6 = liquidityTemplate.liquidityAmounts(token6);
+    
+    emit DebugLog("allocation18", allocation18);
+    emit DebugLog("liquid18", liquid18);
+    emit DebugLog("liquid6", liquid6);
+    
+    // Get canonical price: always fetch prices(A, B) where A < B
+    (address token0, address token1) = token6 < token18 ? (token6, token18) : (token18, token6);
+    uint256 price = listingTemplate.prices(token0, token1); // price = token1/token0
+    
+    uint256 primaryAmount = allocation18 / 5; // Withdraw 20% in token18
+    
+    // Calculate compensation in token6
+    // We want to withdraw some token6 as compensation
+    uint256 compensationAmount;
+    if (token18 == token1) {
+        // price = token18/token6, so to convert token18 to token6: token6 = token18 * price
+        compensationAmount = (allocation18 / 20 * price) / 1e18;
+    } else {
+        // price = token6/token18, so to convert token18 to token6: token6 = token18 / price
+        compensationAmount = (allocation18 / 20 * 1e18) / price;
     }
+    
+    // Convert compensation back to primary to check allocation
+    uint256 compensationInPrimary;
+    if (token18 == token0) {
+        // Converting token1 (token6) to token0 (token18): token18 = token6 / price
+        compensationInPrimary = (compensationAmount * 1e18) / price;
+    } else {
+        // Converting token0 (token6) to token1 (token18): token18 = token6 * price
+        compensationInPrimary = (compensationAmount * price) / 1e18;
+    }
+    
+    // Ensure we don't over-withdraw
+    require(primaryAmount + compensationInPrimary <= allocation18, "Over-withdrawal from allocation");
+    require(primaryAmount <= liquid18, "Insufficient token18 liquidity");
+    require(compensationAmount <= liquid6, "Insufficient token6 liquidity");
+    
+    emit DebugLog("primaryAmount", primaryAmount);
+    emit DebugLog("compensationAmount", compensationAmount);
+    emit DebugLog("compensationInPrimary", compensationInPrimary);
+    
+    uint256 token6BalBefore = IERC20Min(token6).balanceOf(address(this));
+    
+    liquidityRouter.withdraw(
+        address(liquidityTemplate),
+        address(listingTemplate),
+        token18,
+        token6,
+        primaryAmount,
+        compensationAmount,
+        mainSlot
+    );
+    
+    uint256 token6BalAfter = IERC20Min(token6).balanceOf(address(this));
+    assert(token6BalAfter > token6BalBefore);
+    
+    emit TestPassed("test3_WithdrawalWithCompensation");
+}
 
     // Test 4: Full withdrawal of remaining allocation
     function test4_FullWithdrawal() public {
@@ -406,7 +428,7 @@ contract LiquidTests {
 
     // Test 6: Create order and partial settlement via settlement router
     function test6_CreateAndPartialSettle() public {
-        // Approve tester's token6
+        // 1. Approve tester's token6 to OrderRouter (User is selling Token6 to buy Token18)
         IMockTester(tester).proxyCall(
             token6,
             abi.encodeWithSignature("approve(address,uint256)", address(orderRouter), 1000 * 1e6)
@@ -414,38 +436,56 @@ contract LiquidTests {
         
         uint256 orderIdBefore = listingTemplate.getNextOrderId();
         
-        // Create buy order
+        // 2. Create buy order via OrderRouter
         IMockTester(tester).proxyCall(
             address(orderRouter),
             abi.encodeWithSignature(
                 "createBuyOrder(address,address,address,uint256,uint256,uint256)",
-                token6,
-                token18,
-                tester,
-                100 * 1e6,
-                10e18,
-                1e16
+                token6,     // startToken (Input)
+                token18,    // endToken (Output)
+                tester,     // Recipient
+                100 * 1e6,  // Input Amount
+                10e18,      // Max Price
+                1e16        // Min Price
             )
         );
+        
         orderId = orderIdBefore;
         
-        // Partial settle via settlement router (50%)
+        // 3. Setup Partial Settlement (50%)
         (,, uint256[] memory amountsBefore,) = listingTemplate.getBuyOrder(orderId);
         
-        IERC20Min(token18).approve(address(settlementRouter), type(uint256).max);
+        // Note: We do NOT need to approve tokens here. The SettlementRouter withdraws 
+        // the Input Token (Token6) directly from the ListingTemplate, where it is currently held.
         
         uint256[] memory orderIds = new uint256[](1);
         orderIds[0] = orderId;
         
         uint256[] memory amountsIn = new uint256[](1);
-        amountsIn[0] = amountsBefore[0] / 2;
+        amountsIn[0] = amountsBefore[0] / 2; // Calculate 50% of pending amount
         
-        settlementRouter.settleOrders(address(listingTemplate), orderIds, amountsIn, true);
+        // 4. Execute Settlement & CAPTURE REASON
+        // Critical Fix: Capture the return string to verify settlement succeeded
+        string memory reason = settlementRouter.settleOrders(
+            address(listingTemplate), 
+            orderIds, 
+            amountsIn, 
+            true // isBuyOrder
+        );
+        
+        // 5. Assertions
+        // If settlement failed, this require will revert with the exact reason from the Router
+        require(bytes(reason).length == 0, reason); 
         
         (,, uint256[] memory amountsAfter, uint8 status) = listingTemplate.getBuyOrder(orderId);
         
-        assert(status == 2); // Partial
-        assert(amountsAfter[0] > 0); // Still has pending
+        // Status 2 = Partially Filled
+        assert(status == 2); 
+        
+        // Check Amounts
+        assert(amountsAfter[0] > 0); // Still has pending amount (we only settled half)
+        assert(amountsAfter[0] < amountsBefore[0]); // Pending decreased
+        assert(amountsAfter[1] > 0); // Filled amount increased
         
         emit TestPassed("test6_CreateAndPartialSettle");
     }
