@@ -1,5 +1,5 @@
 # Overview
-CoinClash is a decentralized limit-order trading platform built on Uniswap V2 for price discovery and swap execution. The system supports **range-bound orders**, **partial fills**, **dynamic fee scaling**, and **per-pair historical data** while maintaining gas-efficient batch processing. All core functionality is now consolidated into a **monolithic architecture** centered on `CCListingTemplate` and `CCLiquidityTemplate`, eliminating multi-contract agents and per-listing proxies.
+CoinClash is a decentralized limit-order trading platform built on Uniswap V2 for price discovery and swap execution. The system supports **range-bound orders**, **partial fills**, **dynamic fee scaling**, and **per-pair historical data** while maintaining gas-efficient batch processing. All core functionality is now consolidated into a **monolithic architecture** centered on `CCListingTemplate`, eliminating multi-contract agents and per-listing proxies.
 
 ## System Summary
 The platform operates through a **single `CCListingTemplate`** per token pair, which serves as the canonical order book and state tracker. Users interact via **four specialized routers**:
@@ -8,8 +8,6 @@ The platform operates through a **single `CCListingTemplate`** per token pair, w
 |--------|---------|
 | `CCOrderRouter` | Create, cancel, and batch-cancel limit orders |
 | `CCSettlementRouter` | Settle pending orders using Uniswap V2 swaps with pre-normalized `amountsIn` |
-| `CCLiquidRouter` | Settle orders using internal liquidity with dynamic fees (0.05% → 50%) |
-| `CCLiquidityRouter` | Deposit, withdraw, claim fees, and reassign depositor slots |
 
 `CCListingTemplate` stores:
 - Buy/sell orders in array-based structs (`addresses[]`, `prices[]`, `amounts[]`)
@@ -17,12 +15,6 @@ The platform operates through a **single `CCListingTemplate`** per token pair, w
 - Maker-specific pending lists (`makerPendingOrders`)
 - Per-pair historical data (`_historicalData[tokenA][tokenB]`)
 - Real-time price via direct `IERC20.balanceOf` on the Uniswap V2 pair
-
-`CCLiquidityTemplate` manages:
-- Token-agnostic liquidity pools keyed by `address token`
-- Slot-based depositor tracking with normalized allocations
-- Fee accumulation and pro-rata claims
-- Emergency withdrawal via `withdrawToken`
 
 All amounts are **normalized to 1e18** using `normalize()` / `denormalize()` helpers. Transfers use **pre/post balance checks** to support tax-on-transfer tokens. External calls are wrapped in `try/catch` with detailed event emissions for **graceful degradation**.
 
@@ -102,54 +94,13 @@ Settles orders using **Uniswap V2 swaps** with **off-chain pre-calculated `amoun
 
 ---
 
-# CCLiquidRouter
-
-## Description
-Settles orders using **internal liquidity** (CCLiquidityTemplate) with **dynamic fees** based on usage percent:
-- ≤1% → 0.05%
-- 2% → 0.10%
-- 10% → 0.50%
-- 100% → 50% max
-
-## Key Interactions
-- Validates price within 10% of Uniswap
-- Checks `liquidIn ≥ pending`, `liquidOut ≥ expectedOut`
-- Ensures `uniswapBalance(output) ≤ internalLiquidity` (The internal liquidity must be greater than the Uni-v2 liquidity for liquid settlement to execute).
-- Deducts fee → `ICCLiquidity.ccUpdate(updateType=1)`
-- Transfers output → recipient
-- Updates order + historical data
-
-- **Pagination:** Iterates `makerPendingOrdersView` from `step`.
-
-- Token agnostic, settles all pending orders for all orders of various pairs.
-
----
-
-# CCLiquidityRouter
-
-## Description
-Manages **liquidity deposits, withdrawals, and fee claims** in `CCLiquidityTemplate`. Fully **token-agnostic** — no x/y duality.
-
-## Key Functions
-- `depositNativeToken`, `depositToken`
-- `withdraw(listing, token, compensationToken, outputAmount, compensationAmount, index)`
-- `claimFees(token, liquidityIndex)`
-- `changeDepositor(token, slotIndex, newDepositor)`
-
-## Compensation Logic
-- `compensationAmount` converted to primary token equivalent using `ICCListing.prices()`
-- Total allocation deduction = `output + (comp * 1e18 / price)`
-- Actual transfers are independent (denormalized)
-
----
-
 # Deployment & Upgrades
 
 ## Initial Deployment
-1. Deploy `CCListingTemplate` and `CCLiquidityTemplate` for all pairs.
+1. Deploy `CCListingTemplate` for all pairs.
 2. Set `uniswapV2Factory`, deploy and set `registryAddress`, `globalizerAddress` via owner functions
 3. Deploy and set routers via `addRouter()`. 
-4. Setup `CCListingTemplate` and `CCLiquidityTemplate` addresses in routers. 
+4. Setup `CCListingTemplate` addresses in routers. 
 
 ## Upgrades
 - **Router reset**: Routers can be added or removed freely by the contract owner to adjust their functionality. 
@@ -182,13 +133,6 @@ No proxy patterns.
 5. `amountSent` = balance diff
 6. `ccUpdate`: `filled += input`, `amountSent += output`, `pending -= input`
 
-## Liquidity Withdrawal with Compensation
-1. User requests 100 normalized TokenA + 50 normalized TokenB
-2. Price: 1 TokenB = 2 TokenA → 50 TokenB = 100 TokenA equiv
-3. Total deduction: 200 normalized
-4. Transfer 100 TokenA + 50 TokenB independently
-5. `ccUpdate(updateType=2)` deducts 200 from slot
-
 ---
 
 # Pagination & Gas Control
@@ -197,8 +141,6 @@ No proxy patterns.
 |------|------------|
 | `makerPendingOrdersView` | `step` + implicit length |
 | `clearOrders(maxIterations)` | User caps |
-| `settleBuyLiquid(step)` | Starts at index `step` |
-| `getListingsByLister` | `maxIterations` |
 
 All loops respect user limits. No fixed caps.
 
@@ -207,6 +149,4 @@ All loops respect user limits. No fixed caps.
 # Events & Indexing
 
 All events indexed by:
-- `token` (liquidity)
 - `maker`, `orderId` (orders)
-- `depositor`, `slotIndex` (slots)
