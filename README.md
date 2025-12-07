@@ -1,7 +1,7 @@
 # Overview
 CoinClash is a decentralized limit-order trading platform built on Uniswap V2 for price discovery and swap execution. The system supports **range-bound orders**, **partial fills**, **dynamic fee scaling**, and **per-pair historical data** while maintaining gas-efficient batch processing. All core functionality is now consolidated into a **monolithic architecture** centered on `CCListingTemplate`, eliminating multi-contract agents and per-listing proxies.
 
-## System Summary
+## Type-A : Range Orders
 The platform operates through a **single `CCListingTemplate`** per token pair, which serves as the canonical order book and state tracker. Users interact via **four specialized routers**:
 
 | Router | Purpose |
@@ -17,13 +17,6 @@ The platform operates through a **single `CCListingTemplate`** per token pair, w
 - Real-time price via direct `IERC20.balanceOf` on the Uniswap V2 pair
 
 All amounts are **normalized to 1e18** using `normalize()` / `denormalize()` helpers. Transfers use **pre/post balance checks** to support tax-on-transfer tokens. External calls are wrapped in `try/catch` with detailed event emissions for **graceful degradation**.
-
-*Pending*: The following contracts implement leverage trading via AAVE "debt looping". They are under active development and not yet functional.
-- `UAEntryDriver`
-- `UAExitDriver`
-- `UALiquidationDriver`
-- `UAExecutionDriver`
-- `UAStorage`
 
 ---
 
@@ -150,3 +143,16 @@ All loops respect user limits. No fixed caps.
 
 All events indexed by:
 - `maker`, `orderId` (orders)
+
+## Type-B : Debt-Looping Suite
+
+### Description  
+Type-B is a gas-optimized, single-transaction debt-looping system for Aave V3 + Uniswap V2 pairs. Users can instantly leverage up (or unwind) positions without flash loans.
+
+### Key Components
+- **`UADriver`** – Immutable per-pair contract that automates borrow → swap → supply cycles to reach a target leverage (up to ~10× depending on LTV). Includes:
+  - `executeLoop()` – one-tx leveraged entry with user-defined min HF & slippage
+  - `unwindLoop()` – one-tx deleveraging (full or partial)
+  - `previewLoop()` – off-chain simulation of final position & loop count
+  - Built-in 2% default slippage cap, owner-configurable
+- **`UADriverFactory`** – Deploys new UADriver instances on demand (optional small ETH deployment fee). Tracks all drivers and provides pair → driver lookup.
