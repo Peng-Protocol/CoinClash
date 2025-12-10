@@ -9,6 +9,8 @@
  - v0.2.9: Modified globalizeLiquidity to remove external fetches to ICCLiquidityTemplate (except ICCAgent validation), accepting only depositor and token, storing valid liquidity address. Removed depositorSlotSnapshots and slotStatus mappings. Removed getAllUserLiquidityHistory, getAllUserTokenLiquidityHistory, and _fetchHistoricalSlotData. Added getUserHistoricalTemplates.
 */
 
+//To-Do: Monolithic refactor for listing template, new Type-C monolithic liquidity template integration.
+
 pragma solidity ^0.8.2;
 
 import "../imports/Ownable.sol";
