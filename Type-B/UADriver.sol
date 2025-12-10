@@ -6,8 +6,9 @@ pragma solidity ^0.8.20;
  * @notice This contract automates leverage creation through debt looping
  * Executes multiple borrow-swap-deposit cycles in a single transaction
  */
- // File Version: 0.0.1 (07/12/2025)
- // - 0.0.1 (07/12): Initial Implementation . 
+ // File Version: 0.0.2 (10/12/2025)
+ // - 0.0.2 (10/12): Added third party position creation.
+ // - 0.0.1 (07/12): Initial Implementation. 
 
 import "./imports/ReentrancyGuard.sol"; //Imports and inherits ownable
 import "./imports/IERC20.sol";
@@ -280,88 +281,99 @@ contract UADriver is ReentrancyGuard {
     
     // MAIN EXECUTION FUNCTION
     
-    /**
-     * @notice Execute automated debt looping to achieve target leverage
-     * @param initialMargin Amount of collateral to deposit (in wei)
-     * @param targetLeverage Desired leverage multiplier (e.g., 3e18 = 3x)
-     * @param minHealthFactor Minimum acceptable health factor (e.g., 1.2e18)
-     * @param maxSlippage Maximum acceptable slippage in basis points (e.g., 100 = 1%)
-     */
-    /**
-     * @notice Execute automated debt looping (Refactored for Stack Optimization)
-     */
-    function executeLoop(
-        uint256 initialMargin,
-        uint256 targetLeverage,
-        uint256 minHealthFactor,
-        uint256 maxSlippage
-    ) external nonReentrant {
-        if (paused) revert ContractPaused();
-        if (initialMargin == 0) revert InvalidAmount();
-        if (targetLeverage < PRECISION || targetLeverage > 10 * PRECISION) revert InvalidLeverage();
-        if (minHealthFactor < MIN_HEALTH_FACTOR) revert InvalidHealthFactor();
-        if (maxSlippage > maxSlippageBps) revert SlippageExceeded();
+/**
+ * @notice Execute automated debt looping on behalf of a user
+ * @param onBehalfOf Address to create the position for
+ * @param initialMargin Amount of collateral to deposit (in wei)
+ * @param targetLeverage Desired leverage multiplier (e.g., 3e18 = 3x)
+ * @param minHealthFactor Minimum acceptable health factor (e.g., 1.2e18)
+ * @param maxSlippage Maximum acceptable slippage in basis points (e.g., 100 = 1%)
+ */
+function executeLoop(
+    address onBehalfOf,
+    uint256 initialMargin,
+    uint256 targetLeverage,
+    uint256 minHealthFactor,
+    uint256 maxSlippage
+) external nonReentrant {
+    if (paused) revert ContractPaused();
+    if (onBehalfOf == address(0)) revert InvalidAmount();
+    if (initialMargin == 0) revert InvalidAmount();
+    if (targetLeverage < PRECISION || targetLeverage > 10 * PRECISION) revert InvalidLeverage();
+    if (minHealthFactor < MIN_HEALTH_FACTOR) revert InvalidHealthFactor();
+    if (maxSlippage > maxSlippageBps) revert SlippageExceeded();
 
-        // 1. Build Configuration Cache
-        ExecuteCache memory cache = _buildExecuteCache(initialMargin, targetLeverage, minHealthFactor, maxSlippage);
+    // 1. Build Configuration Cache
+    ExecuteCache memory cache = _buildExecuteCache(initialMargin, targetLeverage, minHealthFactor, maxSlippage);
 
-        // 2. Initial Transfer and Deposit
-        IERC20(collateralAsset).transferFrom(msg.sender, address(this), initialMargin);
-        aavePool.supply(collateralAsset, initialMargin, msg.sender, 0);
+    // 2. Initial Transfer (from msg.sender) and Deposit (to onBehalfOf)
+    IERC20(collateralAsset).transferFrom(msg.sender, address(this), initialMargin);
+    aavePool.supply(collateralAsset, initialMargin, onBehalfOf, 0);
 
-        // 3. Initialize State
-        ExecuteState memory state = ExecuteState({
-            currentCollateral: initialMargin,
-            totalDebt: 0,
-            loopCount: 0
-        });
+    // 3. Initialize State
+    ExecuteState memory state = ExecuteState({
+        currentCollateral: initialMargin,
+        totalDebt: 0,
+        loopCount: 0
+    });
 
-        // 4. Execution Loop
-        while (state.loopCount < MAX_LOOPS) {
-            uint256 currentVal = (state.currentCollateral * cache.collateralPrice) / PRECISION;
-            
-            // Break if target reached
-            if (currentVal >= cache.targetCollateralValue) break;
+    // 4. Execution Loop - use helper to avoid stack too deep
+    _executeLoopCycles(onBehalfOf, cache, state);
+    
+    if (state.loopCount >= MAX_LOOPS) revert MaxLoopsExceeded();
+    
+    _emitCompletion(onBehalfOf, state.currentCollateral, state.totalDebt, state.loopCount, cache.minHealthFactor);
+}
 
-            // Calculate Borrow Amount (Math Logic Offloaded)
-            uint256 borrowAmount = _calculateLoopBorrow(cache, state, currentVal);
-
-            // Stop if dust amount
-            if (borrowAmount < 1000) break;
-
-            // Check Liquidity availability
-            uint256 liquidity = _getAvailableLiquidity(borrowAsset);
-            if (borrowAmount > liquidity) borrowAmount = liquidity;
-
-            // Execute: Borrow -> Swap -> Supply
-            aavePool.borrow(borrowAsset, borrowAmount, 2, 0, msg.sender);
-            
-            // Calc minimum output for slippage
-            uint256 expectedOut = _getExpectedOutput(borrowAmount);
-            uint256 minAmountOut = (expectedOut * (BPS_PRECISION - cache.maxSlippage)) / BPS_PRECISION;
-            
-            // Swap
-            uint256 collateralReceived = _swapBorrowForCollateral(borrowAmount, minAmountOut);
-            
-            // Supply
-            aavePool.supply(collateralAsset, collateralReceived, msg.sender, 0);
-
-            // Update State
-            state.currentCollateral += collateralReceived;
-            state.totalDebt += borrowAmount;
-            state.loopCount++;
-
-            // Safety Check
-            (, , , , , uint256 healthFactor) = aavePool.getUserAccountData(msg.sender);
-            emit LoopExecuted(msg.sender, state.loopCount, borrowAmount, borrowAmount, collateralReceived, healthFactor);
-            
-            if (healthFactor < cache.minHealthFactor) revert HealthFactorTooLow();
-        }
+/**
+ * @notice Internal helper to execute loop cycles (avoids stack too deep)
+ */
+function _executeLoopCycles(
+    address onBehalfOf,
+    ExecuteCache memory cache,
+    ExecuteState memory state
+) internal {
+    while (state.loopCount < MAX_LOOPS) {
+        uint256 currentVal = (state.currentCollateral * cache.collateralPrice) / PRECISION;
         
-        if (state.loopCount >= MAX_LOOPS) revert MaxLoopsExceeded();
+        // Break if target reached
+        if (currentVal >= cache.targetCollateralValue) break;
+
+        // Calculate Borrow Amount
+        uint256 borrowAmount = _calculateLoopBorrow(cache, state, currentVal);
+
+        // Stop if dust amount
+        if (borrowAmount < 1000) break;
+
+        // Check Liquidity availability
+        uint256 liquidity = _getAvailableLiquidity(borrowAsset);
+        if (borrowAmount > liquidity) borrowAmount = liquidity;
+
+        // Execute: Borrow -> Swap -> Supply
+        aavePool.borrow(borrowAsset, borrowAmount, 2, 0, onBehalfOf);
         
-        _emitCompletion(state.currentCollateral, state.totalDebt, state.loopCount, cache.minHealthFactor);
+        // Calc minimum output for slippage
+        uint256 expectedOut = _getExpectedOutput(borrowAmount);
+        uint256 minAmountOut = (expectedOut * (BPS_PRECISION - cache.maxSlippage)) / BPS_PRECISION;
+        
+        // Swap
+        uint256 collateralReceived = _swapBorrowForCollateral(borrowAmount, minAmountOut);
+        
+        // Supply
+        aavePool.supply(collateralAsset, collateralReceived, onBehalfOf, 0);
+
+        // Update State
+        state.currentCollateral += collateralReceived;
+        state.totalDebt += borrowAmount;
+        state.loopCount++;
+
+        // Safety Check
+        (, , , , , uint256 healthFactor) = aavePool.getUserAccountData(onBehalfOf);
+        emit LoopExecuted(onBehalfOf, state.loopCount, borrowAmount, borrowAmount, collateralReceived, healthFactor);
+        
+        if (healthFactor < cache.minHealthFactor) revert HealthFactorTooLow();
     }
+}
     
     // HELPER: Build Configuration Cache
     function _buildExecuteCache(
@@ -434,31 +446,32 @@ contract UADriver is ReentrancyGuard {
         return availableLiquidity;
     }
 
-    // HELPER: Final Event Emission
-    function _emitCompletion(
-        uint256 currentCollateral, 
-        uint256 totalDebt, 
-        uint256 loopCount,
-        uint256 minHealthFactor
-    ) internal {
-        (uint256 totalCollateralBase, uint256 totalDebtBase, , , , uint256 finalHealthFactor) 
-            = aavePool.getUserAccountData(msg.sender);
+// Updated (0.0.2) helper function
+function _emitCompletion(
+    address onBehalfOf, // Added parameter
+    uint256 currentCollateral, 
+    uint256 totalDebt, 
+    uint256 loopCount,
+    uint256 minHealthFactor
+) internal {
+    (uint256 totalCollateralBase, uint256 totalDebtBase, , , , uint256 finalHealthFactor) 
+        = aavePool.getUserAccountData(onBehalfOf); // Changed
 
-        if (finalHealthFactor < minHealthFactor) revert HealthFactorTooLow();
-        
-        uint256 achievedLeverage = totalCollateralBase > 0 
-            ? (totalCollateralBase * PRECISION) / (totalCollateralBase - totalDebtBase)
-            : 0; 
+    if (finalHealthFactor < minHealthFactor) revert HealthFactorTooLow();
+    
+    uint256 achievedLeverage = totalCollateralBase > 0 
+        ? (totalCollateralBase * PRECISION) / (totalCollateralBase - totalDebtBase)
+        : 0; 
 
-        emit LoopingCompleted(
-            msg.sender,
-            loopCount,
-            currentCollateral,
-            totalDebt,
-            finalHealthFactor,
-            achievedLeverage
-        );
-    }
+    emit LoopingCompleted(
+        onBehalfOf, // Changed
+        loopCount,
+        currentCollateral,
+        totalDebt,
+        finalHealthFactor,
+        achievedLeverage
+    );
+}
     
     // UNWINDING FUNCTION
     
