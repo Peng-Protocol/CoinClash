@@ -21,25 +21,7 @@ When a user executes a loop using the UADriver, the driver acts **on the user's 
 
 ***
 
-## 2. The UADriver Factory and Per-Pair Design
-
-### UAFactory Role
-
-The `UAFactory` smart contract is the central deployment and management hub. Its primary function is to deploy new, verified instances of the `UADriver` contract for any supported asset pair.
-
-### Per-Pair Structure
-
-A single deployed `UADriver` contract instance is **asset-pair specific**:
-
-* The factory's `createDriver` function requires two distinct addresses: the **`collateralAsset`** and the **`borrowAsset`**.
-* A new `UADriver` is deployed and initialized with these two fixed assets.
-* All functions within that driver, such as `executeLoop` and `unwindLoop`, are hardcoded to operate *only* on that specific token pair.
-
-For a user to leverage a different set of tokens, a different, already-deployed `UADriver` instance (or a newly deployed one) must be used.
-
-***
-
-## 3. Core Position Concepts and Driver Usage
+## 2. Core Position Concepts and Driver Usage
 
 The leverage loop can be interpreted as a levered exposure strategy based on the pair chosen for collateral and borrowing.
 
@@ -90,3 +72,38 @@ The process is managed by the contract's **`executeLoop`** function, which takes
     * **Supply:** It supplies the newly acquired collateral back to Aave, increasing your position's collateral balance.
 
 The loop continues until either the **target collateral value is reached** or the next loop is blocked by the **`minHealthFactor`** constraint. This means your safety setting can, and often will, cap your final achieved leverage below the maximum value requested.
+
+---
+
+## 3. UAExecutor - Limit Order and Automated Execution System
+
+The **UAExecutor** contract serves as the Limit Order and Automated Execution System for the UADriver Protocol. It provides an on-chain mechanism for users to submit orders for future execution based on specific price conditions, integrating directly with the **UADriver** to handle the complex debt-looping logic.
+
+It introduces two primary order types and one position tracking mechanism:
+
+### Core Data Structures
+
+| Data Structure | Purpose | Key Parameters |
+| :--- | :--- | :--- |
+| **`WindOrder`** | A limit order to **open** a leveraged position (a "wind"). | `entryPrice`, `entryDirection` (e.g., execute when price `>=` or `<=` target), `targetLeverage`, `collateralAmount`. |
+| **`UnwindOrder`** | A limit order to **close** an existing position. | `positionId`, `targetPrice`, `priceDirection`, `isTP` (Take Profit) or `isSL` (Stop Loss). |
+| **`Position`** | Tracks the details of an active, executed leveraged position. | `maker`, `collateralAsset`, `borrowAsset`, `collateralAmount`, `debtAmount`, and links to the `tpOrderId` and `slOrderId`. |
+
+### Execution Flow and Mechanics
+
+1.  **Order Creation (`createWindOrder`)**: A user sends the initial margin (collateral) to the `UAExecutor` contract, along with all parameters for the desired leveraged position (pair, leverage, entry price, etc.).
+2.  **External Execution**: Since smart contracts cannot execute themselves, the order execution is permissionless. An external entity ("mysterium") calls the `executeWinds` or `executeUnwinds` functions.
+3.  **Price Check**: The Executor checks the current price for the asset pair using the integrated Uniswap V2 functions. If the price condition is met, the order proceeds.
+4.  **Position Execution**:
+    * **Wind Order**: The Executor calls the internal `_executeWindOrder`, which triggers the **UADriver's `executeLoop`** function.
+    * **Unwind Order (TP/SL)**: The Executor calls the internal `_executeUnwindOrder`, which triggers the **UADriver's `unwindLoop`** function.
+5.  **Position Management**: Users can create, modify, or bulk-cancel their pending orders, returning the held collateral if the order is not yet executed. Users can also manually `closePosition` at any time.
+
+### Key Nuance: Custodial Position Management
+
+The single most important distinction between the `UAExecutor` and the raw `UADriver` is their approach to position ownership:
+
+* **UADriver (Direct Use) is Non-Custodial**: As outlined in Section 2, when a user calls the `UADriver` directly, the driver sets the `onBehalfOf` parameter to the **user's wallet address**. This means the aTokens (collateral) and DebtTokens are held and tracked by Aave against the user's wallet, maintaining non-custodial ownership.
+* **UAExecutor is Custodial**: When a position is opened via a `WindOrder`, the `UAExecutor` calls the `UADriver` with its own contract address (`address(this)`) as the `onBehalfOf` parameter.
+    * **Custody**: The Aave debt and collateral are tracked against the **Executor's address**.
+    * **Tracking**: The `UAExecutor` becomes the custodian of the active position and tracks the *true* owner using its internal `Position` struct. This shift in ownership is necessary for the Executor to maintain the collateral and to be the entity that can later call `unwindLoop` for the TP/SL orders.
