@@ -63,7 +63,9 @@ The process is managed by the contract's **`executeLoop`** function, which takes
 1.  **Calculate Target Collateral Value:**
     The contract first calculates the total value of collateral it needs to accumulate to reach the desired leverage, using your **initial margin (equity)** as a base.
     
-    ```Target Collateral Value $\approx$ Initial Margin Value * Target Leverage```
+$$
+\text{Target Collateral Value} \approx \text{Initial Margin Value} \times \text{Target Leverage}
+$$
     
 2.  **Iterative Looping:**
     The contract then enters a loop to achieve this target. In each iteration, it performs the following steps on your behalf:
@@ -75,7 +77,77 @@ The loop continues until either the **target collateral value is reached** or th
 
 ---
 
-## 3. UAExecutor - Limit Order and Automated Execution System
+## 4. Financial Costs of Debt Looping
+
+### 4.1. Aave Protocol Costs: Interest
+
+The Aave protocol is an interest-based system and **does not** charge a standard supply or borrow origination fee on the principal amount.
+
+The primary cost of using Aave is the **Borrow Interest Rate**:
+
+| Cost Component | Description | Calculation |
+| :--- | :--- | :--- |
+| **Borrow Interest Rate** | The continuous, time-dependent cost of maintaining the debt position. | Interest accrues in real-time based on the **Variable** or **Stable** Annual Percentage Rate (APR/APY) of the asset borrowed. |
+| **Supply Yield** | The yield earned on your collateral. | The interest earned on your supplied collateral (aTokens) helps to offset the borrow interest, resulting in the **Net Borrow Rate**. |
+
+### 4.2. Uniswap Protocol Costs: Swap Fees
+
+This is a fixed-percentage cost of 0.30% charged by the Uniswap liquidity pool for exchanging the borrowed asset back into the collateral asset during each cycle of the loop.
+This cost is multiplied for each debt loop cycle. 
+
+### 4.3. Total Cost Analysis
+
+* **Opening the Position:** $N$ swaps are executed as the loop is initiated (borrow → swap → supply).
+* **Unwinding the Position:** Reversing the loop requires $N$ reverse swaps to liquidate collateral and obtain the required repayment asset.
+
+For an $N$-cycle loop, the total swap fee cost is incurred on $2N$ swaps.
+
+### Ongoing Interest Cost (Time-Dependent)
+
+Interest is calculated on the **total notional borrowed amount**. Since Aave interest rates are highly dynamic, we use a representative example:
+
+***Assumption:*** *A representative annual borrow APR for a stablecoin is **6%**.*
+
+* **Hourly Interest Rate:** $6\% \text{ APR} / (365 \text{ days} \times 24 \text{ hours}) \approx \mathbf{0.000684\%}$ per hour.
+
+| Target Leverage (Approx.) | Cycles ($N$) to Open | Total Swaps (Open + Unwind) | Total Swap Fee Cost (% of Initial Principal) | Effective Hourly Interest Rate (on Total Borrowed) |
+| :---: | :---: | :---: | :---: | :---: |
+| **2x** | 2 | 4 | **1.20%** | $\approx \mathbf{0.000684\%}$ |
+| **10x** | 10 | 20 | **6.00%** | $\approx \mathbf{0.000684\%}$ |
+| **50x** | 50 | 100 | **30.00%** | $\approx \mathbf{0.000684\%}$ |
+
+### Gas Fees
+
+All interactions with Aave and Uniswap are subject to **Gas Fees**, which are non-refundable network transaction costs. Due to the high number of contract calls and internal loops in a single leveraged transaction, the gas cost for both opening and unwinding a position is substantial.
+
+---
+
+## 5. Understanding Leverage: Exposure vs. Equity
+
+A debt loop multiplies the user's **market exposure**, not their initial margin (net worth).
+
+The key distinction is between the **Target Collateral Value** (what you control) and your **Net Equity** (what you own).
+
+### Exposure and Net Equity
+
+| Term | Definition | Impact on Profit/Loss |
+| :--- | :--- | :--- |
+| **Total Exposure** | The total size of the collateral asset controlled by the position. This is the **Target Collateral Value** (Initial Margin $\times$ Target Leverage). | The full profit or loss from price movements is applied to this amount. |
+| **Net Equity** | The user's true capital in the position (Total Collateral Value minus Total Debt Owed). | This value remains constant until the market price changes. |
+
+### Example: 2x Leverage Loop
+
+Starting with **200 USDT** and targeting **2x Leverage**:
+
+* **Total Assets (Controlled):** $\mathbf{400 \text{ USDT}}$ (Collateral)
+* **Total Liabilities (Owed):** $\mathbf{-200 \text{ USDT}}$ (Debt)
+* **Net Equity (Owned):** $\mathbf{200 \text{ USDT}}$ (Your initial capital, not accounting for fees)
+
+If the price of the collateral asset increases by $10\%$, the user's **Net Equity** increases by 40 USDT, which represents a **$20\%$ return** (40 / 200) on the initial margin, or double the $10\%$ market gain.
+
+---
+
+## 6. UAExecutor - Limit Order and Automated Execution System
 
 The **UAExecutor** contract serves as the Limit Order and Automated Execution System for the UADriver Protocol. It provides an on-chain mechanism for users to submit orders for future execution based on specific price conditions, integrating directly with the **UADriver** to handle the complex debt-looping logic.
 
