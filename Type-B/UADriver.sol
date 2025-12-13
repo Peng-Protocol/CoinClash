@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.20;
 
 /**
@@ -97,13 +97,12 @@ contract UADriver is ReentrancyGuard {
     
     // STATE VARIABLES
     
-    IPool public immutable aavePool;
-    IUniswapV2Router02 public immutable uniswapRouter;
-    IAaveOracle public immutable aaveOracle;
-    IAaveProtocolDataProvider public immutable dataProvider;
-    IUniswapV2Factory public immutable uniswapFactory;
-    
-    // REMOVED: collateralAsset and borrowAsset [cite: 27, 28]
+IPool public aavePool;
+IUniswapV2Router02 public uniswapRouter;
+IAaveOracle public aaveOracle;
+IAaveProtocolDataProvider public dataProvider;
+IUniswapV2Factory public uniswapFactory;
+// REMOVED: collateralAsset and borrowAsset to allow dynamism. 
     
     // Constants
     uint256 private constant PRECISION = 1e18;
@@ -140,23 +139,56 @@ contract UADriver is ReentrancyGuard {
 
     // CONSTRUCTOR (Cleaned up parameters) [cite: 38]
     
-    constructor(
-        address _aavePool,
-        address _uniswapRouter,
-        address _uniswapFactory,
-        address _aaveOracle,
-        address _dataProvider
-    ) Ownable() {
+    // CONSTRUCTOR 
+    
+    constructor() Ownable() {
+        // No external contract addresses are set here; they are set via setter functions.
+    }
+    
+    // ADMIN SETTER FUNCTIONS
+    
+    /**
+     * @notice Sets the Aave Pool address
+     * @param _aavePool The address of the Aave V3 Pool
+     */
+    function setAavePool(address _aavePool) external onlyOwner {
         require(_aavePool != address(0), "Invalid pool");
-        require(_uniswapRouter != address(0), "Invalid router");
-        require(_uniswapFactory != address(0), "Invalid factory");
-        require(_aaveOracle != address(0), "Invalid oracle");
-        require(_dataProvider != address(0), "Invalid data provider");
-        
         aavePool = IPool(_aavePool);
+    }
+    
+    /**
+     * @notice Sets the Uniswap Router address
+     * @param _uniswapRouter The address of the UniswapV2Router02
+     */
+    function setUniswapRouter(address _uniswapRouter) external onlyOwner {
+        require(_uniswapRouter != address(0), "Invalid router");
         uniswapRouter = IUniswapV2Router02(_uniswapRouter);
+    }
+
+    /**
+     * @notice Sets the Uniswap Factory address
+     * @param _uniswapFactory The address of the UniswapV2Factory
+     */
+    function setUniswapFactory(address _uniswapFactory) external onlyOwner {
+        require(_uniswapFactory != address(0), "Invalid factory");
         uniswapFactory = IUniswapV2Factory(_uniswapFactory);
+    }
+
+    /**
+     * @notice Sets the Aave Oracle address
+     * @param _aaveOracle The address of the Aave Oracle
+     */
+    function setAaveOracle(address _aaveOracle) external onlyOwner {
+        require(_aaveOracle != address(0), "Invalid oracle");
         aaveOracle = IAaveOracle(_aaveOracle);
+    }
+    
+    /**
+     * @notice Sets the Aave Data Provider address
+     * @param _dataProvider The address of the Aave Protocol Data Provider
+     */
+    function setDataProvider(address _dataProvider) external onlyOwner {
+        require(_dataProvider != address(0), "Invalid data provider");
         dataProvider = IAaveProtocolDataProvider(_dataProvider);
     }
     

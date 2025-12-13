@@ -97,9 +97,9 @@ contract UAExecutor is ReentrancyGuard {
     
     // STATE VARIABLES
     
-    IUADriver public immutable uaDriver;
-    IUniswapV2Factory public immutable uniswapFactory;
-    IPool public immutable aavePool;
+    IUADriver public uaDriver;
+    IUniswapV2Factory public uniswapFactory;
+    IPool public aavePool;
     
     // REMOVED: collateralAsset, borrowAsset, pairAddress
     
@@ -185,17 +185,34 @@ contract UAExecutor is ReentrancyGuard {
     
     // CONSTRUCTOR (Simplified - removed pair-specific params)
     
-    constructor(
-        address _uaDriver,
-        address _uniswapFactory,
-        address _aavePool
-    ) Ownable() {
+    // CONSTRUCTOR (Retained only for Ownable initialization)
+    constructor() Ownable() {
+        // Dependencies are now set via owner-only setters after deployment
+    }
+    
+    // SETTER FUNCTIONS
+    
+    /**
+     * @notice Sets the address of the UADriver contract
+     */
+    function setUADriver(address _uaDriver) external onlyOwner {
         require(_uaDriver != address(0), "Invalid driver");
-        require(_uniswapFactory != address(0), "Invalid factory");
-        require(_aavePool != address(0), "Invalid pool");
-        
         uaDriver = IUADriver(_uaDriver);
+    }
+    
+    /**
+     * @notice Sets the address of the Uniswap V2 Factory
+     */
+    function setUniswapFactory(address _uniswapFactory) external onlyOwner {
+        require(_uniswapFactory != address(0), "Invalid factory");
         uniswapFactory = IUniswapV2Factory(_uniswapFactory);
+    }
+    
+    /**
+     * @notice Sets the address of the Aave Pool contract
+     */
+    function setAavePool(address _aavePool) external onlyOwner {
+        require(_aavePool != address(0), "Invalid pool");
         aavePool = IPool(_aavePool);
     }
     
