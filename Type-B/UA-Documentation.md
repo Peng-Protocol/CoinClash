@@ -104,17 +104,20 @@ For an $N$-cycle loop, the total swap fee cost is incurred on $2N$ swaps.
 
 ### Ongoing Interest Cost (Time-Dependent)
 
-Interest is calculated on the **total notional borrowed amount**. Since Aave interest rates are highly dynamic, we use a representative example:
+Interest is calculated on the **total notional borrowed amount**. Looping multiplies the overall debt, which in turn multiples the relative fee, the interest rate itself remains flat.
+Since Aave interest rates are highly dynamic, we use a representative example:
 
 ***Assumption:*** *A representative annual borrow APR for a stablecoin is **6%**.*
 
 * **Hourly Interest Rate:** $6\% \text{ APR} / (365 \text{ days} \times 24 \text{ hours}) \approx \mathbf{0.000684\%}$ per hour.
 
+*This figure is multiplied by the amount of leverage used*
+
 | Target Leverage (Approx.) | Cycles ($N$) to Open | Total Swaps (Open + Unwind) | Total Swap Fee Cost (% of Initial Principal) | Effective Hourly Interest Rate (on Total Borrowed) |
 | :---: | :---: | :---: | :---: | :---: |
-| **2x** | 2 | 4 | **1.20%** | $\approx \mathbf{0.000684\%}$ |
-| **10x** | 10 | 20 | **6.00%** | $\approx \mathbf{0.000684\%}$ |
-| **50x** | 50 | 100 | **30.00%** | $\approx \mathbf{0.000684\%}$ |
+| **2x** | 2 | 4 | **1.20%** | $\approx \mathbf{0.001368\%}$ |
+| **10x** | 10 | 20 | **6.00%** | $\approx \mathbf{0.00684\%}$ |
+| **50x** | 50 | 100 | **30.00%** | $\approx \mathbf{0.0342\%}$ |
 
 ### Gas Fees
 
