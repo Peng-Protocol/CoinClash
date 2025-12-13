@@ -109,7 +109,7 @@ Since Aave interest rates are highly dynamic, we use a representative example:
 
 ***Assumption:*** *A representative annual borrow APR for a stablecoin is **6%**.*
 
-* **Hourly Interest Rate:** $6\% \text{ APR} / (365 \text{ days} \times 24 \text{ hours}) \approx \mathbf{0.000684\%}$ per hour.
+* **Hourly Interest Rate:** 6% APR / (365 days \* 24 hours) ≈ **0.000684%** per hour.
 
 *This figure is multiplied by the amount of leverage used*
 
