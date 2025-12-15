@@ -6,7 +6,8 @@ pragma solidity ^0.8.20;
  * @notice Manages limit orders for position creation (winds) and unwinding with TP/SL
  * @dev Integrates with UADriver for position execution
  */
-// File Version: 0.0.2 (10/12/2025)
+// File Version: 0.0.3 (14/12/2025) (15/12/2025)
+// - 0.0.3 (14/12) (15/12) Merged wind and position structs, used mappings for associating winds and unwinds, refactored TP/SL to use fewer functions. Refactored position creation and cancellation to use new structs and mappings.
 // - 0.0.2 (10/12): Monolithic refactor - support multiple pairs dynamically
 
 import "./imports/ReentrancyGuard.sol"; // imports and inherits ownable
@@ -55,44 +56,35 @@ interface IPool {
 
 contract UAExecutor is ReentrancyGuard {
     
+    // ENUMS
+    enum Status { PENDING, ACTIVE, CLOSED, CANCELLED }
+
     // STRUCTS
-    
-    struct WindOrder {
+    struct Position {
+        uint256 id;
         address maker;
-        address collateralAsset;      // NEW: Store pair info in order
-        address borrowAsset;           // NEW: Store pair info in order
+        address collateralAsset;
+        address borrowAsset;
         uint256 collateralAmount;
+        uint256 debtAmount;        // 0 when PENDING
         uint256 targetLeverage;
         uint256 minHealthFactor;
         uint256 maxSlippage;
-        uint256 entryPrice;            // Price at which to execute (scaled 1e18)
-        bool entryDirection;           // true = execute when current >= entry, false = execute when current <= entry
+        uint256 entryPrice;        // Trigger price for PENDING, Execution price for ACTIVE
+        bool entryDirection;       // true: >=, false: <=
+        Status status;
         uint256 createdAt;
-        bool executed;
-        bool cancelled;
+        uint256 executedAt;
     }
-    
+
     struct UnwindOrder {
+        uint256 id;
         uint256 positionId;
-        uint256 targetPrice;           // Price at which to unwind
-        bool priceDirection;           // true = unwind when current >= target, false = unwind when current <= target
-        bool isTP;                     // true = Take Profit, false = Stop Loss
+        uint256 targetPrice;
+        bool priceDirection;       // true: >=, false: <=
+        bool isTP;                 // true: TP, false: SL
         bool executed;
         bool cancelled;
-    }
-    
-    struct Position {
-        address maker;
-        address collateralAsset;       // NEW: Store pair info in position
-        address borrowAsset;           // NEW: Store pair info in position
-        uint256 windOrderId;
-        uint256 collateralAmount;
-        uint256 debtAmount;
-        uint256 entryPrice;
-        uint256 createdAt;
-        bool active;
-        uint256 tpOrderId;             // 0 if no TP set
-        uint256 slOrderId;             // 0 if no SL set
     }
     
     // STATE VARIABLES
@@ -101,19 +93,24 @@ contract UAExecutor is ReentrancyGuard {
     IUniswapV2Factory public uniswapFactory;
     IPool public aavePool;
     
-    // REMOVED: collateralAsset, borrowAsset, pairAddress
+    // REMOVED: collateralAsset, borrowAsset, pairAddress for dynamism
     
-    // Order tracking
-    uint256 public nextWindOrderId = 1;
+// Mappings
+    mapping(uint256 => Position) public positions;
+    mapping(uint256 => UnwindOrder) public unwindOrders;
+    
+    // Simplified TP/SL Mappings (Position ID => Unwind Order ID)
+    mapping(uint256 => uint256) public positionToTP;
+    mapping(uint256 => uint256) public positionToSL;
+    
+    // Reverse mapping for internal checks
+    mapping(uint256 => uint256) public unwindToPosition;
+    
+    // Order tracking 
     uint256 public nextUnwindOrderId = 1;
     uint256 public nextPositionId = 1;
     
-    mapping(uint256 => WindOrder) public windOrders;
-    mapping(uint256 => UnwindOrder) public unwindOrders;
-    mapping(uint256 => Position) public positions;
-    
     // User tracking
-    mapping(address => uint256[]) public userWindOrders;
     mapping(address => uint256[]) public userPositions;
     
     // Constants
@@ -258,10 +255,10 @@ contract UAExecutor is ReentrancyGuard {
     
     // WIND ORDER FUNCTIONS
     
-    /**
-     * @notice Create a wind order (limit order to open leveraged position)
+   /**
+     * @notice (0.0.3) Create a new Position (starts as PENDING wind order)
      */
-    function createWindOrder(
+    function createOrder(
         address collateralAsset,
         address borrowAsset,
         uint256 collateralAmount,
@@ -270,391 +267,428 @@ contract UAExecutor is ReentrancyGuard {
         uint256 maxSlippage,
         uint256 entryPrice,
         bool entryDirection
-    ) external nonReentrant returns (uint256 orderId) {
+    ) external nonReentrant returns (uint256 id) {
         if (paused) revert ContractPaused();
         if (collateralAsset == borrowAsset) revert SameAsset();
         if (collateralAmount == 0) revert InvalidAmount();
-        if (entryPrice == 0) revert InvalidPrice();
-        if (targetLeverage < PRECISION || targetLeverage > 10 * PRECISION) revert InvalidLeverage();
         
-        // Verify pair exists
-        address pair = uniswapFactory.getPair(collateralAsset, borrowAsset);
-        if (pair == address(0)) revert PairNotFound();
-        
-        // Transfer collateral to this contract
         IERC20(collateralAsset).transferFrom(msg.sender, address(this), collateralAmount);
-        
-        // Approve UADriver to spend this collateral (dynamic approval)
         _approveIfNeeded(collateralAsset, address(uaDriver), collateralAmount);
         
-        orderId = nextWindOrderId++;
+        id = nextPositionId++;
         
-        windOrders[orderId] = WindOrder({
+        positions[id] = Position({
+            id: id,
             maker: msg.sender,
             collateralAsset: collateralAsset,
             borrowAsset: borrowAsset,
             collateralAmount: collateralAmount,
+            debtAmount: 0,
             targetLeverage: targetLeverage,
             minHealthFactor: minHealthFactor,
             maxSlippage: maxSlippage,
             entryPrice: entryPrice,
             entryDirection: entryDirection,
+            status: Status.PENDING,
             createdAt: block.timestamp,
-            executed: false,
-            cancelled: false
+            executedAt: 0
         });
-        
-        userWindOrders[msg.sender].push(orderId);
-        
-        emit WindOrderCreated(orderId, msg.sender, collateralAsset, borrowAsset, collateralAmount, entryPrice, entryDirection);
+
+        userPositions[msg.sender].push(id);
+        emit WindOrderCreated(id, msg.sender, collateralAsset, borrowAsset, collateralAmount, entryPrice, entryDirection);
     }
     
     /**
-     * @notice Execute multiple wind orders
+     * @notice (0.0.3) Execute multiple wind orders
      */
-    function executeWinds(uint256[] calldata orderIds) external nonReentrant {
+    function executeOrders(uint256[] calldata positionIds) external nonReentrant {
         if (paused) revert ContractPaused();
-        
-        for (uint256 i = 0; i < orderIds.length; i++) {
-            uint256 orderId = orderIds[i];
-            WindOrder storage order = windOrders[orderId];
+
+        for (uint256 i = 0; i < positionIds.length; i++) {
+            uint256 id = positionIds[i];
+            Position storage pos = positions[id];
+
+            // Only execute PENDING orders
+            if (pos.status != Status.PENDING) continue;
+
+            uint256 currentPrice = getCurrentPrice(pos.collateralAsset, pos.borrowAsset);
+            if (!_checkPriceCondition(currentPrice, pos.entryPrice, pos.entryDirection)) continue;
+
+            // Execute Loop
+            uaDriver.executeLoop(
+                pos.collateralAsset,
+                pos.borrowAsset,
+                address(this),
+                pos.collateralAmount,
+                pos.targetLeverage,
+                pos.minHealthFactor,
+                pos.maxSlippage
+            );
+
+            // Fetch updated data from Aave
+            (uint256 totalCollateral, uint256 totalDebt,,,,) = aavePool.getUserAccountData(address(this));
+
+            // Update the EXISTING struct
+            pos.status = Status.ACTIVE;
+            pos.collateralAmount = totalCollateral;
+            pos.debtAmount = totalDebt;
+            pos.entryPrice = currentPrice; // Update entry price to actual execution price
+            pos.executedAt = block.timestamp;
+
+            // TP and SL mappings (positionToTP/SL) remain valid for this ID!
             
-            // Skip if order doesn't exist or already processed
-            if (order.maker == address(0) || order.executed || order.cancelled) continue;
-            
-            // Get current price for this order's pair
-            uint256 currentPrice = getCurrentPrice(order.collateralAsset, order.borrowAsset);
-            
-            // Check if price condition is met
-            if (!_checkPriceCondition(currentPrice, order.entryPrice, order.entryDirection)) continue;
-            
-            // Execute the order
-            _executeWindOrder(orderId, order, currentPrice);
+            emit WindOrderExecuted(id, id, currentPrice); // positionId is the same as orderId
         }
     }
     
-    /**
-     * @notice Internal function to execute a wind order
-     */
-    function _executeWindOrder(
-        uint256 orderId,
-        WindOrder storage order,
-        uint256 executionPrice
-    ) internal {
-        // Mark as executed
-        order.executed = true;
-        
-        // Execute loop via UADriver (creates position for this contract)
-        uaDriver.executeLoop(
-            order.collateralAsset,
-            order.borrowAsset,
-            address(this),
-            order.collateralAmount,
-            order.targetLeverage,
-            order.minHealthFactor,
-            order.maxSlippage
-        );
-        
-        // Create position record
-        uint256 positionId = nextPositionId++;
-        
-        // Get position data from Aave
-        (uint256 totalCollateral, uint256 totalDebt,,,,) = aavePool.getUserAccountData(address(this));
-        
-        positions[positionId] = Position({
-            maker: order.maker,
-            collateralAsset: order.collateralAsset,
-            borrowAsset: order.borrowAsset,
-            windOrderId: orderId,
-            collateralAmount: totalCollateral,
-            debtAmount: totalDebt,
-            entryPrice: executionPrice,
-            createdAt: block.timestamp,
-            active: true,
-            tpOrderId: 0,
-            slOrderId: 0
-        });
-        
-        userPositions[order.maker].push(positionId);
-        
-        emit WindOrderExecuted(orderId, positionId, executionPrice);
+/**
+ * @notice Cancel a pending position
+ */
+function cancelPosition(uint256 positionId) external nonReentrant {
+    Position storage pos = positions[positionId];
+    
+    if (pos.maker != msg.sender) revert Unauthorized();
+    if (pos.status != Status.PENDING) revert PositionNotActive();
+    
+    pos.status = Status.CANCELLED;
+    
+    // Cancel associated TP/SL orders
+    uint256 tpOrderId = positionToTP[positionId];
+    uint256 slOrderId = positionToSL[positionId];
+    
+    if (tpOrderId != 0) {
+        unwindOrders[tpOrderId].cancelled = true;
+        delete positionToTP[positionId];
+        delete unwindToPosition[tpOrderId];
+        emit UnwindOrderCancelled(tpOrderId);
+    }
+    if (slOrderId != 0) {
+        unwindOrders[slOrderId].cancelled = true;
+        delete positionToSL[positionId];
+        delete unwindToPosition[slOrderId];
+        emit UnwindOrderCancelled(slOrderId);
     }
     
-    /**
-     * @notice Cancel a pending wind order
-     */
-    function cancelWindOrder(uint256 orderId) external nonReentrant {
-        WindOrder storage order = windOrders[orderId];
-        
-        if (order.maker != msg.sender) revert Unauthorized();
-        if (order.executed) revert OrderAlreadyExecuted();
-        if (order.cancelled) revert OrderAlreadyCancelled();
-        
-        order.cancelled = true;
-        
-        // Return collateral to maker
-        IERC20(order.collateralAsset).transfer(order.maker, order.collateralAmount);
-        
-        emit WindOrderCancelled(orderId);
-    }
+    // Return collateral to maker
+    IERC20(pos.collateralAsset).transfer(pos.maker, pos.collateralAmount);
     
-    /**
-     * @notice Bulk cancel wind orders
-     */
-    function bulkCancelWindOrders(uint256[] calldata orderIds) external nonReentrant {
-        for (uint256 i = 0; i < orderIds.length; i++) {
-            uint256 orderId = orderIds[i];
-            WindOrder storage order = windOrders[orderId];
-            
-            if (order.maker != msg.sender) continue;
-            if (order.executed || order.cancelled) continue;
-            
-            order.cancelled = true;
-            IERC20(order.collateralAsset).transfer(order.maker, order.collateralAmount);
-            
-            emit WindOrderCancelled(orderId);
+    emit WindOrderCancelled(positionId);
+}
+    
+/**
+ * @notice Bulk cancel pending positions
+ */
+function bulkCancelPositions(uint256[] calldata positionIds) external nonReentrant {
+    for (uint256 i = 0; i < positionIds.length; i++) {
+        uint256 positionId = positionIds[i];
+        Position storage pos = positions[positionId];
+        
+        if (pos.maker != msg.sender) continue;
+        if (pos.status != Status.PENDING) continue;
+        
+        pos.status = Status.CANCELLED;
+        
+        // Cancel associated TP/SL
+        uint256 tpOrderId = positionToTP[positionId];
+        uint256 slOrderId = positionToSL[positionId];
+        
+        if (tpOrderId != 0) {
+            unwindOrders[tpOrderId].cancelled = true;
+            delete positionToTP[positionId];
+            delete unwindToPosition[tpOrderId];
+            emit UnwindOrderCancelled(tpOrderId);
         }
+        if (slOrderId != 0) {
+            unwindOrders[slOrderId].cancelled = true;
+            delete positionToSL[positionId];
+            delete unwindToPosition[slOrderId];
+            emit UnwindOrderCancelled(slOrderId);
+        }
+        
+        IERC20(pos.collateralAsset).transfer(pos.maker, pos.collateralAmount);
+        
+        emit WindOrderCancelled(positionId);
     }
+}
     
     // UNWIND ORDER FUNCTIONS (TP/SL)
     
-    /**
-     * @notice Create a Take Profit order
+/**
+     * @notice Sets or updates the Take Profit order for a position (Pending or Active)
      */
-    function createTPOrder(
+    function setTP(
         uint256 positionId,
         uint256 targetPrice,
         bool priceDirection
     ) external nonReentrant returns (uint256 orderId) {
-        Position storage position = positions[positionId];
-        
-        if (position.maker != msg.sender) revert Unauthorized();
-        if (!position.active) revert PositionNotActive();
-        if (position.tpOrderId != 0) revert TPSLAlreadySet();
+        Position storage pos = positions[positionId];
+        if (pos.maker != msg.sender) revert Unauthorized();
+        if (pos.status == Status.CLOSED || pos.status == Status.CANCELLED) revert PositionNotActive();
         if (targetPrice == 0) revert InvalidPrice();
-        
-        orderId = nextUnwindOrderId++;
-        
-        unwindOrders[orderId] = UnwindOrder({
-            positionId: positionId,
-            targetPrice: targetPrice,
-            priceDirection: priceDirection,
-            isTP: true,
-            executed: false,
-            cancelled: false
-        });
-        
-        position.tpOrderId = orderId;
-        
-        emit UnwindOrderCreated(orderId, positionId, targetPrice, true);
+
+        uint256 existingId = positionToTP[positionId];
+
+        if (existingId != 0) {
+            // Update existing
+            UnwindOrder storage order = unwindOrders[existingId];
+            if (order.executed) revert OrderAlreadyExecuted();
+            order.targetPrice = targetPrice;
+            order.priceDirection = priceDirection;
+            order.cancelled = false; // Reactivate if it was cancelled
+            return existingId;
+        } else {
+            // Create new
+            orderId = nextUnwindOrderId++;
+            unwindOrders[orderId] = UnwindOrder({
+                id: orderId,
+                positionId: positionId,
+                targetPrice: targetPrice,
+                priceDirection: priceDirection,
+                isTP: true,
+                executed: false,
+                cancelled: false
+            });
+            positionToTP[positionId] = orderId;
+            unwindToPosition[orderId] = positionId;
+            emit UnwindOrderCreated(orderId, positionId, targetPrice, true);
+        }
     }
-    
+
     /**
-     * @notice Create a Stop Loss order
+     * @notice Sets or updates the Stop Loss order for a position (Pending or Active)
      */
-    function createSLOrder(
+    function setSL(
         uint256 positionId,
         uint256 targetPrice,
         bool priceDirection
     ) external nonReentrant returns (uint256 orderId) {
-        Position storage position = positions[positionId];
-        
-        if (position.maker != msg.sender) revert Unauthorized();
-        if (!position.active) revert PositionNotActive();
-        if (position.slOrderId != 0) revert TPSLAlreadySet();
+        Position storage pos = positions[positionId];
+        if (pos.maker != msg.sender) revert Unauthorized();
+        if (pos.status == Status.CLOSED || pos.status == Status.CANCELLED) revert PositionNotActive();
         if (targetPrice == 0) revert InvalidPrice();
-        
-        orderId = nextUnwindOrderId++;
-        
-        unwindOrders[orderId] = UnwindOrder({
-            positionId: positionId,
-            targetPrice: targetPrice,
-            priceDirection: priceDirection,
-            isTP: false,
-            executed: false,
-            cancelled: false
-        });
-        
-        position.slOrderId = orderId;
-        
-        emit UnwindOrderCreated(orderId, positionId, targetPrice, false);
-    }
-    
-    /**
-     * @notice Update Take Profit order
-     */
-    function updateTPOrder(
-        uint256 positionId,
-        uint256 newTargetPrice,
-        bool newPriceDirection
-    ) external nonReentrant {
-        Position storage position = positions[positionId];
-        
-        if (position.maker != msg.sender) revert Unauthorized();
-        if (!position.active) revert PositionNotActive();
-        if (position.tpOrderId == 0) revert OrderNotFound();
-        if (newTargetPrice == 0) revert InvalidPrice();
-        
-        UnwindOrder storage order = unwindOrders[position.tpOrderId];
-        if (order.executed) revert OrderAlreadyExecuted();
-        
-        order.targetPrice = newTargetPrice;
-        order.priceDirection = newPriceDirection;
-    }
-    
-    /**
-     * @notice Update Stop Loss order
-     */
-    function updateSLOrder(
-        uint256 positionId,
-        uint256 newTargetPrice,
-        bool newPriceDirection
-    ) external nonReentrant {
-        Position storage position = positions[positionId];
-        
-        if (position.maker != msg.sender) revert Unauthorized();
-        if (!position.active) revert PositionNotActive();
-        if (position.slOrderId == 0) revert OrderNotFound();
-        if (newTargetPrice == 0) revert InvalidPrice();
-        
-        UnwindOrder storage order = unwindOrders[position.slOrderId];
-        if (order.executed) revert OrderAlreadyExecuted();
-        
-        order.targetPrice = newTargetPrice;
-        order.priceDirection = newPriceDirection;
-    }
-    
-    /**
-     * @notice Execute multiple unwind orders (TP/SL)
-     */
-    function executeUnwinds(uint256[] calldata orderIds) external nonReentrant {
-        if (paused) revert ContractPaused();
-        
-        for (uint256 i = 0; i < orderIds.length; i++) {
-            uint256 orderId = orderIds[i];
-            UnwindOrder storage order = unwindOrders[orderId];
-            
-            // Skip if order doesn't exist or already processed
-            if (order.positionId == 0 || order.executed || order.cancelled) continue;
-            
-            Position storage position = positions[order.positionId];
-            if (!position.active) continue;
-            
-            // Get current price for this position's pair
-            uint256 currentPrice = getCurrentPrice(position.collateralAsset, position.borrowAsset);
-            
-            // Check if price condition is met
-            if (!_checkPriceCondition(currentPrice, order.targetPrice, order.priceDirection)) continue;
-            
-            // Execute the unwind
-            _executeUnwindOrder(orderId, order, position, currentPrice);
+
+        uint256 existingId = positionToSL[positionId];
+
+        if (existingId != 0) {
+            // Update existing
+            UnwindOrder storage order = unwindOrders[existingId];
+            if (order.executed) revert OrderAlreadyExecuted();
+            order.targetPrice = targetPrice;
+            order.priceDirection = priceDirection;
+            order.cancelled = false;
+            return existingId;
+        } else {
+            // Create new
+            orderId = nextUnwindOrderId++;
+            unwindOrders[orderId] = UnwindOrder({
+                id: orderId,
+                positionId: positionId,
+                targetPrice: targetPrice,
+                priceDirection: priceDirection,
+                isTP: false,
+                executed: false,
+                cancelled: false
+            });
+            positionToSL[positionId] = orderId;
+            unwindToPosition[orderId] = positionId;
+            emit UnwindOrderCreated(orderId, positionId, targetPrice, false);
         }
     }
+
+ // @notice Use cancelUnWindOrder for cancelling TP/Ss
+
+/**
+ * @notice Execute multiple unwind orders (TP/SL)
+ */
+function executeUnwinds(uint256[] calldata orderIds) external nonReentrant {
+    if (paused) revert ContractPaused();
     
-    /**
-     * @notice Internal function to execute an unwind order
-     */
-    function _executeUnwindOrder(
-        uint256 orderId,
-        UnwindOrder storage order,
-        Position storage position,
-        uint256 executionPrice
-    ) internal {
-        // Mark as executed
-        order.executed = true;
-        position.active = false;
+    for (uint256 i = 0; i < orderIds.length; i++) {
+        uint256 orderId = orderIds[i];
+        UnwindOrder storage order = unwindOrders[orderId];
         
-        // Unwind via UADriver (repay = 0 means repay all)
-        uaDriver.unwindLoop(
-            position.collateralAsset,
-            position.borrowAsset,
-            0,
-            0,
-            200
-        ); // 2% max slippage
+        // Skip if order doesn't exist or already processed
+        if (order.positionId == 0 || order.executed || order.cancelled) continue;
         
-        // Calculate P&L (simplified - actual implementation would be more complex)
-        uint256 pnl = 0;
-        if (executionPrice > position.entryPrice) {
-            pnl = ((executionPrice - position.entryPrice) * position.collateralAmount) / PRECISION;
-        }
+        Position storage position = positions[order.positionId];
+        if (position.status != Status.ACTIVE) continue; // FIXED: use status enum
         
-        // Transfer remaining collateral to maker
-        uint256 balance = IERC20(position.collateralAsset).balanceOf(address(this));
-        if (balance > 0) {
-            IERC20(position.collateralAsset).transfer(position.maker, balance);
-        }
+        // Get current price for this position's pair
+        uint256 currentPrice = getCurrentPrice(position.collateralAsset, position.borrowAsset);
         
-        emit UnwindOrderExecuted(orderId, order.positionId, executionPrice, pnl);
+        // Check if price condition is met
+        if (!_checkPriceCondition(currentPrice, order.targetPrice, order.priceDirection)) continue;
+        
+        // Execute the unwind
+        _executeUnwindOrder(orderId, order, position, currentPrice);
+    }
+}
+    
+/**
+ * @notice Internal function to execute an unwind order
+ */
+function _executeUnwindOrder(
+    uint256 orderId,
+    UnwindOrder storage order,
+    Position storage position,
+    uint256 executionPrice
+) internal {
+    // Mark as executed
+    order.executed = true;
+    position.status = Status.CLOSED; // FIXED: use status enum
+    
+    // Unwind via UADriver (repay = 0 means repay all)
+    uaDriver.unwindLoop(
+        position.collateralAsset,
+        position.borrowAsset,
+        0,
+        0,
+        200
+    ); // 2% max slippage
+    
+    // Calculate P&L (simplified - actual implementation would be more complex)
+    uint256 pnl = 0;
+    if (executionPrice > position.entryPrice) {
+        pnl = ((executionPrice - position.entryPrice) * position.collateralAmount) / PRECISION;
     }
     
-    /**
-     * @notice Cancel an unwind order (TP or SL)
-     */
-    function cancelUnwindOrder(uint256 orderId) external nonReentrant {
+    // Transfer remaining collateral to maker
+    uint256 balance = IERC20(position.collateralAsset).balanceOf(address(this));
+    if (balance > 0) {
+        IERC20(position.collateralAsset).transfer(position.maker, balance);
+    }
+    
+    // Clear TP/SL mappings
+    delete positionToTP[position.id];
+    delete positionToSL[position.id];
+    
+    emit UnwindOrderExecuted(orderId, order.positionId, executionPrice, pnl);
+}
+    
+/**
+ * @notice Cancel an unwind order (TP or SL)
+ */
+function cancelUnwindOrder(uint256 orderId) external nonReentrant {
+    UnwindOrder storage order = unwindOrders[orderId];
+    Position storage position = positions[order.positionId];
+    
+    if (position.maker != msg.sender) revert Unauthorized();
+    if (order.executed) revert OrderAlreadyExecuted();
+    if (order.cancelled) revert OrderAlreadyCancelled();
+    
+    order.cancelled = true;
+    
+    // Clear reference from position mappings
+    if (order.isTP) {
+        delete positionToTP[order.positionId];
+    } else {
+        delete positionToSL[order.positionId];
+    }
+    delete unwindToPosition[orderId];
+    
+    emit UnwindOrderCancelled(orderId);
+}
+    
+/**
+ * @notice Bulk cancel unwind orders
+ */
+function bulkCancelUnwindOrders(uint256[] calldata orderIds) external nonReentrant {
+    for (uint256 i = 0; i < orderIds.length; i++) {
+        uint256 orderId = orderIds[i];
         UnwindOrder storage order = unwindOrders[orderId];
         Position storage position = positions[order.positionId];
         
-        if (position.maker != msg.sender) revert Unauthorized();
-        if (order.executed) revert OrderAlreadyExecuted();
-        if (order.cancelled) revert OrderAlreadyCancelled();
+        if (position.maker != msg.sender) continue;
+        if (order.executed || order.cancelled) continue;
         
         order.cancelled = true;
         
-        // Clear reference from position
         if (order.isTP) {
-            position.tpOrderId = 0;
+            delete positionToTP[order.positionId];
         } else {
-            position.slOrderId = 0;
+            delete positionToSL[order.positionId];
         }
+        delete unwindToPosition[orderId];
         
         emit UnwindOrderCancelled(orderId);
     }
+}
     
-    /**
-     * @notice Bulk cancel unwind orders
-     */
-    function bulkCancelUnwindOrders(uint256[] calldata orderIds) external nonReentrant {
-        for (uint256 i = 0; i < orderIds.length; i++) {
-            uint256 orderId = orderIds[i];
-            UnwindOrder storage order = unwindOrders[orderId];
-            Position storage position = positions[order.positionId];
-            
-            if (position.maker != msg.sender) continue;
-            if (order.executed || order.cancelled) continue;
-            
-            order.cancelled = true;
-            
-            if (order.isTP) {
-                position.tpOrderId = 0;
-            } else {
-                position.slOrderId = 0;
-            }
-            
-            emit UnwindOrderCancelled(orderId);
-        }
+/**
+ * @notice Manually close an active position
+ */
+function closePosition(uint256 positionId) external nonReentrant {
+    Position storage position = positions[positionId];
+    
+    if (position.maker != msg.sender) revert Unauthorized();
+    if (position.status != Status.ACTIVE) revert PositionNotActive();
+    
+    position.status = Status.CLOSED;
+    
+    // Cancel any pending TP/SL orders
+    uint256 tpOrderId = positionToTP[positionId];
+    uint256 slOrderId = positionToSL[positionId];
+    
+    if (tpOrderId != 0) {
+        unwindOrders[tpOrderId].cancelled = true;
+        delete positionToTP[positionId];
+        delete unwindToPosition[tpOrderId];
+    }
+    if (slOrderId != 0) {
+        unwindOrders[slOrderId].cancelled = true;
+        delete positionToSL[positionId];
+        delete unwindToPosition[slOrderId];
     }
     
-    /**
-     * @notice Manually close an active position
-     */
-    function closePosition(uint256 positionId) external nonReentrant {
+    // Unwind position
+    uaDriver.unwindLoop(
+        position.collateralAsset,
+        position.borrowAsset,
+        0,
+        0,
+        200
+    );
+    
+    // Transfer remaining collateral to maker
+    uint256 balance = IERC20(position.collateralAsset).balanceOf(address(this));
+    uint256 pnl = balance > position.collateralAmount ? balance - position.collateralAmount : 0;
+    
+    if (balance > 0) {
+        IERC20(position.collateralAsset).transfer(position.maker, balance);
+    }
+    
+    emit PositionClosed(positionId, position.maker, pnl);
+}
+    
+/**
+ * @notice Bulk close positions
+ */
+function bulkClosePositions(uint256[] calldata positionIds) external nonReentrant {
+    for (uint256 i = 0; i < positionIds.length; i++) {
+        uint256 positionId = positionIds[i];
         Position storage position = positions[positionId];
         
-        if (position.maker != msg.sender) revert Unauthorized();
-        if (!position.active) revert PositionNotActive();
+        if (position.maker != msg.sender) continue;
+        if (position.status != Status.ACTIVE) continue;
         
-        position.active = false;
+        position.status = Status.CLOSED;
         
-        // Cancel any pending TP/SL orders
-        if (position.tpOrderId != 0) {
-            unwindOrders[position.tpOrderId].cancelled = true;
+        // Cancel TP/SL
+        uint256 tpOrderId = positionToTP[positionId];
+        uint256 slOrderId = positionToSL[positionId];
+        
+        if (tpOrderId != 0) {
+            unwindOrders[tpOrderId].cancelled = true;
+            delete positionToTP[positionId];
+            delete unwindToPosition[tpOrderId];
         }
-        if (position.slOrderId != 0) {
-            unwindOrders[position.slOrderId].cancelled = true;
+        if (slOrderId != 0) {
+            unwindOrders[slOrderId].cancelled = true;
+            delete positionToSL[positionId];
+            delete unwindToPosition[slOrderId];
         }
         
-        // Unwind position
+        // Unwind
         uaDriver.unwindLoop(
             position.collateralAsset,
             position.borrowAsset,
@@ -663,7 +697,7 @@ contract UAExecutor is ReentrancyGuard {
             200
         );
         
-        // Transfer remaining collateral to maker
+        // Transfer
         uint256 balance = IERC20(position.collateralAsset).balanceOf(address(this));
         uint256 pnl = balance > position.collateralAmount ? balance - position.collateralAmount : 0;
         
@@ -673,48 +707,7 @@ contract UAExecutor is ReentrancyGuard {
         
         emit PositionClosed(positionId, position.maker, pnl);
     }
-    
-    /**
-     * @notice Bulk close positions
-     */
-    function bulkClosePositions(uint256[] calldata positionIds) external nonReentrant {
-        for (uint256 i = 0; i < positionIds.length; i++) {
-            uint256 positionId = positionIds[i];
-            Position storage position = positions[positionId];
-            
-            if (position.maker != msg.sender) continue;
-            if (!position.active) continue;
-            
-            position.active = false;
-            
-            // Cancel TP/SL
-            if (position.tpOrderId != 0) {
-                unwindOrders[position.tpOrderId].cancelled = true;
-            }
-            if (position.slOrderId != 0) {
-                unwindOrders[position.slOrderId].cancelled = true;
-            }
-            
-            // Unwind
-            uaDriver.unwindLoop(
-                position.collateralAsset,
-                position.borrowAsset,
-                0,
-                0,
-                200
-            );
-            
-            // Transfer
-            uint256 balance = IERC20(position.collateralAsset).balanceOf(address(this));
-            uint256 pnl = balance > position.collateralAmount ? balance - position.collateralAmount : 0;
-            
-            if (balance > 0) {
-                IERC20(position.collateralAsset).transfer(position.maker, balance);
-            }
-            
-            emit PositionClosed(positionId, position.maker, pnl);
-        }
-    }
+}
     
     // INTERNAL HELPERS
     
@@ -730,104 +723,132 @@ contract UAExecutor is ReentrancyGuard {
     
     // VIEW FUNCTIONS
     
-    /**
-     * @notice Get wind order details
-     */
-    function getWindOrder(uint256 orderId) external view returns (WindOrder memory) {
-        return windOrders[orderId];
-    }
+/**
+ * @notice Get position with associated TP/SL details
+ */
+function getPositionWithOrders(uint256 positionId) external view returns (
+    Position memory position,
+    UnwindOrder memory tpOrder,
+    UnwindOrder memory slOrder
+) {
+    position = positions[positionId];
     
-    /**
-     * @notice Get unwind order details
-     */
-    function getUnwindOrder(uint256 orderId) external view returns (UnwindOrder memory) {
-        return unwindOrders[orderId];
-    }
+    uint256 tpOrderId = positionToTP[positionId];
+    uint256 slOrderId = positionToSL[positionId];
     
-    /**
-     * @notice Get position details
-     */
-    function getPosition(uint256 positionId) external view returns (Position memory) {
-        return positions[positionId];
+    if (tpOrderId != 0) {
+        tpOrder = unwindOrders[tpOrderId];
     }
+    if (slOrderId != 0) {
+        slOrder = unwindOrders[slOrderId];
+    }
+}
+
+/**
+ * @notice Get all pending positions (wind orders) for a user
+ */
+function getUserPendingPositions(address user) external view returns (uint256[] memory) {
+    uint256[] memory allPositions = userPositions[user];
+    uint256 count = 0;
     
-    /**
-     * @notice Get position with TP/SL details
-     */
-    function getPositionWithOrders(uint256 positionId) external view returns (
-        Position memory position,
-        UnwindOrder memory tpOrder,
-        UnwindOrder memory slOrder
-    ) {
-        position = positions[positionId];
-        
-        if (position.tpOrderId != 0) {
-            tpOrder = unwindOrders[position.tpOrderId];
-        }
-        if (position.slOrderId != 0) {
-            slOrder = unwindOrders[position.slOrderId];
+    // Count pending positions
+    for (uint256 i = 0; i < allPositions.length; i++) {
+        if (positions[allPositions[i]].status == Status.PENDING) {
+            count++;
         }
     }
     
-    /**
-     * @notice Get all wind orders for a user
-     */
-    function getUserWindOrders(address user) external view returns (uint256[] memory) {
-        return userWindOrders[user];
+    // Create result array
+    uint256[] memory pending = new uint256[](count);
+    uint256 index = 0;
+    for (uint256 i = 0; i < allPositions.length; i++) {
+        if (positions[allPositions[i]].status == Status.PENDING) {
+            pending[index] = allPositions[i];
+            index++;
+        }
     }
     
-    /**
-     * @notice Get all positions for a user
-     */
-    function getUserPositions(address user) external view returns (uint256[] memory) {
-        return userPositions[user];
+    return pending;
+}
+
+/**
+ * @notice Get all active positions for a user
+ */
+function getUserActivePositions(address user) external view returns (uint256[] memory) {
+    uint256[] memory allPositions = userPositions[user];
+    uint256 count = 0;
+    
+    // Count active positions
+    for (uint256 i = 0; i < allPositions.length; i++) {
+        if (positions[allPositions[i]].status == Status.ACTIVE) {
+            count++;
+        }
     }
     
-    /**
-     * @notice Check if wind order can be executed
-     */
-    function canExecuteWind(uint256 orderId) external view returns (bool) {
-        WindOrder memory order = windOrders[orderId];
-        
-        if (order.maker == address(0) || order.executed || order.cancelled) {
-            return false;
+    // Create result array
+    uint256[] memory active = new uint256[](count);
+    uint256 index = 0;
+    for (uint256 i = 0; i < allPositions.length; i++) {
+        if (positions[allPositions[i]].status == Status.ACTIVE) {
+            active[index] = allPositions[i];
+            index++;
         }
-        
-        uint256 currentPrice = getCurrentPrice(order.collateralAsset, order.borrowAsset);
-        return _checkPriceCondition(currentPrice, order.entryPrice, order.entryDirection);
     }
     
-    /**
-     * @notice Check if unwind order can be executed
-     */
-    function canExecuteUnwind(uint256 orderId) external view returns (bool) {
-        UnwindOrder memory order = unwindOrders[orderId];
-        
-        if (order.positionId == 0 || order.executed || order.cancelled) {
-            return false;
-        }
-        
-        Position memory position = positions[order.positionId];
-        if (!position.active) {
-            return false;
-        }
-        
-        uint256 currentPrice = getCurrentPrice(position.collateralAsset, position.borrowAsset);
-        return _checkPriceCondition(currentPrice, order.targetPrice, order.priceDirection);
+    return active;
+}
+
+/**
+ * @notice Check if unwind order can be executed
+ */
+function canExecuteUnwind(uint256 orderId) external view returns (bool) {
+    UnwindOrder memory order = unwindOrders[orderId];
+    
+    if (order.executed || order.cancelled) {
+        return false;
     }
+    
+    uint256 positionId = unwindToPosition[orderId];
+    if (positionId == 0) {
+        return false;
+    }
+    
+    Position memory position = positions[positionId];
+    if (position.status != Status.ACTIVE) {
+        return false;
+    }
+    
+    uint256 currentPrice = getCurrentPrice(position.collateralAsset, position.borrowAsset);
+    return _checkPriceCondition(currentPrice, order.targetPrice, order.priceDirection);
+}
+
+/**
+ * @notice Get TP/SL order IDs for a position
+ */
+function getPositionTPSL(uint256 positionId) external view returns (uint256 tpOrderId, uint256 slOrderId) {
+    tpOrderId = positionToTP[positionId];
+    slOrderId = positionToSL[positionId];
+}
+
+/**
+ * @notice Check if position can be executed (for PENDING positions)
+ */
+function canExecutePosition(uint256 positionId) external view returns (bool) {
+    Position memory pos = positions[positionId];
+    
+    if (pos.maker == address(0) || pos.status != Status.PENDING) {
+        return false;
+    }
+    
+    uint256 currentPrice = getCurrentPrice(pos.collateralAsset, pos.borrowAsset);
+    return _checkPriceCondition(currentPrice, pos.entryPrice, pos.entryDirection);
+}
     
     // ADMIN FUNCTIONS
     
     function togglePause() external onlyOwner {
         paused = !paused;
         emit PauseToggled(paused);
-    }
-    
-    /**
-     * @notice Emergency withdraw function for stuck funds
-     */
-    function emergencyWithdraw(address asset, uint256 amount) external onlyOwner {
-        IERC20(asset).transfer(owner(), amount);
     }
     
     receive() external payable {}

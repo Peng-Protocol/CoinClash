@@ -154,31 +154,57 @@ If the price of the collateral asset increases by $10\%$, the user's **Net Equit
 
 The **UAExecutor** contract serves as the Limit Order and Automated Execution System for the UADriver Protocol. It provides an on-chain mechanism for users to submit orders for future execution based on specific price conditions, integrating directly with the **UADriver** to handle the complex debt-looping logic.
 
-It introduces two primary order types and one position tracking mechanism:
+The contract refactors position initiation (wind orders) and ongoing position tracking into a single **`Position`** struct and introduces an **`UnwindOrder`** struct for Take Profit (TP) and Stop Loss (SL) management.
 
-### Core Data Structures
+### Core Data Structures and Status
 
-| Data Structure | Purpose | Key Parameters |
-| :--- | :--- | :--- |
-| **`WindOrder`** | A limit order to **open** a leveraged position (a "wind"). | `entryPrice`, `entryDirection` (e.g., execute when price `>=` or `<=` target), `targetLeverage`, `collateralAmount`. |
-| **`UnwindOrder`** | A limit order to **close** an existing position. | `positionId`, `targetPrice`, `priceDirection`, `isTP` (Take Profit) or `isSL` (Stop Loss). |
-| **`Position`** | Tracks the details of an active, executed leveraged position. | `maker`, `collateralAsset`, `borrowAsset`, `collateralAmount`, `debtAmount`, and links to the `tpOrderId` and `slOrderId`. |
+| Data Structure | Status Enum | Purpose | Key Parameters |
+| :--- | :--- | :--- | :--- |
+| **`Position`** | `PENDING`, `ACTIVE`, `CLOSED`, `CANCELLED` | Used to track both the initial limit order (when `PENDING`) and the resulting active position (when `ACTIVE`). | `entryPrice`, `entryDirection`, `targetLeverage`, `collateralAmount`, `debtAmount`. |
+| **`UnwindOrder`** | N/A (uses `executed`, `cancelled` flags) | A limit order to **close** an existing `ACTIVE` position, either as a TP or SL. | `positionId`, `targetPrice`, `priceDirection`, `isTP` (Take Profit) or `isSL` (Stop Loss). |
+
+The contract uses mappings to manage the life-cycle of these orders:
+
+* `positions`: Maps the unique `positionId` to its `Position` struct.
+* `positionToTP`, `positionToSL`: Maps an `ACTIVE` `positionId` to its associated `UnwindOrder` ID. This ensures only one TP and one SL can exist per position.
 
 ### Execution Flow and Mechanics
 
-1.  **Order Creation (`createWindOrder`)**: A user sends the initial margin (collateral) to the `UAExecutor` contract, along with all parameters for the desired leveraged position (pair, leverage, entry price, etc.).
-2.  **External Execution**: Since smart contracts cannot execute themselves, the order execution is permissionless. An external entity ("mysterium") calls the `executeWinds` or `executeUnwinds` functions.
-3.  **Price Check**: The Executor checks the current price for the asset pair using the integrated Uniswap V2 functions. If the price condition is met, the order proceeds.
-4.  **Position Execution**:
-    * **Wind Order**: The Executor calls the internal `_executeWindOrder`, which triggers the **UADriver's `executeLoop`** function.
-    * **Unwind Order (TP/SL)**: The Executor calls the internal `_executeUnwindOrder`, which triggers the **UADriver's `unwindLoop`** function.
-5.  **Position Management**: Users can create, modify, or bulk-cancel their pending orders, returning the held collateral if the order is not yet executed. Users can also manually `closePosition` at any time.
+1.  **Order Creation (`createOrder`)**:
+    * A user sends the initial margin (collateral) to the `UAExecutor` contract.
+    * A new **`Position`** struct is created with the status set to **`PENDING`**. The `entryPrice` and `entryDirection` define the limit order's trigger condition.
+
+2.  **External Execution of Wind Orders (`executeOrders`)**:
+    * An external entity ("mysterium") calls the `executeOrders` function with a list of `positionId`s.
+    * The Executor checks:
+        a.  If the position's status is **`PENDING`**.
+        b.  If the `currentPrice` meets the `entryPrice` and `entryDirection` condition.
+    * If conditions are met, the Executor calls the **UADriver's `executeLoop`** function, and then updates the `Position` struct:
+        * Status is changed to **`ACTIVE`**.
+        * `collateralAmount` and `debtAmount` are updated based on the actual figures from the Aave pool.
+        * `entryPrice` is updated to the actual execution price.
+
+3.  **TP/SL Order Management (`setTP`, `setSL`)**:
+    * A user can set or update a Take Profit or Stop Loss for a `PENDING` or `ACTIVE` position.
+    * A new **`UnwindOrder`** is created (or an existing one is updated).
+    * The `positionToTP` or `positionToSL` mapping is updated to link the position to the new unwind order ID.
+
+4.  **External Execution of Unwind Orders (`executeUnwinds`)**:
+    * An external entity calls the `executeUnwinds` function.
+    * The Executor iterates through the provided `orderId`s and checks:
+        a.  If the associated `Position` is **`ACTIVE`**.
+        b.  If the `currentPrice` meets the `targetPrice` and `priceDirection` condition of the `UnwindOrder`.
+    * If conditions are met, the Executor calls the internal `_executeUnwindOrder`, which triggers the **UADriver's `unwindLoop`** function to close the position.
+
+5.  **Position Finalization and Funds Return**:
+    * Upon successful `unwindLoop` execution, the `Position` status is set to **`CLOSED`**.
+    * All remaining collateral (initial margin + profit/loss) held by the Executor is transferred back to the original `maker`.
+    * The position's associated TP/SL mappings are deleted.
 
 ### Key Nuance: Custodial Position Management
 
-The single most important distinction between the `UAExecutor` and the raw `UADriver` is their approach to position ownership:
+The `UAExecutor` is designed to act as the holder and manager of the active position. When a `PENDING` order becomes `ACTIVE` (the wind is executed):
 
-* **UADriver (Direct Use) is Non-Custodial**: As outlined in Section 2, when a user calls the `UADriver` directly, the driver sets the `onBehalfOf` parameter to the **user's wallet address**. This means the aTokens (collateral) and DebtTokens are held and tracked by Aave against the user's wallet, maintaining non-custodial ownership.
-* **UAExecutor is Custodial**: When a position is opened via a `WindOrder`, the `UAExecutor` calls the `UADriver` with its own contract address (`address(this)`) as the `onBehalfOf` parameter.
-    * **Custody**: The Aave debt and collateral are tracked against the **Executor's address**.
-    * **Tracking**: The `UAExecutor` becomes the custodian of the active position and tracks the *true* owner using its internal `Position` struct. This shift in ownership is necessary for the Executor to maintain the collateral and to be the entity that can later call `unwindLoop` for the TP/SL orders.
+* The **`UAExecutor`** calls the `UADriver` with its own contract address (`address(this)`) as the `onBehalfOf` parameter in `executeLoop`.
+* **Custody**: The Aave debt and collateral are tracked against the **Executor's address** by Aave.
+* **Tracking**: The `UAExecutor` becomes the custodian of the active position, tracking the *true* user owner via the `Position.maker` field. This custodial arrangement is essential for the Executor to maintain control of the collateral and debt, allowing it to execute the subsequent `unwindLoop` for TP/SL orders or manual closing.
