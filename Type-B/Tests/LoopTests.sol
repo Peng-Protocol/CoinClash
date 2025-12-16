@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: BSL 1.1
 pragma solidity ^0.8.20;
 
-// INTERFACES (To avoid importing full artifacts)
+// File Version : 0.0.2 (16/12/2025)
+// - 0.0.2 (16/12): Improved debugging of external calls with try/catch and error decoding. 
+
+// INTERFACES
 interface IUADriver {
     function executeLoop(
         address collateralAsset,
@@ -12,6 +15,7 @@ interface IUADriver {
         uint256 minHealthFactor,
         uint256 maxSlippage
     ) external;
+
     function unwindLoop(
         address collateralAsset,
         address borrowAsset,
@@ -19,6 +23,7 @@ interface IUADriver {
         uint256 withdrawAmount,
         uint256 maxSlippage
     ) external;
+
     function transferOwnership(address newOwner) external;
 }
 
@@ -29,7 +34,7 @@ interface IMockDeployer {
     function uniRouter() external view returns (address);
     function aavePool() external view returns (address);
     function aaveOracle() external view returns (address);
-    function driver() external view returns (address); 
+    function driver() external view returns (address);
 }
 
 interface IERC20 {
@@ -71,50 +76,51 @@ contract LoopTests {
     IMockDeployer public deployer;
     
     // CACHED ADDRESSES
-    address public weth;  // Token18 (Collateral for Long)
-    address public usdt;  // Token6 (Borrow for Long)
+    address public weth; // Token18 (Collateral for Long)
+    address public usdt; // Token6 (Borrow for Long)
     address public aavePool;
     address public aaveOracle;
     address public uniRouter;
     
     address public owner;
-    
-    // Events for tracking test progress
+
+    // EVENTS
     event TestLog(string message, uint256 value);
     event SetupCompleted(address deployer, address driver);
-    
+    // NEW: Debug Event to capture revert reasons
+    event DebugError(string reason, bytes lowLevelData);
+
     constructor() {
         owner = msg.sender;
     }
 
     // ============ SETUP FUNCTIONS ============
 
-function setDeployer(address _deployer) external {
-    require(msg.sender == owner, "Auth");
-    deployer = IMockDeployer(_deployer);
-    
-    // Load mocks from the deployer
-    weth = deployer.token18();
-    usdt = deployer.token6();
-    aavePool = deployer.aavePool();
-    aaveOracle = deployer.aaveOracle();
-    uniRouter = deployer.uniRouter();
-    
-    // Fetch driver address from deployer
-    driver = IUADriver(deployer.driver());
-    
-    emit SetupCompleted(address(deployer), address(driver));
-}
+    function setDeployer(address _deployer) external {
+        require(msg.sender == owner, "Auth");
+        deployer = IMockDeployer(_deployer);
+        
+        // Load mocks from the deployer
+        weth = deployer.token18();
+        usdt = deployer.token6();
+        aavePool = deployer.aavePool();
+        aaveOracle = deployer.aaveOracle();
+        uniRouter = deployer.uniRouter();
+        
+        // Fetch driver address from deployer
+        driver = IUADriver(deployer.driver());
+        emit SetupCompleted(address(deployer), address(driver));
+    }
 
     // ============ PATH 1: 2x LONG STRATEGY ============
-    // Objective: Long ETH (WETH) using USDT debt. 
+    // Objective: Long ETH (WETH) using USDT debt.
     // Initial: 10 ETH. Target: 2x Leverage ($40k Exposure).
 
     function p1_1_PrepareFunds() external {
         uint256 amount = 10 * 1e18; // 10 ETH
         IERC20(weth).mint(address(this), amount);
         IERC20(weth).approve(address(driver), amount);
-        
+
         // Ensure Oracle Prices (WETH=$2000, USDT=$1)
         IMockAaveOracle(aaveOracle).setAssetPrice(weth, 2000 * 1e18);
         IMockAaveOracle(aaveOracle).setAssetPrice(usdt, 1 * 1e18);
@@ -125,7 +131,8 @@ function setDeployer(address _deployer) external {
     function p1_2_Execute2xLong() external {
         uint256 initialMargin = 10 * 1e18;
         
-        driver.executeLoop(
+        // DEBUG: Try/Catch wrapper
+        try driver.executeLoop(
             weth,           // Collateral Asset
             usdt,           // Borrow Asset
             address(this),  // OnBehalfOf
@@ -133,24 +140,30 @@ function setDeployer(address _deployer) external {
             2 * 1e18,       // Target Leverage (2.0)
             1.1 * 1e18,     // Min Health Factor
             200             // Max Slippage (2%)
-        );
-        
-        // Verification
-        (,,,,, uint256 hf) = IMockAavePool(aavePool).getUserAccountData(address(this));
-        require(hf > 1.1 * 1e18, "HF too low");
-        
-        uint256 col = IMockAavePool(aavePool).userCollateral(address(this), weth);
-        // 2x Leverage on 10 ETH = 20 ETH Total Position
-        require(col >= 19 * 1e18, "Leverage target not met");
-        
-        emit TestLog("p1_2: 2x Long Executed. HF:", hf);
+        ) {
+            // VERIFICATION
+            (,,,,, uint256 hf) = IMockAavePool(aavePool).getUserAccountData(address(this));
+            require(hf > 1.1 * 1e18, "HF too low");
+            
+            uint256 col = IMockAavePool(aavePool).userCollateral(address(this), weth);
+            require(col >= 19 * 1e18, "Leverage target not met");
+            
+            emit TestLog("p1_2: SUCCESS - 2x Long Executed. HF:", hf);
+
+        } catch Error(string memory reason) {
+            emit DebugError(reason, "");
+            revert(string(abi.encodePacked("p1_2 Failed: ", reason)));
+        } catch (bytes memory lowLevelData) {
+            emit DebugError("Low Level Error", lowLevelData);
+            revert("p1_2 Failed: Low Level Error (Check Logs)");
+        }
     }
 
     function p1_3_SimulatePump() external {
         // Pump WETH price by +10% (to $2200)
         // 1. Update Oracle
         IMockAaveOracle(aaveOracle).setAssetPrice(weth, 2200 * 1e18);
-        
+
         // 2. Buy WETH on Uni to match oracle (Simulate real market move)
         uint256 buyAmount = 2_000_000 * 1e6; // $2M USDT
         IERC20(usdt).mint(address(this), buyAmount);
@@ -160,40 +173,51 @@ function setDeployer(address _deployer) external {
         path[0] = usdt; 
         path[1] = weth;
         
-        IMockUniRouter(uniRouter).swapExactTokensForTokens(
+        // DEBUG: Try/Catch wrapper for Mock Swap
+        try IMockUniRouter(uniRouter).swapExactTokensForTokens(
             buyAmount,
             0,
             path,
             address(this),
             block.timestamp + 100
-        );
-        
-        emit TestLog("p1_3: Pumped to $2200", 2200);
+        ) {
+            emit TestLog("p1_3: Pumped to $2200", 2200);
+        } catch Error(string memory reason) {
+            emit DebugError(reason, "");
+            revert(string(abi.encodePacked("p1_3 Swap Failed: ", reason)));
+        } catch (bytes memory lowLevelData) {
+            emit DebugError("Low Level Error", lowLevelData);
+            revert("p1_3 Swap Failed: Low Level Error");
+        }
     }
 
     function p1_4_UnwindAndVerifyProfit() external {
         uint256 balBefore = IERC20(weth).balanceOf(address(this));
-        
-        driver.unwindLoop(
+
+        // DEBUG: Try/Catch wrapper
+        try driver.unwindLoop(
             weth,
             usdt,
             0,                 // Repay All
             type(uint256).max, // Withdraw All
             500                // 5% Slippage allowed for unwind
-        );
-        
-        uint256 balAfter = IERC20(weth).balanceOf(address(this));
-        uint256 profit = balAfter - balBefore;
-        
-        // Analysis:
-        // Position: 20 ETH ($44k value at $2200). Debt: $20k USDT.
-        // Net Equity: $24k.
-        // Initial Equity: 10 ETH @ $2000 = $20k.
-        // Profit: $4k. In WETH terms ($2200/ETH) -> ~1.81 ETH.
-        // Due to fees/slippage, we expect at least 1.5 ETH profit.
-        
-        emit TestLog("p1_4: Profit (Wei)", profit);
-        require(profit > 1.5 * 1e18, "Profit lower than expected");
+        ) {
+            uint256 balAfter = IERC20(weth).balanceOf(address(this));
+            uint256 profit = balAfter - balBefore;
+            
+            // Analysis:
+            // Position: 20 ETH ($44k value at $2200). Debt: $20k USDT.
+            // Net Equity: $24k. Initial Equity: $20k. Profit: $4k (~1.81 ETH).
+            emit TestLog("p1_4: Profit (Wei)", profit);
+            require(profit > 1.5 * 1e18, "Profit lower than expected");
+
+        } catch Error(string memory reason) {
+            emit DebugError(reason, "");
+            revert(string(abi.encodePacked("p1_4 Unwind Failed: ", reason)));
+        } catch (bytes memory lowLevelData) {
+            emit DebugError("Low Level Error", lowLevelData);
+            revert("p1_4 Unwind Failed: Low Level Error");
+        }
     }
 
     // ============ PATH 2: 10x SHORT STRATEGY ============
@@ -216,12 +240,8 @@ function setDeployer(address _deployer) external {
     function p2_2_Execute10xShort() external {
         uint256 initialMargin = 20_000 * 1e6;
         
-        // 10x Short means:
-        // Equity: $20k.
-        // Total Position (Collateral USDT): $200k.
-        // Debt (WETH): $180k worth (90 ETH).
-        
-        driver.executeLoop(
+        // DEBUG: Try/Catch wrapper
+        try driver.executeLoop(
             usdt,           // Collateral (Long USDT)
             weth,           // Borrow (Short WETH)
             address(this),
@@ -229,19 +249,22 @@ function setDeployer(address _deployer) external {
             10 * 1e18,      // 10x
             1.01 * 1e18,    // Extremely tight HF allowed
             200
-        );
-        
-        emit TestLog("p2_2: 10x Short Executed", 0);
+        ) {
+            emit TestLog("p2_2: 10x Short Executed", 0);
+        } catch Error(string memory reason) {
+            emit DebugError(reason, "");
+            revert(string(abi.encodePacked("p2_2 Short Failed: ", reason)));
+        } catch (bytes memory lowLevelData) {
+            emit DebugError("Low Level Error", lowLevelData);
+            revert("p2_2 Short Failed: Low Level Error");
+        }
     }
 
     function p2_3_VerifyRisk() external {
         (,,,,, uint256 hf) = IMockAavePool(aavePool).getUserAccountData(address(this));
-        
         emit TestLog("p2_3: Health Factor", hf);
         
         // At 10x leverage, HF should be very close to liquidation threshold.
-        // Depending on LTV (e.g. 80%), 10x might barely fit or be risky.
-        // We ensure it is LOW (risk confirmed).
         require(hf < 1.25 * 1e18, "HF too safe, leverage failed?");
         require(hf > 0.99 * 1e18, "Already liquidated?");
     }

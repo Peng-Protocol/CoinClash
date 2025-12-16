@@ -6,7 +6,8 @@ pragma solidity ^0.8.20;
  * @notice Automates leverage creation through debt looping for any valid Aave/Uniswap asset pair.
  * Executes multiple borrow-swap-deposit cycles in a single transaction.
  */
-  // File Version: 0.0.3 (10/12/2025)
+  // File Version: 0.0.4 (16/12/2025)
+ // - 0.0.4 (16/12): Fixed decimal precision. 
  // - 0.0.3 (10/12): Monolithic refactor.
  // - 0.0.2 (10/12): Added third party position creation.
  // - 0.0.1 (07/12): Initial Implementation. 
@@ -78,6 +79,7 @@ contract UADriver is ReentrancyGuard {
     struct ExecuteCache {
         address collateralAsset;
         address borrowAsset;
+        uint256 borrowAssetDecimals; // <--- NEW
         uint256 initialMargin;
         uint256 targetLeverage;
         uint256 minHealthFactor;
@@ -315,16 +317,21 @@ IUniswapV2Factory public uniswapFactory;
         cache.targetLeverage = targetLeverage;
         cache.minHealthFactor = minHealthFactor;
         cache.maxSlippage = maxSlippage;
-
+        
         // Prices
         cache.collateralPrice = _getAssetPrice(collateralAsset);
         cache.borrowPrice = _getAssetPrice(borrowAsset);
-
-        // Aave Config
+        
+        // Aave Config - Collateral
         ( , uint256 ltv, uint256 liquidationThreshold, , , , bool borrowingEnabled, , bool isActive, bool isFrozen) 
             = dataProvider.getReserveConfigurationData(collateralAsset);
         
         if (!borrowingEnabled || !isActive || isFrozen) revert BorrowingDisabled();
+
+        // Aave Config - Borrow Asset (NEW: Fetch decimals)
+        (uint256 borrowDecimals, , , , , , , , , ) 
+            = dataProvider.getReserveConfigurationData(borrowAsset);
+        cache.borrowAssetDecimals = borrowDecimals; // <--- STORE DECIMALS
 
         cache.ltvScaled = (ltv * PRECISION) / BPS_PRECISION;
         cache.ltScaled = (liquidationThreshold * PRECISION) / BPS_PRECISION;
@@ -333,29 +340,40 @@ IUniswapV2Factory public uniswapFactory;
         cache.targetCollateralValue = (initialMargin * targetLeverage * cache.collateralPrice) / (PRECISION * PRECISION);
     }
 
-    // HELPER: Calculate Borrow Amount (Pure Math - Unchanged logic)
+// HELPER: Calculate Borrow Amount (Math Engine)
     function _calculateLoopBorrow(
         ExecuteCache memory cache, 
         ExecuteState memory state,
         uint256 currentCollateralValue
     ) internal pure returns (uint256) {
         uint256 maxBorrowValue = (currentCollateralValue * cache.ltvScaled) / PRECISION;
-        uint256 currentDebtValue = (state.totalDebt * cache.borrowPrice) / PRECISION;
+        
+        // Convert current debt (Token Units) to Value ($)
+        // Formula: (Amount * Price) / 10^Decimals
+        uint256 currentDebtValue = (state.totalDebt * cache.borrowPrice) / (10 ** cache.borrowAssetDecimals);
 
         if (maxBorrowValue <= currentDebtValue) return 0;
 
         uint256 availableBorrowValue = maxBorrowValue - currentDebtValue;
-        uint256 borrowAmount = (availableBorrowValue * PRECISION) / cache.borrowPrice;
+        
+        // Convert Value ($) to Borrow Amount (Token Units)
+        // Formula: (Value * 10^Decimals) / Price
+        uint256 borrowAmount = (availableBorrowValue * (10 ** cache.borrowAssetDecimals)) / cache.borrowPrice;
 
         uint256 projectedDebt = state.totalDebt + borrowAmount;
-        uint256 projectedDebtVal = (projectedDebt * cache.borrowPrice) / PRECISION;
+        
+        // Recalculate Projected Debt Value for Health Factor check
+        uint256 projectedDebtVal = (projectedDebt * cache.borrowPrice) / (10 ** cache.borrowAssetDecimals);
         
         if (projectedDebtVal == 0) return borrowAmount;
+        
         uint256 projectedHF = (currentCollateralValue * cache.ltScaled) / projectedDebtVal;
 
         if (projectedHF < cache.minHealthFactor) {
             uint256 maxDebtValue = (currentCollateralValue * cache.ltScaled) / cache.minHealthFactor;
-            uint256 maxDebt = (maxDebtValue * PRECISION) / cache.borrowPrice;
+            
+            // Convert Max Debt Value back to Token Units
+            uint256 maxDebt = (maxDebtValue * (10 ** cache.borrowAssetDecimals)) / cache.borrowPrice;
             
             if (maxDebt > state.totalDebt) {
                 return maxDebt - state.totalDebt;
@@ -685,11 +703,6 @@ IUniswapV2Factory public uniswapFactory;
     function togglePause() external onlyOwner {
         paused = !paused;
         emit PauseToggled(paused);
-    }
-    
-    function emergencyWithdraw(address asset, uint256 amount) external onlyOwner {
-        IERC20(asset).transfer(owner(), amount);
-        emit EmergencyWithdraw(owner(), asset, amount);
     }
     
     receive() external payable {}
