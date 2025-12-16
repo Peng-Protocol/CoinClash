@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1
 pragma solidity ^0.8.20;
 
-// File Version: 0.0.1 (13/12/2025)
+// File Version: 0.0.2 (16/12/2025)
+// - 0.0.2 (16/12/2025): Adjusted borrow. 
 
 interface xERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -60,7 +61,10 @@ contract MockAavePool {
     }
 
     function borrow(address asset, uint256 amount, uint256, uint16, address onBehalfOf) external {
-        xERC20(asset).transfer(onBehalfOf, amount);
+        // CHANGE: Transfer asset to msg.sender (the Driver), not onBehalfOf
+        xERC20(asset).transfer(msg.sender, amount); 
+        
+        // Debt is still recorded against onBehalfOf
         userDebt[onBehalfOf][asset] += amount;
     }
 
