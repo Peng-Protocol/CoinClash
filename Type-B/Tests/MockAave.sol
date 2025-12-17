@@ -1,24 +1,52 @@
 // SPDX-License-Identifier: BSL 1.1
 pragma solidity ^0.8.20;
 
-// File Version: 0.0.2 (16/12/2025)
+// File Version: 0.0.3 (17/12/2025)
+// - 0.0.3 (17/12/2025): Added and integrated mock aToken for collateral ownership. 
 // - 0.0.2 (16/12/2025): Adjusted borrow. 
 
 interface xERC20 {
-    function balanceOf(address) external view returns (uint256);
-    function mint(address, uint256) external;
-    function burn(address, uint256) external;
     function transfer(address, uint256) external returns (bool);
     function transferFrom(address, address, uint256) external returns (bool);
+    function balanceOf(address) external view returns (uint256);
+    function approve(address, uint256) external returns (bool);
+}
+
+// 1. LIGHTWEIGHT MOCK A-TOKEN
+contract MockAToken {
+    MockAavePool pool;
+    address public underlyingAsset;
+    mapping(address => mapping(address => uint256)) public allowances;
+
+    constructor(address _pool, address _asset) {
+        pool = MockAavePool(_pool);
+        underlyingAsset = _asset;
+    }
+
+    // Forward balance checks to the pool's internal mapping
+    function balanceOf(address user) external view returns (uint256) {
+        return pool.userCollateral(user, underlyingAsset);
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowances[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(allowances[from][msg.sender] >= amount, "AToken: Low allowance");
+        allowances[from][msg.sender] -= amount;
+        // The Pool handles the actual accounting
+        pool.moveCollateral(underlyingAsset, from, to, amount);
+        return true;
+    }
 }
 
 contract MockAaveOracle {
     mapping(address => uint256) public prices;
-
     function getAssetPrice(address asset) external view returns (uint256) {
         return prices[asset];
     }
-
     function setAssetPrice(address asset, uint256 price) external {
         prices[asset] = price;
     }
@@ -26,9 +54,14 @@ contract MockAaveOracle {
 
 contract MockAavePool {
     MockAaveOracle public oracle;
+    
+    // Mapping: User -> Asset -> Amount
     mapping(address => mapping(address => uint256)) public userCollateral;
     mapping(address => mapping(address => uint256)) public userDebt;
     
+    // Mapping: Asset -> aToken Address
+    mapping(address => address) public aTokens;
+
     struct ReserveConfig {
         uint256 ltv;
         uint256 liquidationThreshold;
@@ -42,10 +75,21 @@ contract MockAavePool {
     }
 
     function setReserveConfig(address asset, uint256 ltv, uint256 lt, uint256 decimals) external {
-        if (configs[asset].ltv == 0 && configs[asset].liquidationThreshold == 0) {
+        if (configs[asset].ltv == 0) {
             assets.push(asset);
+            // Auto-deploy a MockAToken for this asset
+            MockAToken aToken = new MockAToken(address(this), asset);
+            aTokens[asset] = address(aToken);
         }
         configs[asset] = ReserveConfig(ltv, lt, decimals);
+    }
+
+    // Called by MockAToken to move collateral (simulating transfer)
+    function moveCollateral(address asset, address from, address to, uint256 amount) external {
+        require(msg.sender == aTokens[asset], "Only aToken can move collateral");
+        require(userCollateral[from][asset] >= amount, "Not enough collateral");
+        userCollateral[from][asset] -= amount;
+        userCollateral[to][asset] += amount;
     }
 
     function supply(address asset, uint256 amount, address onBehalfOf, uint16) external {
@@ -54,40 +98,33 @@ contract MockAavePool {
     }
 
     function withdraw(address asset, uint256 amount, address to) external returns (uint256) {
+        // STANDARD LOGIC: msg.sender must hold the collateral (aTokens)
         require(userCollateral[msg.sender][asset] >= amount, "Not enough collateral");
+        
         userCollateral[msg.sender][asset] -= amount;
         xERC20(asset).transfer(to, amount);
         return amount;
     }
 
     function borrow(address asset, uint256 amount, uint256, uint16, address onBehalfOf) external {
-        // CHANGE: Transfer asset to msg.sender (the Driver), not onBehalfOf
-        xERC20(asset).transfer(msg.sender, amount); 
-        
-        // Debt is still recorded against onBehalfOf
+        // FIXED: Transfer to msg.sender (the Driver), record debt on onBehalfOf
+        xERC20(asset).transfer(msg.sender, amount);
         userDebt[onBehalfOf][asset] += amount;
     }
 
     function repay(address asset, uint256 amount, uint256, address onBehalfOf) external returns (uint256) {
         xERC20(asset).transferFrom(msg.sender, address(this), amount);
-        if (userDebt[onBehalfOf][asset] >= amount) {
-            userDebt[onBehalfOf][asset] -= amount;
-        } else {
-            userDebt[onBehalfOf][asset] = 0;
-        }
-        return amount;
+        uint256 currentDebt = userDebt[onBehalfOf][asset];
+        uint256 repayAmt = amount > currentDebt ? currentDebt : amount;
+        userDebt[onBehalfOf][asset] -= repayAmt;
+        return repayAmt;
     }
-
+    
     function setUserUseReserveAsCollateral(address, bool) external {}
 
-    // MATH ENGINE - Refactored to avoid stack too deep
     function getUserAccountData(address user) external view returns (
-        uint256 totalCollateralBase, 
-        uint256 totalDebtBase, 
-        uint256 availableBorrowsBase, 
-        uint256 currentLiquidationThreshold, 
-        uint256 ltv, 
-        uint256 healthFactor
+        uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, 
+        uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor
     ) {
         (uint256 totalCollateralETH, uint256 weightedLT, uint256 weightedLTV) = _calculateCollateral(user);
         uint256 totalDebtETH = _calculateDebt(user);
@@ -97,24 +134,17 @@ contract MockAavePool {
             ltv = weightedLTV / totalCollateralETH;
         }
 
-        if (totalDebtETH > 0) {
-            healthFactor = (totalCollateralETH * currentLiquidationThreshold * 1e14) / totalDebtETH;
-        } else {
-            healthFactor = type(uint256).max;
-        }
+        healthFactor = (totalDebtETH > 0) 
+            ? (totalCollateralETH * currentLiquidationThreshold * 1e14) / totalDebtETH 
+            : type(uint256).max;
 
         return (totalCollateralETH, totalDebtETH, 0, currentLiquidationThreshold, ltv, healthFactor);
     }
 
-    function _calculateCollateral(address user) private view returns (
-        uint256 totalCollateralETH,
-        uint256 weightedLT,
-        uint256 weightedLTV
-    ) {
+    function _calculateCollateral(address user) private view returns (uint256 totalCollateralETH, uint256 weightedLT, uint256 weightedLTV) {
         for (uint i = 0; i < assets.length; i++) {
             address asset = assets[i];
             uint256 collateral = userCollateral[user][asset];
-            
             if (collateral > 0) {
                 uint256 price = oracle.getAssetPrice(asset);
                 uint256 val = (collateral * price) / 1e18;
@@ -129,10 +159,8 @@ contract MockAavePool {
         for (uint i = 0; i < assets.length; i++) {
             address asset = assets[i];
             uint256 debt = userDebt[user][asset];
-            
             if (debt > 0) {
-                uint256 price = oracle.getAssetPrice(asset);
-                totalDebtETH += (debt * price) / 1e18;
+                totalDebtETH += (debt * oracle.getAssetPrice(asset)) / 1e18;
             }
         }
     }
@@ -140,56 +168,33 @@ contract MockAavePool {
 
 contract MockAaveDataProvider {
     MockAavePool public pool;
-
-    constructor(address _pool) {
-        pool = MockAavePool(_pool);
-    }
+    constructor(address _pool) { pool = MockAavePool(_pool); }
 
     function getReserveConfigurationData(address asset) external view returns (
-        uint256 decimals, 
-        uint256 ltv, 
-        uint256 liquidationThreshold, 
-        uint256 liquidationBonus, 
-        uint256 reserveFactor, 
-        bool usageAsCollateralEnabled, 
-        bool borrowingEnabled, 
-        bool stableBorrowRateEnabled, 
-        bool isActive, 
-        bool isFrozen
+        uint256 decimals, uint256 ltv, uint256 liquidationThreshold, uint256 liquidationBonus, 
+        uint256 reserveFactor, bool usageAsCollateralEnabled, bool borrowingEnabled, 
+        bool stableBorrowRateEnabled, bool isActive, bool isFrozen
     ) {
         (uint256 _ltv, uint256 _lt, uint256 _dec) = pool.configs(asset);
         return (_dec, _ltv, _lt, 0, 0, true, true, true, true, false);
     }
 
-    function getUserReserveData(address asset, address user) external view returns (
-        uint256 currentATokenBalance, 
-        uint256 currentStableDebt, 
-        uint256 currentVariableDebt, 
-        uint256 principalStableDebt, 
-        uint256 scaledVariableDebt, 
-        uint256 stableBorrowRate, 
-        uint256 liquidityRate, 
-        uint40 stableRateLastUpdated, 
-        bool usageAsCollateralEnabled
+    // NEW: Return the MockAToken address
+    function getReserveTokensAddresses(address asset) external view returns (
+        address aTokenAddress, address stableDebtTokenAddress, address variableDebtTokenAddress
     ) {
-        uint256 col = pool.userCollateral(user, asset);
-        uint256 debt = pool.userDebt(user, asset);
-        
-        return (col, 0, debt, 0, 0, 0, 0, 0, true);
+        return (pool.aTokens(asset), address(0), address(0));
     }
 
-    function getReserveData(address) external pure returns (
-        uint256 availableLiquidity, 
-        uint256 totalStableDebt, 
-        uint256 totalVariableDebt, 
-        uint256 liquidityRate, 
-        uint256 variableBorrowRate, 
-        uint256 stableBorrowRate, 
-        uint256 averageStableBorrowRate, 
-        uint256 liquidityIndex, 
-        uint256 variableBorrowIndex, 
-        uint40 lastUpdateTimestamp
+    function getUserReserveData(address asset, address user) external view returns (
+        uint256 currentATokenBalance, uint256 currentStableDebt, uint256 currentVariableDebt, 
+        uint256 principalStableDebt, uint256 scaledVariableDebt, uint256 stableBorrowRate, 
+        uint256 liquidityRate, uint40 stableRateLastUpdated, bool usageAsCollateralEnabled
     ) {
+        return (pool.userCollateral(user, asset), 0, pool.userDebt(user, asset), 0, 0, 0, 0, 0, true);
+    }
+    
+    function getReserveData(address) external pure returns (uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint40) {
         return (type(uint256).max, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 }

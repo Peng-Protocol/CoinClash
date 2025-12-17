@@ -6,11 +6,9 @@ pragma solidity ^0.8.20;
  * @notice Automates leverage creation through debt looping for any valid Aave/Uniswap asset pair.
  * Executes multiple borrow-swap-deposit cycles in a single transaction.
  */
-  // File Version: 0.0.4 (16/12/2025)
+  // File Version: 0.0.5 (17/12/2025)
+ // - 0.0.5 (17/12): Added aToken usage for collateral management. 
  // - 0.0.4 (16/12): Fixed decimal precision. 
- // - 0.0.3 (10/12): Monolithic refactor.
- // - 0.0.2 (10/12): Added third party position creation.
- // - 0.0.1 (07/12): Initial Implementation. 
  
 import "./imports/ReentrancyGuard.sol"; //Imports and inherits ownable
 import "./imports/IERC20.sol";
@@ -26,6 +24,7 @@ interface IPool {
 }
 
 interface IAaveProtocolDataProvider {
+    function getReserveTokensAddresses(address asset) external view returns (address aTokenAddress, address stableDebtTokenAddress, address variableDebtTokenAddress);
     function getReserveConfigurationData(address asset) external view returns (uint256 decimals, uint256 ltv, uint256 liquidationThreshold, uint256 liquidationBonus, uint256 reserveFactor, bool usageAsCollateralEnabled, bool borrowingEnabled, bool stableBorrowRateEnabled, bool isActive, bool isFrozen);
     function getUserReserveData(address asset, address user) external view returns (uint256 currentATokenBalance, uint256 currentStableDebt, uint256 currentVariableDebt, uint256 principalStableDebt, uint256 scaledVariableDebt, uint256 stableBorrowRate, uint256 liquidityRate, uint40 stableRateLastUpdated, bool usageAsCollateralEnabled);
     function getReserveData(address asset) external view returns (uint256 availableLiquidity, uint256 totalStableDebt, uint256 totalVariableDebt, uint256 liquidityRate, uint256 variableBorrowRate, uint256 stableBorrowRate, uint256 averageStableBorrowRate, uint256 liquidityIndex, uint256 variableBorrowIndex, uint40 lastUpdateTimestamp);
@@ -423,19 +422,12 @@ IUniswapV2Factory public uniswapFactory;
         if (paused) revert ContractPaused();
         if (collateralAsset == borrowAsset) revert SameAsset();
 
-        // FIX: Corrected tuple to match 9 return values and capture index 2 (currentVariableDebt)
-        (
-            ,
-            ,
-            uint256 currentVariableDebt,
-            ,
-            ,
-            ,
-            ,
-            ,
-        ) = dataProvider.getUserReserveData(borrowAsset, msg.sender);
-        
+        // 1. Fetch Debt Data
+        ( , , uint256 currentVariableDebt, , , , , , ) = dataProvider.getUserReserveData(borrowAsset, msg.sender);
         uint256 actualRepayAmount = repayAmount == 0 ? currentVariableDebt : repayAmount;
+
+        // 2. Fetch aToken Address (NEW : 0.0.5)
+        (address aTokenAddress, , ) = dataProvider.getReserveTokensAddresses(collateralAsset);
 
         if (actualRepayAmount > 0) {
             address[] memory path = new address[](2);
@@ -447,26 +439,27 @@ IUniswapV2Factory public uniswapFactory;
             
             // Add slippage buffer
             collateralNeeded = (collateralNeeded * (BPS_PRECISION + maxSlippage)) / BPS_PRECISION;
-            
-            // Withdraw collateral from Aave
-            aavePool.withdraw(collateralAsset, collateralNeeded, address(this));
-            
-            // Dynamic Approval: Approve Router to swap collateral
-            _approveIfNeeded(collateralAsset, address(uniswapRouter), collateralNeeded);
 
-            // Swap collateral for borrow asset
+            // 3. PULL COLLATERAL FROM USER (NEW: Faithful Logic)
+            // The Driver must hold the aToken to withdraw it.
+            IERC20(aTokenAddress).transferFrom(msg.sender, address(this), collateralNeeded);
+
+            // Withdraw collateral from Aave (now works because Driver holds aTokens)
+            aavePool.withdraw(collateralAsset, collateralNeeded, address(this));
+
+            _approveIfNeeded(collateralAsset, address(uniswapRouter), collateralNeeded);
+            
             uint256 minAmountOut = (actualRepayAmount * (BPS_PRECISION - maxSlippage)) / BPS_PRECISION;
             uint256 borrowReceived = _swapCollateralForBorrow(collateralAsset, borrowAsset, collateralNeeded, minAmountOut);
             
-            // Dynamic Approval: Approve Aave to repay debt
             _approveIfNeeded(borrowAsset, address(aavePool), borrowReceived);
-            
-            // Repay debt
             aavePool.repay(borrowAsset, borrowReceived, 2, msg.sender);
         }
         
-        // Withdraw remaining collateral if requested
         if (withdrawAmount > 0) {
+            // PULL REMAINING COLLATERAL (NEW)
+            IERC20(aTokenAddress).transferFrom(msg.sender, address(this), withdrawAmount);
+            
             uint256 withdrawn = aavePool.withdraw(collateralAsset, withdrawAmount, msg.sender);
             (, , , , , uint256 finalHealthFactor) = aavePool.getUserAccountData(msg.sender);
             emit LoopUnwound(msg.sender, actualRepayAmount, withdrawn, finalHealthFactor);

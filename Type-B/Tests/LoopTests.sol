@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1
 pragma solidity ^0.8.20;
 
-// File Version : 0.0.2 (16/12/2025)
+// File Version : 0.0.3 (17/12/2025)
+// - 0.0.3 (17/12): Added aToken implementation for realistic collateral management. 
 // - 0.0.2 (16/12): Improved debugging of external calls with try/catch and error decoding. 
 
 // INTERFACES
@@ -59,6 +60,7 @@ interface IMockUniRouter {
 }
 
 interface IMockAavePool {
+    function aTokens(address asset) external view returns (address); // Added this (0.0.3)
     function getUserAccountData(address user) external view returns (
         uint256 totalCollateralBase,
         uint256 totalDebtBase,
@@ -194,6 +196,16 @@ contract LoopTests {
     function p1_4_UnwindAndVerifyProfit() external {
         uint256 balBefore = IERC20(weth).balanceOf(address(this));
 
+        // 1. GET A-TOKEN ADDRESS
+        // Ask the Mock Pool for the address of the aToken corresponding to WETH
+        address aTokenWeth = IMockAavePool(aavePool).aTokens(weth);
+        require(aTokenWeth != address(0), "aToken not found");
+
+        // 2. APPROVE DRIVER (CRITICAL 0.0.3 STEP)
+        // The Driver needs to pull our aTokens to withdraw them.
+        // We approve the Driver to spend ALL our aWETH.
+        IERC20(aTokenWeth).approve(address(driver), type(uint256).max);
+
         // DEBUG: Try/Catch wrapper
         try driver.unwindLoop(
             weth,
@@ -206,8 +218,12 @@ contract LoopTests {
             uint256 profit = balAfter - balBefore;
             
             // Analysis:
-            // Position: 20 ETH ($44k value at $2200). Debt: $20k USDT.
-            // Net Equity: $24k. Initial Equity: $20k. Profit: $4k (~1.81 ETH).
+            // Position: ~20 ETH ($44k value at $2200). 
+            // Debt: ~$20k USDT.
+            // Net Equity: ~$24k. 
+            // Initial Equity: 10 ETH @ $2000 = $20k.
+            // Expected Profit: ~$4k (approx 1.81 ETH).
+            
             emit TestLog("p1_4: Profit (Wei)", profit);
             require(profit > 1.5 * 1e18, "Profit lower than expected");
 
