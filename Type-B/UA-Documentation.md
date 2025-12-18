@@ -77,6 +77,29 @@ The loop continues until either the **target collateral value is reached** or th
 
 ---
 
+## 3. Price Impact and Market Slippage
+
+The **UADriver**'s recursive swaps on Uniswap V2 actively move the market price of the assets involved in each cycle of the loop. This creates a direct relationship between the user's chosen leverage and the resulting price impact.
+
+### Leverage as an Impact Multiplier
+
+Price impact is a function of the user's **total exposure** (Initial Margin \times Leverage). 
+
+* **Long Positions:** Concentrated demand "pumps" the price of the collateral relative to the borrow asset.
+* **Short Positions:** Selling the borrowed asset into the pool "dumps" its price.
+
+For example, a swap representing **1%** of a pool’s depth might cause **2%** price impact. At **2x leverage**, that same initial margin results in a **4%** impact. At **10x leverage**, the total amount swapped could move the price by **20%** or more.
+
+### Impact on Loop Success
+
+Price impact is the primary reason high-leverage orders may fail. The protocol’s safeguards interact with these price shifts in real-time:
+
+* **Slippage Reversion:** If the cumulative price impact across all cycles exceeds your `maxSlippage` setting, the transaction will revert to prevent you from entering at an unfavorable price.
+* **Health Factor Degradation:** Significant price movement during execution can cause the `projectedHealthFactor` to drop. If the impact pushes the position’s health below your `minHealthFactor`, the driver will either stop looping early or fail the transaction entirely.
+* **Liquidity Constraints:** In smaller pools, the depth often cannot support the volume required for high leverage (like 10x). The price moves so aggressively during the initial cycles that the safety buffers are triggered before the target leverage is ever reached.
+
+---
+
 ## 4. Financial Costs of Debt Looping
 
 ### 4.1. Aave Protocol Costs: Interest
