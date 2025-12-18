@@ -6,9 +6,11 @@ pragma solidity ^0.8.20;
  * @notice Automates leverage creation through debt looping for any valid Aave/Uniswap asset pair.
  * Executes multiple borrow-swap-deposit cycles in a single transaction.
  */
-  // File Version: 0.0.5 (17/12/2025)
- // - 0.0.5 (17/12): Added aToken usage for collateral management. 
- // - 0.0.4 (16/12): Fixed decimal precision. 
+// File Version: 0.0.7 (18/12/2025)
+// - 0.0.7 (18/12): Accounted for "max" input during unwind. 
+// - 0.0.6 (18/12): Fixed aToken withdraw amount precision for unwind. 
+// - 0.0.5 (17/12): Added aToken usage for collateral management. 
+// - 0.0.4 (16/12): Fixed decimal precision for wind. 
  
 import "./imports/ReentrancyGuard.sol"; //Imports and inherits ownable
 import "./imports/IERC20.sol";
@@ -409,8 +411,9 @@ IUniswapV2Factory public uniswapFactory;
     
     // UNWINDING FUNCTION
     
-    /**
+/**
      * @notice Unwind a leveraged position
+     * (0.0.6): Resolves type(uint256).max to actual balances to prevent arithmetic panics.
      */
     function unwindLoop(
         address collateralAsset,
@@ -420,49 +423,55 @@ IUniswapV2Factory public uniswapFactory;
         uint256 maxSlippage
     ) external nonReentrant {
         if (paused) revert ContractPaused();
-        if (collateralAsset == borrowAsset) revert SameAsset();
-
-        // 1. Fetch Debt Data
-        ( , , uint256 currentVariableDebt, , , , , , ) = dataProvider.getUserReserveData(borrowAsset, msg.sender);
-        uint256 actualRepayAmount = repayAmount == 0 ? currentVariableDebt : repayAmount;
-
-        // 2. Fetch aToken Address (NEW : 0.0.5)
-        (address aTokenAddress, , ) = dataProvider.getReserveTokensAddresses(collateralAsset);
-
-        if (actualRepayAmount > 0) {
-            address[] memory path = new address[](2);
-            path[0] = collateralAsset;
-            path[1] = borrowAsset;
-            
-            uint256[] memory amountsIn = uniswapRouter.getAmountsIn(actualRepayAmount, path);
-            uint256 collateralNeeded = amountsIn[0];
-            
-            // Add slippage buffer
-            collateralNeeded = (collateralNeeded * (BPS_PRECISION + maxSlippage)) / BPS_PRECISION;
-
-            // 3. PULL COLLATERAL FROM USER (NEW: Faithful Logic)
-            // The Driver must hold the aToken to withdraw it.
-            IERC20(aTokenAddress).transferFrom(msg.sender, address(this), collateralNeeded);
-
-            // Withdraw collateral from Aave (now works because Driver holds aTokens)
-            aavePool.withdraw(collateralAsset, collateralNeeded, address(this));
-
-            _approveIfNeeded(collateralAsset, address(uniswapRouter), collateralNeeded);
-            
-            uint256 minAmountOut = (actualRepayAmount * (BPS_PRECISION - maxSlippage)) / BPS_PRECISION;
-            uint256 borrowReceived = _swapCollateralForBorrow(collateralAsset, borrowAsset, collateralNeeded, minAmountOut);
-            
-            _approveIfNeeded(borrowAsset, address(aavePool), borrowReceived);
-            aavePool.repay(borrowAsset, borrowReceived, 2, msg.sender);
-        }
         
-        if (withdrawAmount > 0) {
-            // PULL REMAINING COLLATERAL (NEW)
-            IERC20(aTokenAddress).transferFrom(msg.sender, address(this), withdrawAmount);
+        // 1. Resolve aToken address and user balance
+        (address aTokenAddress, , ) = dataProvider.getReserveTokensAddresses(collateralAsset);
+        uint256 userATokenBal = IERC20(aTokenAddress).balanceOf(msg.sender);
+
+        // 2. Handle Repayment Phase
+        uint256 totalRepaid = 0;
+        if (repayAmount > 0 && userATokenBal > 0) {
+            // Get actual debt to avoid passing max to Uniswap
+            ( , , uint256 currentDebt, , , , , , ) = dataProvider.getUserReserveData(borrowAsset, msg.sender);
+            uint256 actualRepay = (repayAmount == type(uint256).max || repayAmount > currentDebt) ? currentDebt : repayAmount;
+
+            if (actualRepay > 0) {
+                address[] memory path = new address[](2);
+                path[0] = collateralAsset;
+                path[1] = borrowAsset;
+                
+                uint256[] memory amountsIn = uniswapRouter.getAmountsIn(actualRepay, path);
+                uint256 collateralNeeded = (amountsIn[0] * (BPS_PRECISION + maxSlippage)) / BPS_PRECISION;
+                
+                // Safety cap to user balance
+                if (collateralNeeded > userATokenBal) collateralNeeded = userATokenBal;
+
+                // Move aTokens to driver to perform withdrawal
+                IERC20(aTokenAddress).transferFrom(msg.sender, address(this), collateralNeeded);
+                aavePool.withdraw(collateralAsset, collateralNeeded, address(this));
+                
+                _approveIfNeeded(collateralAsset, address(uniswapRouter), collateralNeeded);
+                uint256 borrowReceived = _swapCollateralForBorrow(collateralAsset, borrowAsset, collateralNeeded, 0);
+                
+                _approveIfNeeded(borrowAsset, address(aavePool), borrowReceived);
+                totalRepaid = aavePool.repay(borrowAsset, borrowReceived, 2, msg.sender);
+                
+                // Update tracked balance
+                userATokenBal = IERC20(aTokenAddress).balanceOf(msg.sender);
+            }
+        }
+
+        // 3. Handle Remaining Withdrawal Phase
+        if (withdrawAmount > 0 && userATokenBal > 0) {
+            uint256 actualWithdraw = (withdrawAmount == type(uint256).max || withdrawAmount > userATokenBal) 
+                ? userATokenBal 
+                : withdrawAmount;
+
+            IERC20(aTokenAddress).transferFrom(msg.sender, address(this), actualWithdraw);
+            uint256 withdrawn = aavePool.withdraw(collateralAsset, actualWithdraw, msg.sender);
             
-            uint256 withdrawn = aavePool.withdraw(collateralAsset, withdrawAmount, msg.sender);
-            (, , , , , uint256 finalHealthFactor) = aavePool.getUserAccountData(msg.sender);
-            emit LoopUnwound(msg.sender, actualRepayAmount, withdrawn, finalHealthFactor);
+            (, , , , , uint256 hf) = aavePool.getUserAccountData(msg.sender);
+            emit LoopUnwound(msg.sender, totalRepaid, withdrawn, hf);
         }
     }
     

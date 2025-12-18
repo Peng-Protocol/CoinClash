@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1
 pragma solidity ^0.8.20;
 
-// File Version: 0.0.3 (17/12/2025)
+// File Version: 0.0.4 (18/12/2025)
+// - 0.0.4 (18/12/2025): Fixed decimal precision
 // - 0.0.3 (17/12/2025): Added and integrated mock aToken for collateral ownership. 
 // - 0.0.2 (16/12/2025): Adjusted borrow. 
 
@@ -147,7 +148,8 @@ contract MockAavePool {
             uint256 collateral = userCollateral[user][asset];
             if (collateral > 0) {
                 uint256 price = oracle.getAssetPrice(asset);
-                uint256 val = (collateral * price) / 1e18;
+                // Adjust for decimals: (Amount * Price) / 10^Decimals [0.0.4]
+                uint256 val = (collateral * price) / (10 ** configs[asset].decimals);
                 totalCollateralETH += val;
                 weightedLT += val * configs[asset].liquidationThreshold;
                 weightedLTV += val * configs[asset].ltv;
@@ -160,11 +162,12 @@ contract MockAavePool {
             address asset = assets[i];
             uint256 debt = userDebt[user][asset];
             if (debt > 0) {
-                totalDebtETH += (debt * oracle.getAssetPrice(asset)) / 1e18;
+                // Adjust for decimals: (Debt * Price) / 10^Decimals [0.0.4]
+                totalDebtETH += (debt * oracle.getAssetPrice(asset)) / (10 ** configs[asset].decimals);
             }
         }
     }
-}
+    }
 
 contract MockAaveDataProvider {
     MockAavePool public pool;

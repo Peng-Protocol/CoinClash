@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: BSL 1.1
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.1 (24/11/2025)  // Initial version for this file, incrementing third numerator from implied 0.0.0
+// File Version: 0.0.2 (18/12/2025)  
 // Changelog Summary:
+// - 0.0.2 (18/12/2025): Added getAmountsIn  and getAmountIn to enable driver tests. 
 // - 24/11/2025: Fixed explicit type conversion error from "address" to "contract MockUniPair" by casting pair addresses to payable before conversion, as MockUniPair has a payable fallback.
+// Initial version for this file, incrementing third numerator from implied 0.0.0
 
 import "./MockUniFactory.sol";
 
@@ -163,5 +165,42 @@ function _swap(uint[] memory amounts, address[] memory path, address _to) intern
         IWETH(WETH).withdraw(amounts[amounts.length - 1]);
         (bool success, ) = to.call{value: amounts[amounts.length - 1]}("");
         require(success, "MockUniRouter: ETH_TRANSFER_FAILED");
+    }
+    
+    // ============ MISSING FUNCTIONALITY (0.0.2) ============
+
+    // Helper: Calculates the input amount for a fixed output
+    function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) public pure returns (uint amountIn) {
+        require(amountOut > 0, "MockUniRouter: INSUFFICIENT_OUTPUT_AMOUNT");
+        require(reserveIn > 0 && reserveOut > 0, "MockUniRouter: INSUFFICIENT_LIQUIDITY");
+        uint numerator = reserveIn * amountOut * 1000;
+        uint denominator = (reserveOut - amountOut) * 997;
+        amountIn = (numerator / denominator) + 1;
+    }
+
+    // Main Function: Calculates input amounts for a path (used by UADriver unwind)
+    function getAmountsIn(uint amountOut, address[] memory path) public view returns (uint[] memory amounts) {
+        require(path.length >= 2, "MockUniRouter: INVALID_PATH");
+        amounts = new uint[](path.length);
+        amounts[amounts.length - 1] = amountOut;
+
+        // Walk backwards through the path
+        for (uint i = path.length - 1; i > 0; i--) {
+            address payable pair = payable(pairFor(path[i - 1], path[i]));
+            (uint reserveIn, uint reserveOut,) = MockUniPair(pair).getReserves();
+            
+            // Sort reserves to match path direction (In -> Out)
+            // If path is [A, B], we are going from A -> B. 
+            // We need reserves for A (In) and B (Out).
+            (address token0,) = sortTokens(path[i - 1], path[i]);
+            if (path[i - 1] == token0) {
+                 // reserves are (A, B) -> (reserveIn, reserveOut)
+            } else {
+                // reserves are (B, A) -> Swap them
+                (reserveIn, reserveOut) = (reserveOut, reserveIn);
+            }
+            
+            amounts[i - 1] = getAmountIn(amounts[i], reserveIn, reserveOut);
+        }
     }
 }
