@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1
 pragma solidity ^0.8.20;
 
-// File Version : 0.0.4 (18/12/2025)
+// File Version : 0.0.5 (18/12/2025)
+// - 0.0.5 (18/12): Added profit check in 1_4. 
 // - 0.0.4 (18/12): Added aToken allowance to driver in 1_4. 
 // - 0.0.3 (17/12): Added aToken implementation for realistic collateral management. 
 // - 0.0.2 (16/12): Improved debugging of external calls with try/catch and error decoding. 
@@ -219,6 +220,8 @@ contract LoopTests {
         IERC20(aWeth).approve(address(driver), type(uint256).max);
         
         emit TestLog("p1_4: aToken Approved", 0);
+        
+        uint256 balanceBefore = IERC20(weth).balanceOf(address(this));
 
         // 2. Execute Unwind
         try driver.unwindLoop(
@@ -235,6 +238,11 @@ contract LoopTests {
             emit DebugError("Low Level Error during Unwind", lowLevelData);
             revert("Unwind Failed: Low Level Error");
         }
+        // Verify profit
+        uint256 balanceAfter = IERC20(weth).balanceOf(address(this));
+uint256 profit = balanceAfter - balanceBefore;
+require(profit >= 1.5 * 1e18, "Expected profit not achieved");
+emit TestLog("p1_4: Net Profit (ETH)", profit);
     }
 
     // ============ PATH 2: 10x SHORT STRATEGY ============
