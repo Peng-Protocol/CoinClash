@@ -169,7 +169,7 @@ Starting with **200 USDT** and targeting **2x Leverage**:
 * **Total Liabilities (Owed):** $\mathbf{-200 \text{ USDT}}$ (Debt)
 * **Net Equity (Owned):** $\mathbf{200 \text{ USDT}}$ (Your initial capital, not accounting for fees)
 
-If the price of the collateral asset increases by $10\%$, the user's **Net Equity** increases by 40 USDT, which represents a **$20\%$ return** (40 / 200) on the initial margin, or double the $10\%$ market gain.
+If the price of the collateral asset increases by **10%**, the user's **Net Equity** increases by 40 USDT, which represents a **20%** return (40 / 200) on the initial margin, or double the **10%** market gain.
 
 ---
 
