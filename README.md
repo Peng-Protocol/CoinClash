@@ -1,7 +1,7 @@
 # Overview
 CoinClash is a decentralized limit-order trading platform built on Uniswap V2 for price discovery and swap execution. The system supports **range-bound orders**, **partial fills**, **dynamic fee scaling**, and **per-pair historical data** while maintaining gas-efficient batch processing. All core functionality is now consolidated into a **monolithic architecture** centered on `CCListingTemplate`, eliminating multi-contract agents and per-listing proxies.
 
-## Type-A : Range Orders
+# Type-A : Range Orders
 The platform operates through a **single `CCListingTemplate`** per token pair, which serves as the canonical order book and state tracker. Users interact via **four specialized routers**:
 
 | Router | Purpose |
@@ -20,12 +20,12 @@ All amounts are **normalized to 1e18** using `normalize()` / `denormalize()` hel
 
 ---
 
-# CCListingTemplate
+## CCListingTemplate
 
-## Description
+### Description
 The `CCListingTemplate` is the **central state authority** for a token pair. It tracks orders, volumes, and historical snapshots using **array-based order structs** and **per-pair mappings**. Price is derived live from the Uniswap V2 pair via `balanceOf`.
 
-## Key Features
+### Key Features
 - **Array-Based Orders**:  
   ```solidity
   addresses: [maker, recipient, startToken, endToken]
@@ -48,17 +48,17 @@ The `CCListingTemplate` is the **central state authority** for a token pair. It 
 
 ---
 
-# CCOrderRouter
+## CCOrderRouter
 
-## Description
+### Description
 User-facing interface for **order creation and cancellation**. Transfers funds to the router, validates Uniswap pair liquidity, and submits batch updates to `CCListingTemplate`.
 
-## Key Functions
+### Key Functions
 - `createBuyOrder()` / `createSellOrder()` → payable, supports ETH or ERC20
 - `clearSingleOrder(orderId, isBuy)`
 - `clearOrders(maxIterations)` → batch cancel from `makerPendingOrdersView`
 
-## Flow
+### Flow
 1. Validate pair exists + reserves > 0
 2. Transfer input → router (pre/post balance)
 3. Normalize received amount
@@ -67,12 +67,12 @@ User-facing interface for **order creation and cancellation**. Transfers funds t
 
 ---
 
-# CCSettlementRouter
+## CCSettlementRouter
 
-## Description
+### Description
 Settles orders using **Uniswap V2 swaps** with **off-chain pre-calculated `amountsIn`** (18-decimal normalized). No on-chain slippage math — all impact validation uses available Uniswap v2 balances.
 
-## Key Interactions
+### Key Interactions
 - Pulls funds via `withdrawToken` or low-level `call{value:}` (ETH)
 - Executes `swapExactTokensForTokens` with `amountOutMin = expected * 95 / 100`
 - Updates order via `ccUpdate` (Amounts + Status)
@@ -87,22 +87,22 @@ Settles orders using **Uniswap V2 swaps** with **off-chain pre-calculated `amoun
 
 ---
 
-# Deployment & Upgrades
+## Deployment & Upgrades
 
-## Initial Deployment
+### Initial Deployment
 1. Deploy `CCListingTemplate` for all pairs.
 2. Set `uniswapV2Factory`, deploy and set `registryAddress`, `globalizerAddress` via owner functions
 3. Deploy and set routers via `addRouter()`. 
 4. Setup `CCListingTemplate` addresses in routers. 
 
-## Upgrades
+### Upgrades
 - **Router reset**: Routers can be added or removed freely by the contract owner to adjust their functionality. 
 
 No proxy patterns. 
 
 ---
 
-# Security & Design Principles
+## Security & Design Principles
 
 - **Reentrancy**: `nonReentrant` on all external entrypoints
 - **Graceful Degradation**: `try/catch` + detailed events, never silent fail
@@ -116,7 +116,7 @@ No proxy patterns.
 
 ---
 
-# Token Flow Examples
+## Token Flow Examples
 
 ## Buy Order (TokenB → TokenA)
 1. User sends TokenB → `CCOrderRouter`
@@ -128,7 +128,7 @@ No proxy patterns.
 
 ---
 
-# Pagination & Gas Control
+## Pagination & Gas Control
 
 | View | Pagination |
 |------|------------|
@@ -139,12 +139,14 @@ All loops respect user limits. No fixed caps.
 
 ---
 
-# Events & Indexing
+## Events & Indexing
 
 All events indexed by:
 - `maker`, `orderId` (orders)
 
-## Type-B : Debt-Looping Suite
+---
+
+# Type-B : Debt-Looping Suite
 
 ### Description
 
