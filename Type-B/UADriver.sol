@@ -6,7 +6,8 @@ pragma solidity ^0.8.20;
  * @notice Automates leverage creation through debt looping for any valid Aave/Uniswap asset pair.
  * Executes multiple borrow-swap-deposit cycles in a single transaction.
  */
-// File Version: 0.0.7 (18/12/2025)
+// File Version: 0.0.8 (19/12/2025)
+// - 0.0.8 (19/12): Fixed collateral asset decimal precision. 
 // - 0.0.7 (18/12): Accounted for "max" input during unwind. 
 // - 0.0.6 (18/12): Fixed aToken withdraw amount precision for unwind. 
 // - 0.0.5 (17/12): Added aToken usage for collateral management. 
@@ -61,6 +62,8 @@ contract UADriver is ReentrancyGuard {
     struct PreviewCache {
         address collateralAsset;
         address borrowAsset;
+        uint256 collateralAssetDecimals; // NEW (0.0.8)
+        uint256 borrowAssetDecimals;     // NEW (0.0.8)
         uint256 collateralPrice;
         uint256 borrowPrice;
         uint256 ltvScaled;
@@ -80,6 +83,7 @@ contract UADriver is ReentrancyGuard {
     struct ExecuteCache {
         address collateralAsset;
         address borrowAsset;
+        uint256 collateralAssetDecimals; // ←NEW (0.0.8)
         uint256 borrowAssetDecimals; // <--- NEW
         uint256 initialMargin;
         uint256 targetLeverage;
@@ -251,95 +255,83 @@ IUniswapV2Factory public uniswapFactory;
      * @notice Internal helper to execute loop cycles
      */
     function _executeLoopCycles(
-        address onBehalfOf,
-        ExecuteCache memory cache,
-        ExecuteState memory state
-    ) internal {
-        while (state.loopCount < MAX_LOOPS) {
-            uint256 currentVal = (state.currentCollateral * cache.collateralPrice) / PRECISION;
-            
-            // Break if target reached
-            if (currentVal >= cache.targetCollateralValue) break;
-            
-            // Calculate Borrow Amount
-            uint256 borrowAmount = _calculateLoopBorrow(cache, state, currentVal);
-            
-            // Stop if dust amount
-            if (borrowAmount < 1000) break;
-            
-            // Check Liquidity availability
-            uint256 liquidity = _getAvailableLiquidity(cache.borrowAsset);
-            if (borrowAmount > liquidity) borrowAmount = liquidity;
+    address onBehalfOf,
+    ExecuteCache memory cache,
+    ExecuteState memory state
+) internal {
+    while (state.loopCount < MAX_LOOPS) {
+        // FIX: Normalize collateral value to 18 decimals using specific decimals
+        // This ensures it matches the 18-decimal debt value calculated later
+        uint256 currentVal = (state.currentCollateral * cache.collateralPrice) / (10 ** cache.collateralAssetDecimals);
 
-            // Execute: Borrow -> Swap -> Supply
-            aavePool.borrow(cache.borrowAsset, borrowAmount, 2, 0, onBehalfOf);
-            
-            // Dynamic Approval: Approve Router to spend borrowed asset for swap [cite: 44]
-            _approveIfNeeded(cache.borrowAsset, address(uniswapRouter), borrowAmount);
+        if (currentVal >= cache.targetCollateralValue) break;
 
-            // Calc minimum output for slippage
-            uint256 expectedOut = _getExpectedOutput(cache.borrowAsset, cache.collateralAsset, borrowAmount);
-            uint256 minAmountOut = (expectedOut * (BPS_PRECISION - cache.maxSlippage)) / BPS_PRECISION;
-            
-            // Swap
-            uint256 collateralReceived = _swapBorrowForCollateral(cache.borrowAsset, cache.collateralAsset, borrowAmount, minAmountOut);
-            
-            // Dynamic Approval: Approve Aave to spend new collateral 
-            _approveIfNeeded(cache.collateralAsset, address(aavePool), collateralReceived);
+        uint256 borrowAmount = _calculateLoopBorrow(cache, state, currentVal);
 
-            // Supply
-            aavePool.supply(cache.collateralAsset, collateralReceived, onBehalfOf, 0);
+        if (borrowAmount < 1000) break;
 
-            // Update State
-            state.currentCollateral += collateralReceived;
-            state.totalDebt += borrowAmount;
-            state.loopCount++;
+        uint256 liquidity = _getAvailableLiquidity(cache.borrowAsset);
+        if (borrowAmount > liquidity) borrowAmount = liquidity;
 
-            // Safety Check
-            (, , , , , uint256 healthFactor) = aavePool.getUserAccountData(onBehalfOf);
-            emit LoopExecuted(onBehalfOf, state.loopCount, borrowAmount, borrowAmount, collateralReceived, healthFactor);
-            
-            if (healthFactor < cache.minHealthFactor) revert HealthFactorTooLow();
-        }
+        aavePool.borrow(cache.borrowAsset, borrowAmount, 2, 0, onBehalfOf);
+        _approveIfNeeded(cache.borrowAsset, address(uniswapRouter), borrowAmount);
+
+        uint256 expectedOut = _getExpectedOutput(cache.borrowAsset, cache.collateralAsset, borrowAmount);
+        uint256 minAmountOut = (expectedOut * (BPS_PRECISION - cache.maxSlippage)) / BPS_PRECISION;
+
+        uint256 collateralReceived = _swapBorrowForCollateral(cache.borrowAsset, cache.collateralAsset, borrowAmount, minAmountOut);
+        _approveIfNeeded(cache.collateralAsset, address(aavePool), collateralReceived);
+        aavePool.supply(cache.collateralAsset, collateralReceived, onBehalfOf, 0);
+
+        state.currentCollateral += collateralReceived;
+        state.totalDebt += borrowAmount;
+        state.loopCount++;
+
+        (, , , , , uint256 healthFactor) = aavePool.getUserAccountData(onBehalfOf);
+        emit LoopExecuted(onBehalfOf, state.loopCount, borrowAmount, borrowAmount, collateralReceived, healthFactor);
+        
+        if (healthFactor < cache.minHealthFactor) revert HealthFactorTooLow();
     }
+}
     
     // HELPER: Build Configuration Cache
     function _buildExecuteCache(
-        address collateralAsset,
-        address borrowAsset,
-        uint256 initialMargin,
-        uint256 targetLeverage,
-        uint256 minHealthFactor,
-        uint256 maxSlippage
-    ) internal view returns (ExecuteCache memory cache) {
-        cache.collateralAsset = collateralAsset;
-        cache.borrowAsset = borrowAsset;
-        cache.initialMargin = initialMargin;
-        cache.targetLeverage = targetLeverage;
-        cache.minHealthFactor = minHealthFactor;
-        cache.maxSlippage = maxSlippage;
-        
-        // Prices
-        cache.collateralPrice = _getAssetPrice(collateralAsset);
-        cache.borrowPrice = _getAssetPrice(borrowAsset);
-        
-        // Aave Config - Collateral
-        ( , uint256 ltv, uint256 liquidationThreshold, , , , bool borrowingEnabled, , bool isActive, bool isFrozen) 
-            = dataProvider.getReserveConfigurationData(collateralAsset);
-        
-        if (!borrowingEnabled || !isActive || isFrozen) revert BorrowingDisabled();
+    address collateralAsset,
+    address borrowAsset,
+    uint256 initialMargin,
+    uint256 targetLeverage,
+    uint256 minHealthFactor,
+    uint256 maxSlippage
+) internal view returns (ExecuteCache memory cache) {
+    cache.collateralAsset = collateralAsset;
+    cache.borrowAsset = borrowAsset;
+    cache.initialMargin = initialMargin;
+    cache.targetLeverage = targetLeverage;
+    cache.minHealthFactor = minHealthFactor;
+    cache.maxSlippage = maxSlippage;
 
-        // Aave Config - Borrow Asset (NEW: Fetch decimals)
-        (uint256 borrowDecimals, , , , , , , , , ) 
-            = dataProvider.getReserveConfigurationData(borrowAsset);
-        cache.borrowAssetDecimals = borrowDecimals; // <--- STORE DECIMALS
+    cache.collateralPrice = _getAssetPrice(collateralAsset);
+    cache.borrowPrice = _getAssetPrice(borrowAsset);
 
-        cache.ltvScaled = (ltv * PRECISION) / BPS_PRECISION;
-        cache.ltScaled = (liquidationThreshold * PRECISION) / BPS_PRECISION;
-        
-        // Target Calc
-        cache.targetCollateralValue = (initialMargin * targetLeverage * cache.collateralPrice) / (PRECISION * PRECISION);
-    }
+    // FETCH AND STORE DECIMALS
+    (uint256 colDecimals, uint256 ltv, uint256 liquidationThreshold, , , , bool borrowingEnabled, , bool isActive, bool isFrozen) 
+        = dataProvider.getReserveConfigurationData(collateralAsset);
+    if (!borrowingEnabled || !isActive || isFrozen) revert BorrowingDisabled();
+    
+    cache.collateralAssetDecimals = colDecimals; // New field in struct
+
+    (uint256 borrowDecimals, , , , , , , , , ) 
+        = dataProvider.getReserveConfigurationData(borrowAsset);
+    cache.borrowAssetDecimals = borrowDecimals;
+
+    cache.ltvScaled = (ltv * PRECISION) / BPS_PRECISION;
+    cache.ltScaled = (liquidationThreshold * PRECISION) / BPS_PRECISION;
+    
+    // NORMALIZE TARGET TO 18 DECIMALS
+    // (Margin * Price) / 10^Decimals
+    uint256 marginValue = (initialMargin * cache.collateralPrice) / (10 ** colDecimals);
+    cache.targetCollateralValue = (marginValue * targetLeverage) / PRECISION;
+}
 
 // HELPER: Calculate Borrow Amount (Math Engine)
     function _calculateLoopBorrow(
@@ -347,10 +339,10 @@ IUniswapV2Factory public uniswapFactory;
         ExecuteState memory state,
         uint256 currentCollateralValue
     ) internal pure returns (uint256) {
+        // currentCollateralValue is passed in as 18 decimals
         uint256 maxBorrowValue = (currentCollateralValue * cache.ltvScaled) / PRECISION;
         
-        // Convert current debt (Token Units) to Value ($)
-        // Formula: (Amount * Price) / 10^Decimals
+        // Convert current debt (Token Units) to Value ($ 18 decimals) using specific decimals
         uint256 currentDebtValue = (state.totalDebt * cache.borrowPrice) / (10 ** cache.borrowAssetDecimals);
 
         if (maxBorrowValue <= currentDebtValue) return 0;
@@ -358,9 +350,8 @@ IUniswapV2Factory public uniswapFactory;
         uint256 availableBorrowValue = maxBorrowValue - currentDebtValue;
         
         // Convert Value ($) to Borrow Amount (Token Units)
-        // Formula: (Value * 10^Decimals) / Price
         uint256 borrowAmount = (availableBorrowValue * (10 ** cache.borrowAssetDecimals)) / cache.borrowPrice;
-
+        
         uint256 projectedDebt = state.totalDebt + borrowAmount;
         
         // Recalculate Projected Debt Value for Health Factor check
@@ -369,7 +360,7 @@ IUniswapV2Factory public uniswapFactory;
         if (projectedDebtVal == 0) return borrowAmount;
         
         uint256 projectedHF = (currentCollateralValue * cache.ltScaled) / projectedDebtVal;
-
+        
         if (projectedHF < cache.minHealthFactor) {
             uint256 maxDebtValue = (currentCollateralValue * cache.ltScaled) / cache.minHealthFactor;
             
@@ -559,22 +550,22 @@ IUniswapV2Factory public uniswapFactory;
     ) {
         // 1. Initialize Cache
         PreviewCache memory cache = _buildPreviewCache(collateralAsset, borrowAsset, initialMargin, targetLeverage, minHealthFactor);
-        
         // 2. Initialize State
         PreviewState memory state = PreviewState({
             currentCollateral: initialMargin,
             totalDebt: 0,
             loops: 0
         });
-
         // 3. Run Simulation
         while (state.loops < MAX_LOOPS) { 
-            uint256 currentVal = (state.currentCollateral * cache.collateralPrice) / PRECISION;
+            // FIX: Use specific decimals
+            uint256 currentVal = (state.currentCollateral * cache.collateralPrice) / (10 ** cache.collateralAssetDecimals);
+            
             if (currentVal >= cache.targetCollateralValue) break;
 
             uint256 borrowAmount = _calculateSafeBorrow(cache, state, currentVal);
             if (borrowAmount < 1000) break;
-
+            
             address[] memory path = new address[](2);
             path[0] = borrowAsset;
             path[1] = collateralAsset;
@@ -605,14 +596,21 @@ IUniswapV2Factory public uniswapFactory;
         
         cache.collateralPrice = aaveOracle.getAssetPrice(collateralAsset);
         cache.borrowPrice = aaveOracle.getAssetPrice(borrowAsset);
-
-        (, uint256 ltv, uint256 liquidationThreshold, , , , , , , ) = 
+        
+        (uint256 colDec, uint256 ltv, uint256 liquidationThreshold, , , , , , , ) = 
             dataProvider.getReserveConfigurationData(collateralAsset);
+        cache.collateralAssetDecimals = colDec; // NEW
+
+        (uint256 borDec, , , , , , , , , ) = 
+            dataProvider.getReserveConfigurationData(borrowAsset);
+        cache.borrowAssetDecimals = borDec;     // NEW
 
         cache.ltvScaled = (ltv * PRECISION) / BPS_PRECISION;
         cache.ltScaled = (liquidationThreshold * PRECISION) / BPS_PRECISION;
         
-        cache.targetCollateralValue = (initialMargin * targetLeverage * cache.collateralPrice) / (PRECISION * PRECISION);
+        // Normalize Initial Margin to Value (18 decimals)
+        uint256 marginValue = (initialMargin * cache.collateralPrice) / (10 ** colDec);
+        cache.targetCollateralValue = (marginValue * targetLeverage) / PRECISION;
     }
 
     function _calculateSafeBorrow(
@@ -621,22 +619,30 @@ IUniswapV2Factory public uniswapFactory;
         uint256 currentCollateralValue
     ) internal pure returns (uint256) {
         uint256 maxBorrowValue = (currentCollateralValue * cache.ltvScaled) / PRECISION;
-        uint256 currentDebtValue = (state.totalDebt * cache.borrowPrice) / PRECISION;
+        
+        // FIX: Use specific decimals instead of PRECISION
+        uint256 currentDebtValue = (state.totalDebt * cache.borrowPrice) / (10 ** cache.borrowAssetDecimals);
 
         if (maxBorrowValue <= currentDebtValue) return 0;
 
         uint256 availableBorrowValue = maxBorrowValue - currentDebtValue;
-        uint256 borrowAmount = (availableBorrowValue * PRECISION) / cache.borrowPrice;
+        
+        // FIX: Use specific decimals instead of PRECISION
+        uint256 borrowAmount = (availableBorrowValue * (10 ** cache.borrowAssetDecimals)) / cache.borrowPrice;
 
         uint256 projectedDebt = state.totalDebt + borrowAmount;
-        uint256 projectedDebtVal = (projectedDebt * cache.borrowPrice) / PRECISION;
+        
+        // FIX: Use specific decimals instead of PRECISION
+        uint256 projectedDebtVal = (projectedDebt * cache.borrowPrice) / (10 ** cache.borrowAssetDecimals);
 
         if (projectedDebtVal == 0) return borrowAmount;
         uint256 projectedHF = (currentCollateralValue * cache.ltScaled) / projectedDebtVal;
 
         if (projectedHF < cache.minHealthFactor) {
             uint256 maxSafeDebtValue = (currentCollateralValue * cache.ltScaled) / cache.minHealthFactor;
-            uint256 maxSafeDebt = (maxSafeDebtValue * PRECISION) / cache.borrowPrice;
+            
+            // FIX: Use specific decimals instead of PRECISION
+            uint256 maxSafeDebt = (maxSafeDebtValue * (10 ** cache.borrowAssetDecimals)) / cache.borrowPrice;
             
             if (maxSafeDebt > state.totalDebt) {
                 return maxSafeDebt - state.totalDebt;
@@ -651,12 +657,14 @@ IUniswapV2Factory public uniswapFactory;
         PreviewCache memory cache, 
         PreviewState memory state
     ) internal pure returns (uint256, uint256, uint256, uint256) {
-        uint256 finalCollateralValue = (state.currentCollateral * cache.collateralPrice) / PRECISION;
-        uint256 finalDebtValue = (state.totalDebt * cache.borrowPrice) / PRECISION;
+        // FIX: Use specific decimals instead of PRECISION
+        uint256 finalCollateralValue = (state.currentCollateral * cache.collateralPrice) / (10 ** cache.collateralAssetDecimals);
+        uint256 finalDebtValue = (state.totalDebt * cache.borrowPrice) / (10 ** cache.borrowAssetDecimals);
         
         uint256 healthFactor = finalDebtValue > 0 
             ? (finalCollateralValue * cache.ltScaled) / finalDebtValue 
             : type(uint256).max;
+            
         return (state.loops, state.currentCollateral, state.totalDebt, healthFactor);
     }
     
