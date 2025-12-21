@@ -58,7 +58,7 @@ The `minHealthFactor` is a buffer set by you, the user, to prevent your automate
 
 ## The Mechanism for Achieving Leverage
 
-The process is managed by the contract's **`executeLoop`** function, which takes the desired leverage as the **`targetLeverage`** parameter (e.g., a value of 10 represents 10x leverage).
+The process is managed by the contract's **`executeLoop`** function, which takes the desired leverage as the **`targetLeverage`** parameter (e.g., a value of 2 represents 2x leverage).
 
 1.  **Calculate Target Collateral Value:**
     The contract first calculates the total value of collateral it needs to accumulate to reach the desired leverage, using your **initial margin (equity)** as a base.
@@ -75,6 +75,11 @@ $$
 
 The loop continues until either the **target collateral value is reached** or the next loop is blocked by the **`minHealthFactor`** constraint. This means your safety setting can, and often will, cap your final achieved leverage below the maximum value requested.
 
+LTV limits on Aave (the percent of your collateral you're allowed to borrow against), will set a cap on how much leverage you can realistically use, the highest LTV for uncorrelated assets is ~82.5%, at which the max leverage is about 5.7x. 
+Though most pools will have LTV around 75%
+
+$1 / (1 - 0.75) = \mathbf{4x}$.
+
 ---
 
 ## 3. Price Impact and Market Slippage
@@ -88,7 +93,7 @@ Price impact is a function of the user's **total exposure** (Initial Margin \tim
 * **Long Positions:** Concentrated demand "pumps" the price of the collateral relative to the borrow asset.
 * **Short Positions:** Selling the borrowed asset into the pool "dumps" its price.
 
-For example, a swap representing **1%** of a pool’s depth might cause **2%** price impact. At **2x leverage**, that same initial margin results in a **4%** impact. At **10x leverage**, the total amount swapped could move the price by **20%** or more.
+For example, a swap representing **1%** of a pool’s depth might cause **2%** price impact. At **2x leverage**, that same initial margin results in a **4%** impact. 
 
 ### Impact on Loop Success
 
@@ -96,7 +101,7 @@ Price impact is the primary reason high-leverage orders may fail. The protocol�
 
 * **Slippage Reversion:** If the cumulative price impact across all cycles exceeds your `maxSlippage` setting, the transaction will revert to prevent you from entering at an unfavorable price.
 * **Health Factor Degradation:** Significant price movement during execution can cause the `projectedHealthFactor` to drop. If the impact pushes the position’s health below your `minHealthFactor`, the driver will either stop looping early or fail the transaction entirely.
-* **Liquidity Constraints:** In smaller pools, the depth often cannot support the volume required for high leverage (like 10x). The price moves so aggressively during the initial cycles that the safety buffers are triggered before the target leverage is ever reached.
+* **Liquidity Constraints:** In smaller pools, the depth often cannot support the volume required for leverage. The price moves so aggressively during the initial cycles that the safety buffers are triggered before the target leverage is ever reached.
 
 ---
 
@@ -139,8 +144,7 @@ Since Aave interest rates are highly dynamic, we use a representative example:
 | Target Leverage (Approx.) | Cycles ($N$) to Open | Total Swaps (Open + Unwind) | Total Swap Fee Cost (% of Initial Principal) | Effective Hourly Interest Rate (on Total Borrowed) |
 | :---: | :---: | :---: | :---: | :---: |
 | **2x** | 2 | 4 | **1.20%** | $\approx \mathbf{0.001368\%}$ |
-| **10x** | 10 | 20 | **6.00%** | $\approx \mathbf{0.00684\%}$ |
-| **50x** | 50 | 100 | **30.00%** | $\approx \mathbf{0.0342\%}$ |
+| **4x** | 4 | 8 | **2.4%** | $\approx \mathbf{0.002736\%}$ |
 
 ### Gas Fees
 

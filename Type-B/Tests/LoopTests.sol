@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1
 pragma solidity ^0.8.20;
 
-// File Version : 0.0.5 (18/12/2025)
+// File Version : 0.0.6 (21/12/2025)
+// - 0.0.6 (21/12): Reduced leverage in p2. 
 // - 0.0.5 (18/12): Added profit check in 1_4. 
 // - 0.0.4 (18/12): Added aToken allowance to driver in 1_4. 
 // - 0.0.3 (17/12): Added aToken implementation for realistic collateral management. 
@@ -247,7 +248,7 @@ emit TestLog("p1_4: Net Profit (ETH)", profit);
 
     // ============ PATH 2: 10x SHORT STRATEGY ============
     // Objective: Short ETH (Borrow WETH, Sell for USDT).
-    // Initial: $20k USDT. Target: 10x Leverage.
+    // Initial: $1k USDT. Target: 3.5x Leverage.
     // Dangerous Setup: Low Health Factor expected.
 
     function p2_1_PrepareFunds() external {
@@ -255,27 +256,36 @@ emit TestLog("p1_4: Net Profit (ETH)", profit);
         IMockAaveOracle(aaveOracle).setAssetPrice(weth, 2000 * 1e18);
         IMockAaveOracle(aaveOracle).setAssetPrice(usdt, 1 * 1e18);
 
-        uint256 amount = 20_000 * 1e6; // $20k USDT
+        // [FIX] Reduced Initial Margin 
+        uint256 amount = 1_000 * 1e6; // $1,000 USDT
+        
         IERC20(usdt).mint(address(this), amount);
         IERC20(usdt).approve(address(driver), amount);
         
-        emit TestLog("p2_1: USDT Funds Minted", amount);
+        emit TestLog("p2_1: USDT Funds Minted (Reduced)", amount);
     }
 
-    function p2_2_Execute10xShort() external {
-        uint256 initialMargin = 20_000 * 1e6;
-        
+    function p2_2_Execute3_5xShort() external {
+        // [FIX] Match the reduced margin from p2_1
+        uint256 initialMargin = 1_000 * 1e6; 
+
         // DEBUG: Try/Catch wrapper
         try driver.executeLoop(
             usdt,           // Collateral (Long USDT)
             weth,           // Borrow (Short WETH)
             address(this),
             initialMargin,
-            10 * 1e18,      // 10x
-            1.01 * 1e18,    // Extremely tight HF allowed
-            200
+            
+            // [FIX] Adjusted Target Leverage to 3.5x
+            // Why? With 75% LTV, the mathematical max is 4x (1 / (1-0.75)). 
+            // 10x is impossible without changing the Mock LTV. 
+            // 3.5x is sufficiently risky (HF ~1.12) to verify risk parameters.
+            3.5 * 1e18,      
+
+            1.05 * 1e18,    // Min Health Factor (Expecting ~1.12)
+            200             // Max Slippage
         ) {
-            emit TestLog("p2_2: 10x Short Executed", 0);
+            emit TestLog("p2_2: Short Executed (Adjusted to Max Feasible 3.5x)", 0);
         } catch Error(string memory reason) {
             emit DebugError(reason, "");
             revert(string(abi.encodePacked("p2_2 Short Failed: ", reason)));
@@ -289,7 +299,7 @@ emit TestLog("p1_4: Net Profit (ETH)", profit);
         (,,,,, uint256 hf) = IMockAavePool(aavePool).getUserAccountData(address(this));
         emit TestLog("p2_3: Health Factor", hf);
         
-        // At 10x leverage, HF should be very close to liquidation threshold.
+        // At 3.5x leverage, HF should be very close to liquidation threshold.
         require(hf < 1.25 * 1e18, "HF too safe, leverage failed?");
         require(hf > 0.99 * 1e18, "Already liquidated?");
     }
