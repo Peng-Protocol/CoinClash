@@ -51,7 +51,7 @@ Objective: Achieve 2x leverage on an initial 10 ETH margin and verify profit aft
 ---
 
 ### Path 2: 3.5x Short Strategy (Short ETH, Collateral USDT)
-Objective: Execute an extremely high-leverage short position to test risk parameters.
+Objective: Execute a high risk short position to test risk parameters.
 
 | Step | Function | Key Action & Verification |
 | :--- | :--- | :--- |
