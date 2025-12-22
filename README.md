@@ -146,44 +146,48 @@ All events indexed by:
 
 ---
 
-# Type-B : Debt-Looping Suite
+# Type-B: Euler V2 Debt-Looping Suite
 
-### Description
+## Description
 
-Type-B is a gas-optimized, monolithic debt-looping system for Aave V3 + Uniswap V2 pairs. It enables users to instantly leverage up or unwind positions in a single transaction without the need for flash loans. The suite supports dynamic asset pairs through a single driver and a dedicated limit order executor.
+Type-B is a gas-optimized, monolithic debt-looping system integrated with **Euler V2** and **Uniswap V2**. It enables users to instantly create leveraged collateral positions or unwind them in a single transaction. Unlike traditional looping methods that may require flash loans, this suite automates the borrow-swap-supply cycle directly through Euler’s modular vault architecture.
 
-### Key Components
+## Key Components
 
-* **`UADriver`**: The core execution engine. It is a monolithic contract that automates the borrow → swap → supply cycle.
-  * **Dynamic Pairs**: It handles any valid Aave/Uniswap asset pair dynamically.
-  * **`executeLoop()`**: Performs a one-transaction leveraged entry with user-defined minimum Health Factor (HF) and slippage.
-  * **`unwindLoop()`**: Executes a one-transaction deleveraging/exit by repaying debt and withdrawing collateral.
+* **`UEDriver`**: The core execution engine designed for Euler V2.
+  * **Vault-Centric Design**: Operates across any valid pair of Euler Vaults (Collateral Vault and Borrow Vault).
+  * **`executeLoop()`**: Performs a multi-cycle leveraged entry. It borrows from the debt vault, swaps for collateral via Uniswap V2, and deposits back into the collateral vault until the target leverage is reached.
+  * **`unwindLoop()`**: Executes a "Flash Unwind" by withdrawing collateral, swapping it for the debt asset, and repaying the outstanding balance to deleverage the position.
+  * **Safety Engine**: Dynamically calculates borrow amounts based on vault-specific LTV and liquidation thresholds while enforcing a minimum Health Factor (HF).
 
 
-* **`UAExecutor`**: The limit order layer for the debt-looping suite. It manages the lifecycle of automated positions.
-  * **`createOrder()`**: Allows users to set a "Wind Order" (entry) that triggers when a specific price condition is met.
-  * **Take Profit (TP) & Stop Loss (SL)**: Supports automated unwinds. Users can set TP/SL orders that monitor price movements and trigger `unwindLoop` on the driver.
-  * **Position Tracking**: Manages position states (Pending, Active, Closed, Cancelled) and maps them to specific makers.
+* **`UEExecutor`**: The automation and limit order layer for the Euler suite.
+  * **Custodial Position Management**: Holds collateral in a monolithic model, allowing for precise execution of "Wind Orders" (entries) based on Uniswap V2 price triggers.
+  * **Automated TP/SL**: Supports Take Profit (TP) and Stop Loss (SL) triggers that monitor price movements and automatically trigger the `UEDriver` to close positions.
+  * **Position Lifecycle**: Tracks state transitions from `PENDING` to `ACTIVE`, and finally to `CLOSED` or `CANCELLED`.
 
-### Execution Flow
 
-1. **Creation**: User calls `UAExecutor.createOrder()` with collateral, target leverage, and an entry price.
-2. **Pending**: The position is stored as `Status.PENDING` until the price condition is met.
-3. **Wind**: An off-chain bot or user calls `executeOrders()`. `UAExecutor` pulls the collateral and calls `UADriver.executeLoop()`.
-4. **Active**: Upon successful execution, the position becomes `Status.ACTIVE`. Users can now set or update `setTP()` and `setSL()` triggers.
-5. **Unwind**: When a TP/SL price is hit, `executeUnwinds()` is called, which triggers `UADriver.unwindLoop()` to close the position and return remaining assets to the maker.
+
+## Execution Flow
+
+1. **Creation**: A user calls `UEExecutor.createOrder()`, depositing initial collateral and defining target leverage and an entry price trigger.
+2. **Pending**: The position remains `PENDING` in the executor contract.
+3. **Wind**: Once the Uniswap V2 price condition is met, `executeOrders()` is called. The executor passes the collateral to the `UEDriver`, which performs the recursive looping.
+4. **Active**: The position becomes `ACTIVE`. The executor tracks the updated debt and collateral balances. Users can then set `setTP()` or `setSL()` orders.
+5. **Unwind**: When a target price is hit, `executeUnwinds()` triggers the `UEDriver.unwindLoop()`. The system repays the debt, withdraws the remaining collateral, and returns the net assets to the user.
 
 ---
 
-### Logic & Gas Control
+## Logic & Gas Control
 
 | Feature | Implementation |
 | --- | --- |
-| **Slippage** | Enforced at the `UADriver` level via `maxSlippageBps`. |
-| **Safety** | Minimum Health Factor (default 1.05) is validated after every loop cycle. |
-| **Efficiency** | Dynamic approvals (`_approveIfNeeded`) minimize gas costs for recurring pairs. |
-| **Automation** | `UAExecutor` uses mapping-based tracking for gas-efficient lookups of TP/SL orders. |
+| **Leverage Cap** | Supports up to 10x leverage, subject to Vault LTV constraints. |
+| **Loop Efficiency** | Capped at a maximum of 10 cycles per transaction to prevent out-of-gas errors. |
+| **Slippage Protection** | Enforced at the `UEDriver` level for all Uniswap swaps. |
+| **Price Discovery** | Uses direct Uniswap V2 pair reserve checks for limit order triggers. |
+| **Euler Integration** | Built to interface with the Euler Vault Connector (EVC) and standard Euler V2 Vaults. |
 
 ---
 
-Read more about Type-B in the [UA-Documentation](https://github.com/Peng-Protocol/CoinClash/blob/main/Type-B/UA-Documentation.md).
+Read more about Type-B in the [UE-Documentation](https://github.com/Peng-Protocol/CoinClash/blob/main/Type-B/UE-Documentation.md).
