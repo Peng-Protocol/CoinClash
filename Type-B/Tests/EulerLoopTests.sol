@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1
 pragma solidity ^0.8.20;
 
-// File Version: 0.0.1 (22/12/2025)
+// File Version: 0.0.2 (24/12/2025)
+// - 0.0.2 (24/12): Added proper EVC integration. 
 
 // =============================================================
 // INTERFACES
@@ -53,6 +54,11 @@ interface IMockOracle {
 interface IMockEVault {
     function balanceOf(address account) external view returns (uint256);
     function debtOf(address account) external view returns (uint256);
+}
+
+// (0.0.2) EVC interface 
+interface IMockEVC {
+    function enableOperator(address operator) external;
 }
 
 interface IMockUniRouter {
@@ -129,6 +135,9 @@ contract EulerLoopTests {
     }
 
     function p1_2_Execute2xLong() external {
+        // [FIX : 0.0.2] Authorize Driver on EVC
+        IMockEVC(deployer.evc()).enableOperator(address(driver));
+
         uint256 initialMargin = 10 * 1e18;
         
         try driver.executeLoop(
@@ -245,8 +254,10 @@ contract EulerLoopTests {
     }
 
     function p2_2_Execute10xShort() external {
-        uint256 initialMargin = 2_000 * 1e6;
+        // [FIX : 0.0.2] Authorize Driver on EVC
+        IMockEVC(deployer.evc()).enableOperator(address(driver));
 
+        uint256 initialMargin = 2_000 * 1e6;
         try driver.executeLoop(
             usdtVault,      // Collateral (Long USDT)
             wethVault,      // Borrow (Short WETH)

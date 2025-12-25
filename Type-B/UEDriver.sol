@@ -4,6 +4,10 @@ pragma solidity ^0.8.20;
 import "./imports/ReentrancyGuard.sol"; //Imports and inherits Ownable 
 import "./imports/IERC20.sol";
 
+// File Version : 0.0.2 (24/12/2025)
+
+// - 0.0.2 (24/12) : Implemented proper EVC usage. 
+
 // =============================================================
 // EULER V2 INTERFACES
 // =============================================================
@@ -12,6 +16,14 @@ interface IEVC {
     function isOperator(address owner, address operator) external view returns (bool);
     function enableController(address owner, address vault) external;
     function enableCollateral(address owner, address vault) external;
+
+    // [New : 0.0.2] Allows the Driver (operator) to execute calls on behalf of the User (owner)
+    function call(
+        address target, 
+        uint256 value, 
+        bytes calldata data, 
+        address onBehalfOfAccount
+    ) external payable returns (bytes memory);
 }
 
 interface IEVault {
@@ -159,7 +171,7 @@ contract UEDriver is ReentrancyGuard {
      * @param collateralVault The Euler Vault address for the collateral asset
      * @param borrowVault The Euler Vault address for the debt asset
      */
-    function executeLoop(
+function executeLoop(
         address collateralVault,
         address borrowVault,
         uint256 initialMargin,
@@ -168,13 +180,18 @@ contract UEDriver is ReentrancyGuard {
         uint256 maxSlippage
     ) external nonReentrant {
         if (paused) revert ContractPaused();
+        
+        // [FIX : 0.0.2] Operator Check: Ensure User has authorized Driver on EVC
+        if (!evc.isOperator(msg.sender, address(this))) {
+            revert("UEDriver: Not EVC Operator");
+        }
+
         if (collateralVault == borrowVault) revert SameAsset();
         if (initialMargin == 0) revert InvalidAmount();
         if (targetLeverage < PRECISION || targetLeverage > 10 * PRECISION) revert InvalidLeverage();
         if (maxSlippage > maxSlippageBps) revert SlippageExceeded();
 
         // 1. Build Configuration Cache
-        // Fetches asset addresses from Vaults and decimals
         ExecuteCache memory cache = _buildExecuteCache(collateralVault, borrowVault, initialMargin, targetLeverage, minHealthFactor, maxSlippage);
 
         // Check Liquidity Pair Exists
@@ -187,8 +204,8 @@ contract UEDriver is ReentrancyGuard {
         // Approve Collateral Vault
         _approveIfNeeded(cache.collateralAsset, collateralVault, initialMargin);
         
-        // Deposit into Euler Vault
-        // Note: Receiver is msg.sender (User) to establish base position
+        // Deposit into Euler Vault (Base position)
+        // Receiver is msg.sender (User) to establish ownership
         IEVault(collateralVault).deposit(initialMargin, msg.sender);
 
         // 3. Initialize State
@@ -202,7 +219,7 @@ contract UEDriver is ReentrancyGuard {
         _executeLoopCycles(msg.sender, cache, state);
         
         if (state.loopCount >= MAX_LOOPS) revert MaxLoopsExceeded();
-        
+
         _emitCompletion(msg.sender, state.currentCollateral, state.totalDebt, state.loopCount);
     }
 
@@ -215,23 +232,27 @@ contract UEDriver is ReentrancyGuard {
         ExecuteState memory state
     ) internal {
         while (state.loopCount < MAX_LOOPS) {
-            // Normalize collateral value to 18 decimals using specific decimals
+            // Normalize collateral value to 18 decimals
             uint256 currentVal = (state.currentCollateral * cache.collateralPrice) / (10 ** cache.collateralDecimals);
-
             if (currentVal >= cache.targetCollateralValue) break;
 
             // Calculate borrow based on Euler Vault LTV logic
             uint256 borrowAmount = _calculateLoopBorrow(cache, state, currentVal);
+            if (borrowAmount < 1000) break; // Dust check
 
-            if (borrowAmount < 1000) break;
-
-            // Execute Borrow
-            // NOTE: In standard Euler V2, msg.sender takes the debt. 
-            // If this contract is not executed via delegatecall, the Driver takes the debt.
-            // For this implementation, we assume the Driver manages the cycle or user uses delegatecall.
-            // Using address(this) as receiver to perform swap.
+            // [FIX : 0.0.2] Execute Borrow via EVC
+            // We construct the call: vault.borrow(amount, receiver=Driver)
+            // The EVC executes this in the context of 'user', so User gets the Debt.
+            // The 'receiver' param ensures the Driver gets the Tokens to swap.
             
-            IEVault(cache.borrowVault).borrow(borrowAmount, address(this));
+            bytes memory borrowData = abi.encodeWithSelector(
+                IEVault.borrow.selector, 
+                borrowAmount, 
+                address(this) 
+            );
+
+            // Execute the call on behalf of the user
+            evc.call(cache.borrowVault, 0, borrowData, user);
 
             // Swap Borrowed Asset -> Collateral Asset
             _approveIfNeeded(cache.borrowAsset, address(uniswapRouter), borrowAmount);
@@ -243,6 +264,8 @@ contract UEDriver is ReentrancyGuard {
 
             // Deposit new collateral for user
             _approveIfNeeded(cache.collateralAsset, cache.collateralVault, collateralReceived);
+            
+            // Deposit credited directly to user
             IEVault(cache.collateralVault).deposit(collateralReceived, user);
 
             state.currentCollateral += collateralReceived;

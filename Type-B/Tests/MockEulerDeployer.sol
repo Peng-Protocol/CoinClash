@@ -6,6 +6,9 @@ import "./MockWETH.sol";
 import "./MockUniRouter.sol";
 import "./MockEuler.sol";
 
+// File Version : 0.0.2 (24/12/2025) 
+// - 0.0.2 (24/12): Added EVC setup. 
+
 interface IUEDriverSetup {
     function setEVC(address) external;
     function setUniswapRouter(address) external;
@@ -69,13 +72,11 @@ contract MockEulerDeployer {
         evc = new MockEVC();
         oracle = new MockEulerOracle();
         
-        // Deploy Vaults
-        // WETH Vault: 90% LTV (Aggressive), 91% LT
-        wethVault = new MockEVault(address(token18), "Euler WETH", "eWETH", 18, address(oracle));
+        // Deploy Vaults with EVC reference
+        wethVault = new MockEVault(address(token18), "Euler WETH", "eWETH", 18, address(oracle), address(evc));
         wethVault.setConfig(9000, 9100);
         
-        // USDT Vault: 90% LTV, 91% LT
-        usdtVault = new MockEVault(address(token6), "Euler USDT", "eUSDT", 6, address(oracle));
+        usdtVault = new MockEVault(address(token6), "Euler USDT", "eUSDT", 6, address(oracle), address(evc));
         usdtVault.setConfig(9000, 9100);
         
         // Fund Vaults (Liquidity for borrowing)
