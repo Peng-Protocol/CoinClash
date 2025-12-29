@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.0.1
+// Version: 0.0.2
 // Changes:
+// - v0.0.2 (29/12/2025): Added payout functionality
 // - v0.0.1 (29/12/2025): Built using old CCLiquidityTemplate, segreated fee storage to new fee template. 
 
-import "../imports/Ownable.sol";
+import "../imports/ReentrancyGuard.sol"; //Imports and inherits ownable 
 
 interface IERC20 {
     function decimals() external view returns (uint8);
@@ -25,7 +26,7 @@ interface ICCGlobalizer {
     function globalizeLiquidity(address depositor, address token) external;
 }
 
-contract TypeCLiquidity is Ownable {
+contract TypeCLiquidity is ReentrancyGuard {
     mapping(address router => bool isRouter) public routers;
     address[] private routerAddresses;
     
@@ -70,6 +71,30 @@ struct UpdateType {
     address addr;        // Address for depositor changes
     address recipient;   // Recipient for slot
 }
+
+// --- NEW (0.0.2): Payout Storage ---
+    struct Payout {
+        uint256 id;
+        address recipient;
+        address token; // The token owed
+        uint256 amountOwed;
+        uint256 timestamp;
+    }
+
+    // Incremental ID tracker
+    uint256 public payoutIdCounter;
+
+    // Mapping: payoutID => Payout
+    mapping(uint256 => Payout) public payouts;
+
+    // Helper: user => payoutIDs[]
+    mapping(address => uint256[]) private userPayoutIds;
+    
+    // Event
+    event PayoutCreated(uint256 indexed id, address indexed recipient, address indexed token, uint256 amount);
+    event PayoutClaimed(uint256 indexed id, address indexed recipient, uint256 amountPaid, uint256 amountRemaining);
+    
+    // -- (0.0.2) --
 
     event LiquidityUpdated(address indexed token, uint256 liquid);
     event FeesUpdated(address indexed token, uint256 fees);
@@ -177,6 +202,74 @@ function setFeeTemplateAddress(address _feeTemplateAddress) external onlyOwner {
         }
         emit RouterRemoved(router);
     }
+    
+    // --- NEW (0.0.2): Router-Only Settlement Update ---
+    struct SettlementUpdate {
+        address recipient;
+        address token;
+        uint256 amount;
+    }
+
+    function ssUpdate(SettlementUpdate[] calldata updates) external {
+        require(routers[msg.sender], "Router only"); 
+
+        for (uint256 i = 0; i < updates.length; i++) {
+            payoutIdCounter++;
+            uint256 id = payoutIdCounter;
+
+            Payout storage p = payouts[id];
+            p.id = id;
+            p.recipient = updates[i].recipient;
+            p.token = updates[i].token;
+            p.amountOwed = updates[i].amount;
+            p.timestamp = block.timestamp;
+
+            userPayoutIds[updates[i].recipient].push(id);
+
+            emit PayoutCreated(id, updates[i].recipient, updates[i].token, updates[i].amount);
+        }
+    }
+    
+    // --- NEW (0.0.2): Public Payout Claim ---
+    function processPayout(uint256 payoutId, uint256 amount) external nonReentrant {
+        Payout storage p = payouts[payoutId];
+        require(p.amountOwed > 0, "Payout fully claimed or invalid");
+        require(amount > 0, "Zero amount");
+        require(amount <= p.amountOwed, "Amount exceeds debt");
+
+        // Check contract balance
+        uint256 available;
+        if (p.token == address(0)) {
+            available = address(this).balance;
+        } else {
+            available = IERC20(p.token).balanceOf(address(this));
+        }
+        require(available >= amount, "Insufficient contract liquidity");
+
+        // Update State
+        p.amountOwed -= amount;
+
+        // Transfer
+        if (p.token == address(0)) {
+            (bool success, ) = p.recipient.call{value: amount}("");
+            require(success, "ETH transfer failed");
+        } else {
+            require(IERC20(p.token).transfer(p.recipient, amount), "Token transfer failed");
+        }
+
+        emit PayoutClaimed(payoutId, p.recipient, amount, p.amountOwed);
+    }
+    
+    // --- NEW (0.0.2): Payout Views ---
+    function getPayout(uint256 id) external view returns (Payout memory) {
+        return payouts[id];
+    }
+
+    function getUserPayoutIds(address user) external view returns (uint256[] memory) {
+        return userPayoutIds[user];
+    }
+    
+    // -- (0.0.2) --
 
     function transactToken(address depositor, address token, uint256 amount, address recipient) external {
         require(routers[msg.sender], "Router only");
