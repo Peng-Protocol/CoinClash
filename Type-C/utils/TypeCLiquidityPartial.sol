@@ -320,7 +320,7 @@ function _depositNative(
         return true;
     }
 
-// (0.2.6) Canonical price calculation
+// Canonical price calculation
 // Helper: price fetch - always fetch prices(A,B) where A < B canonically
 function _fetchCompensationPrice(WithdrawalPrepCore memory core, WithdrawalPrepState memory state) internal returns (bool) {
     if (!state.hasCompensation) return true;
@@ -345,7 +345,7 @@ function _fetchCompensationPrice(WithdrawalPrepCore memory core, WithdrawalPrepS
     return true;
 }
 
-// (0.2.6)
+// 
 // Helper: allocation calculation with compensation conversion
 // price from prices(A,B) = B/A
 // Convert B to A: A_output = B_amount / price
@@ -374,7 +374,7 @@ function _calculateAllocationNeeded(WithdrawalPrepCore memory core, WithdrawalPr
     return needed;
 }
 
-    // (0.2.5)
+    //
 
 // FIXED empty return statement and setup. 
 
@@ -467,7 +467,7 @@ function _prepWithdrawal(
     });
     if (!_fetchWithdrawalData(context)) return;
     _transferWithdrawalAmount(context);
-    if (!_updateWithdrawalAllocation(context)) return;
+    require(_updateWithdrawalAllocation(context), "Allocation update failed"); //strictly revert
 }
 
     function _fetchWithdrawalData(WithdrawalContext memory context) internal view returns (bool) {
@@ -479,7 +479,7 @@ function _prepWithdrawal(
         return true;
     }
 
-   // (0.2.6)
+   // updated
 
 function _updateWithdrawalAllocation(WithdrawalContext memory context) internal returns (bool) {
     uint256 totalDeduct = context.primaryAmount;
