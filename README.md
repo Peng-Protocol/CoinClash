@@ -220,15 +220,7 @@ All drivers settle through a modular template system:
 
 | Action | Component | Logic |
 | --- | --- | --- |
-| **Position Entry** | Driver | Pulls Initial + Excess Margin; routes fees to `TypeCFees`.
-
- |
-| **Price Trigger** | Uniswap V2 | Uses `getReserves` to activate limit orders or trigger liquidations.
-
- |
-| **Liquidation** | Driver → Liquidity | Seizes margin and transfers it to the `TypeCLiquidity` vault.
-
- |
-| **Settlement** | Liquidity → User | Disburses profit/margin in the appropriate asset (Isolated) or Base Token (Cross).
-
- |
+| **Position Entry** | Driver | Pulls Initial + Excess Margin; routes fees to `TypeCFees`. |
+| **Price Trigger** | Uniswap V2 | Uses `getReserves` to activate limit orders or trigger liquidations. |
+| **Liquidation** | Driver → Liquidity | Seizes margin and transfers it to the `TypeCLiquidity` vault. |
+| **Settlement** | Liquidity → User | Disburses profit/margin in the appropriate asset (Isolated) or Base Token (Cross).|
