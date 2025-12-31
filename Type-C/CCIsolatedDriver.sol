@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.2
+// File Version: 0.0.3
+// - 0.0.3 (31/12/2025): Added excessMargin initialization. 
 // - 0.0.2 (30/12/2025): Refactored to address stack issues. 
 
-// NOTICE: Requires via-IR to compile, will not compile otherwise!
+// NOTICE: Requires via-IR to compile! Will not compile otherwise! 
 
 import "./imports/ReentrancyGuard.sol"; //Imports and inherita Ownable
 import "./imports/IERC20.sol";
@@ -61,6 +62,7 @@ contract CCIsolatedDriver is ReentrancyGuard {
         uint256 leverageMultiplier;
         bool entryDirection;
         address maker;
+        uint256 excessMargin;  // Forgot this (0.0.3)
     }
 
     // Stack Mitigation: Grouping local variables for Entry
@@ -158,11 +160,20 @@ contract CCIsolatedDriver is ReentrancyGuard {
     require(params.leverageMultiplier >= 2 && params.leverageMultiplier <= 100, "Invalid leverage");
 
     address token = isLong ? IUniswapV2Pair(params.pair).token0() : IUniswapV2Pair(params.pair).token1();
-    uint256 received = _transferIn(token, msg.sender, params.initialMargin);
     
-    // CORRECTED: Restore original precision
+    // (0.0.3) Transfer total margin (initial + excess)
+    uint256 totalToTransfer = params.initialMargin + params.excessMargin;
+    uint256 received = _transferIn(token, msg.sender, totalToTransfer);
+    
+    // Calculate actual amounts received (accounting for transfer taxes)
+    uint256 initialReceived = params.excessMargin == 0 
+        ? received 
+        : (received * params.initialMargin) / totalToTransfer;
+    uint256 excessReceived = received - initialReceived;
+    
+    // Fee only applies to initial margin
     uint256 feeRatio = ((params.leverageMultiplier - 1) * 1e18) / 100;
-    uint256 feeAmount = (received * feeRatio) / 1e18;
+    uint256 feeAmount = (initialReceived * feeRatio) / 1e18;
     
     if (feeAmount > 0) {
         IERC20(token).approve(feeTemplate, feeAmount);
@@ -170,7 +181,7 @@ contract CCIsolatedDriver is ReentrancyGuard {
         else ICCFeeTemplate(feeTemplate).addFees(address(0), token, feeAmount);
     }
 
-    return (received - feeAmount, received * params.leverageMultiplier);
+    return (initialReceived - feeAmount + excessReceived, initialReceived * params.leverageMultiplier);
 }
 
     // Phase 2: Handles ID generation, storage, and execution logic.
@@ -204,12 +215,22 @@ function _storePositionData(
     pos.initialMargin = leverageAmount / params.leverageMultiplier;
     pos.leverageMultiplier = params.leverageMultiplier;
     pos.leverageAmount = leverageAmount;
-    pos.taxedMargin = taxedMargin;
+    
+    // (0.0.3) Split taxedMargin into actual taxed initial margin and excess margin
+    // taxedMargin includes both (initialAfterFee + excessReceived)
+    uint256 totalRequested = params.initialMargin + params.excessMargin;
+    if (totalRequested > 0 && params.excessMargin > 0) {
+        pos.excessMargin = (taxedMargin * params.excessMargin) / totalRequested;
+        pos.taxedMargin = taxedMargin - pos.excessMargin;
+    } else {
+        pos.taxedMargin = taxedMargin;
+        pos.excessMargin = 0;
+    }
+    
     pos.entryDirection = params.entryDirection;
     pos.timestamp = block.timestamp;
-    pos.excessMargin = 0;
     pos.entryPrice = params.entryPrice;
-    pos.status = params.entryPrice == 0 ? 2 : 1; // Active if market, Pending if limit
+    pos.status = params.entryPrice == 0 ? 2 : 1;
 }
 
 function _handlePositionExecution(uint256 id, EntryParams calldata params, bool isLong) private {
