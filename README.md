@@ -191,3 +191,44 @@ Type-B is a gas-optimized, monolithic debt-looping system integrated with **Eule
 ---
 
 Read more about Type-B in the [UE-Documentation](https://github.com/Peng-Protocol/CoinClash/blob/main/Type-B/UE-Documentation.md).
+
+---
+
+# **Type-C : Synthetic Leverage**
+
+Type-C is a decentralized synthetic leverage trading engine, it exists to facilitate short term high leverage positions which Type-B may not always be able to provide. It utilizes **Drivers** to manage position lifecycles and **Templates** for deep liquidity and fee distribution.
+
+## **1. The Driver Layer (Execution)**
+
+The platform utilizes two distinct driver models to handle market and limit orders via Uniswap V2 price discovery:
+
+* **Isolated Driver:** Manages independent positions where collateral is locked per trade, featuring `taxedMargin` (leverage backing) and `excessMargin` (safety cushion).
+
+
+* **Cross Driver:** Implements a universal account model using a single **Base Token** (e.g., USDC). It enables a shared margin pool where `userBaseMargin` protects all active positions from liquidation simultaneously.
+
+## **2. The Template Layer (Settlement & Revenue)**
+
+All drivers settle through a modular template system:
+
+* **TypeCLiquidity:** Acts as the counterparty for all trades. It manages multi-token pools, handles normalized 18-decimal accounting, and creates payouts via `ssUpdate` for authorized drivers.
+
+
+* **TypeCFees:** Collects and tracks protocol revenue using canonical token ordering. It enables distribution of fees to liquidity providers based on pro-rata snapshots taken at the time of deposit.
+
+## **3. Operational Workflow**
+
+| Action | Component | Logic |
+| --- | --- | --- |
+| **Position Entry** | Driver | Pulls Initial + Excess Margin; routes fees to `TypeCFees`.
+
+ |
+| **Price Trigger** | Uniswap V2 | Uses `getReserves` to activate limit orders or trigger liquidations.
+
+ |
+| **Liquidation** | Driver → Liquidity | Seizes margin and transfers it to the `TypeCLiquidity` vault.
+
+ |
+| **Settlement** | Liquidity → User | Disburses profit/margin in the appropriate asset (Isolated) or Base Token (Cross).
+
+ |
