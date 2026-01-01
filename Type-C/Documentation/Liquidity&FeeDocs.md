@@ -1,118 +1,87 @@
-# Templates Documentation (v0.0.1 - v0.0.2)
+# CoinClash Type-C Liquidity & Fee Docs (v0.0.5)
 
-This document outlines the technical specifications and operational logic for the **TypeCLiquidity** and **TypeCFees** templates. These contracts serve as the decentralized settlement and revenue layers for the CoinClash Type-C, separating asset management from execution logic. 
-
----
-
-## 1. TypeCFees Template (v0.0.1)
-
-The `TypeCFees` contract is a standalone module dedicated to tracking, and accumulating protocol fees. It uses canonical token ordering to ensure fee data is consistent across different trading pairs. 
-
-### Key Mechanisms
-
-* **Canonical Ordering:** To prevent duplicate fee mappings for the same pair (e.g., ETH/USDC vs USDC/ETH), the contract always sorts token addresses: `token0 = tokenA < tokenB ? tokenA : tokenB`. 
-
-* **Fee Accumulation:** * **Pair Level:** Tracks the current withdrawable `fees` and the cumulative `feesAcc` for a specific pair. 
-
-* **Token Level:** Tracks a global `tokenFeesAcc` for backwards compatibility with legacy liquidity systems.
-
-* **Depositor Snapshots:** It maintains `depositorFeesAcc`, which takes a snapshot of the global `feesAcc` whenever a user enters a liquidity position, allowing for precise pro-rata fee distribution. 
-
-### Core Functions
-
-* **addFees:** Primary entry point for revenue. It pulls tokens from the caller (e.g., the Driver) and updates both the pair-level and token-level accumulators. 
-
-* **withdrawFees:** Restricted to authorized **Routers**. It allows for the extraction of accumulated fees to a designated recipient. 
-
-* **initializeDepositorFeesAcc:** Used by the liquidity router during new deposit events to "lock in" the starting point for a user's fee earning period. 
+This document outlines the technical specifications for the **TypeCLiquidity** and **TypeCFees** templates. As of version 0.0.5, the protocol uses an **Isolated Liquidity** model to prevent cross-pair exploits.
 
 ---
 
-## 2. TypeCLiquidity Template (v0.0.2)
+## 1. Core Architecture: Pair-Isolation
 
-The `TypeCLiquidity` contract acts as the primary vault and counterparty for all trades. It enables liquidity provider (LP) deposits, withdrawals, and trade settlements. 
+Unlike certain liquidity pools where all assets of a certain type (e.g., USDT) are fungible, Type-C isolates liquidity by the **Pair Bucket**.
 
-### Settlement Architecture
-
-The contract utilizes a **(`ssUpdate`)** pattern. Rather than the Driver handling payouts directly, it submits a request to the liquidity template. 
-
-* **Router Privileges:** Only addresses whitelisted in the `routers` mapping can trigger asset movements or settlement updates. 
-
-* **Liquidity Slots:** User deposits are organized into "Slots," which track the token, amount, and the depositor's address. 
-
-### Core Functions
-
-* **ssUpdate:** The settlement engine. It accepts an array of `SettlementUpdate` structs (containing recipient, token, and amount) to distribute profits to winning traders. 
-
-* **Asset Management:**
-  * **Liquidity Totals:** Tracks the `liquid` (available) balance for every supported token. 
-
-  * **User Views:** Provides functions like `userSlotIndicesView` and `getSlotView` for frontend transparency regarding LP positions. 
+* **The Bucket:** `pairLiquidity[Token][PairedToken]` If `USDT` is deposited to support an `ETH/USDT` pair, that USDT **cannot** be used to pay out winners on a `JUNK/USDT` pair.
+* **Security Impact:** A price manipulation attack on a low-liquidity or "trash" pair is mathematically confined to the liquidity specifically deposited for that pair.
 
 ---
 
-### Security Requirements
+## 2. TypeCLiquidity Template
 
-1. **Router Whitelisting:** The `CCIsolatedDriver` must be added as a router to both contracts via `addRouter` for the system to function. 
+The `TypeCLiquidity` contract serves as the primary vault. It handles principal deposits, trade payouts, and direct withdrawals.
 
-2. **Asset Safety:** All settlement and withdrawal functions are protected by `nonReentrant` modifiers and strict access controls. 
+### A. Core Entry Points
 
-3. **Normalization:** Both templates use internal `normalize` and `denormalize` helpers to ensure math remains consistent across tokens with different decimal places (e.g., USDT vs. WBTC).
+* **`ccDeposit(token, pairedToken, depositor, amount)`**:
+  * Pulls funds from the caller.
+  * Creates a `Slot` for the depositor.
+  * Increases the specific `pairLiquidity` bucket.
+  * Initializes the fee snapshot in the Fee Template.
+
+* **`ccWithdraw(token, slotIndex, amount)`**:
+  * Allows a depositor to reclaim their principal.
+  * Decreases both the slot `allocation` and the `pairLiquidity` bucket.
+  * Restricted to the `depositor` address.
+
+* **`ccDonate(token, pairedToken, amount)`**:
+  * Adds liquidity to a pair bucket without creating a debt (slot).
+  * Used by drivers to add "Yield" or "Closures" to a specific pair.
+
+### B. Settlement Logic
+
+* **`ssUpdate`**: Authorized Drivers call this to create `Payout` objects. Every payout is linked to a `pairedToken` to ensure isolation.
+* **`processPayout`**: Checks that the requested payout does not exceed the `pairLiquidity` for that specific pair. This is the final line of defense against drain attacks.
 
 ---
 
-# CCLiquidityRouter Documentation (v0.0.1)
+## 3. TypeCFees Template
 
-The **CCLiquidityRouter** (extending `TypeCLiquidityPartial`) serves as the primary user-facing interface for interacting with the **TypeCLiquidity** and **TypeCFees** templates. It simplifies complex operations like multi-token deposits, interest-bearing withdrawals, and pro-rata fee claims.
+The `TypeCFees` contract manages protocol revenue independently of user principal. It uses a **Global Accumulator** pattern, meaning it tracks the "true" fees a user is entitled to, rather than a simple time based function. 
 
----
+### A. Fee Logic
 
-## 2. Core Operations
+* **`addFees(tokenA, tokenB, amount)`**: Increases the `feesAcc` (accumulator) for the canonical pair by billing the caller.
+* **`initializeDepositorFeesAcc`**: Called during `ccDeposit` to take a "snapshot" of the current accumulator, this is essential for accurate depositor fee calculation.
 
-### A. Deposits (`depositToken` / `depositNativeToken`)
-
-When a user provides liquidity, the Router coordinates a multi-step process:
-
-1. **Transfer:** Assets are moved from the user to the `TypeCLiquidity` vault.
-2. **Slot Creation:** A "Liquidity Slot" is created in the liquidity template to track the `allocation` and `timestamp`.
-3. **Fee Syncing:** The Router calls the `feeTemplate` to initialize the `depositorFeesAcc` (snapshot) for that specific slot. This "locks in" the current fee accumulator so the user only earns fees generated *after* their deposit.
-
-### B. Fee Claims (`claimFees`)
-
-The Router is responsible for calculating how much profit a Liquidity Provider (LP) has earned based on their share of the pool.
-
-* **Logic:** It compares the current `feesAcc` in the `TypeCFees` template against the snapshot (`dFeesAcc`) stored when the user deposited or last claimed.
-* **Settlement:** Once the share is calculated, the Router triggers a withdrawal from the Fee Template to the user's address and resets their dFeesAcc to prevent double claiming.
-
-### C. Withdrawals (`withdrawToken`)
-
-Withdrawals are "prepared" and then "executed" to handle potential compensations or slippage:
-
-* **Primary Amount:** The principal liquidity being removed from the slot.
-* **Compensation:** In cases where the pool balance is skewed, the system may provide compensation in a paired token.
-* **Slot Update:** The `allocation` in the `TypeCLiquidity` vault is reduced accordingly.
+* **`claimFees(liquidityAddress, token, index)`**: 
+  1. Calculates the delta between the current `feesAcc` and the user's last snapshot. (Essentially; what amount of fees their liquidity has contributed to). 
+  2. Multiplies the delta by the user's `allocation` relative to the `pairLiquidity`.
+  3. Updates the snapshot to the current value to prevent double-claiming.
+  4. Transfers the pro-rata share of fees to the user.
 
 ---
 
 ## 4. Technical Constants & Safety
 
-### Normalize / Denormalize
+### Canonical Ordering
 
-Because the protocol supports tokens with varying decimals (e.g., USDC with 6 vs. DAI with 18), the Router uses internal math to normalize all internal accounting to **18 decimals**.
+To prevent duplicate data for `ETH/USDT` vs `USDT/ETH`, all mappings in the Fee Template use canonical sorting:
+`token0 = address(tokenA) < address(tokenB) ? tokenA : tokenB`
 
-* **Normalize:** `(amount * 1e18) / (10**decimals)`
-* **Denormalize:** `(internalAmount * 10**decimals) / 1e18`
+### Graceful Degradation
 
-### Update Types (ccUpdate)
+Internal calls between the Liquidity and Fee templates (and Globalizer/Registry) are wrapped in `try/catch` blocks. If a non-essential accounting module (like the Globalizer) fails, the core deposit or settlement will still succeed.
 
-The Router communicates with the Liquidity Vault using a standardized `UpdateType` struct:
+### Native ETH Handling
 
-* `0`: Liquid (Total pool balance update)
-* `1`: Fees (Add to pool revenue)
-* `2`: Slot Allocation (Change user principal)
-* `3`: Slot Depositor (Transfer ownership)
+Both templates natively support ETH (`address(0)`).
 
-### Requirements for Deployment
+* **Deposits:** Handled via `msg.value`.
+* **Withdrawals/Claims:** Handled via `address(recipient).call{value: amount}("")`.
 
-1. **Fee Template Link:** The `feeTemplateAddress` must be set in the Router via `setFeeTemplateAddress`.
-2. **Router Whitelisting:** The Router's address must be added to the `routers` mapping in **both** the `TypeCLiquidity` and `TypeCFees` contracts. Without this, the `ccUpdate` and `withdrawFees` calls will fail.
+---
+
+## 5. Deployment Checklist
+
+1. **Linkage:** Set `feeTemplateAddress` in `TypeCLiquidity`. Setup `TypeCLiquidity` as a router in `TypeCFees` to enable `dFeesAcc` initialization. 
+2. **Auth:** Add the `CCIsolatedDriver` address to the `routers` mapping in both templates.
+3. **Initialization:** Ensure the token registry and globalizer addresses are set (optional). 
+
+---
