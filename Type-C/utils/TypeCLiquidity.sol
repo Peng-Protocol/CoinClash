@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.0.2
+// Version: 0.0.5
 // Changes:
-// - v0.0.2 (29/12/2025): Added payout functionality
-// - v0.0.1 (29/12/2025): Built using old CCLiquidityTemplate, segreated fee storage to new fee template. 
+// - v0.0.5: Added dFeesAcc initialization. Added direct liquidity ownership transfer. 
+// - v0.0.4: Implemented ccDeposit/ccWithdraw; secured payouts with pair isolation.
+// - v0.0.3: Pair-isolated liquidity tracking.
 
-import "../imports/ReentrancyGuard.sol"; //Imports and inherits ownable 
+import "../imports/ReentrancyGuard.sol";
 
 interface IERC20 {
     function decimals() external view returns (uint8);
     function transfer(address recipient, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
-}
-
-interface IUniswapV2Factory {
-    function getPair(address tokenA, address tokenB) external view returns (address pair);
 }
 
 interface ITokenRegistry {
@@ -26,160 +24,107 @@ interface ICCGlobalizer {
     function globalizeLiquidity(address depositor, address token) external;
 }
 
+interface ICCFeeTemplate {
+    function initializeDepositorFeesAcc(
+        address tokenA, 
+        address tokenB, 
+        address depositor, 
+        uint256 slotIndex
+    ) external;
+}
+
 contract TypeCLiquidity is ReentrancyGuard {
+    // --- Access Control ---
     mapping(address router => bool isRouter) public routers;
     address[] private routerAddresses;
     
+    // --- Configuration ---
     address public uniswapV2Factory;
     address public registryAddress;
     address public globalizerAddress;
-    
-    // Seperate fee template (0.0.1) 
     address public feeTemplateAddress;
 
+    // --- Liquidity Storage ---
     
-    // Per-token liquidity details: token => LiquidityDetails
-    mapping(address => LiquidityDetails) private liquidityDetail;
-    
+    // Per-pair liquidity tracking: token => pairedToken => Amount
+    // This isolates liquidity pools so JUNK/USDT cannot drain ETH/USDT
+    mapping(address => mapping(address => uint256)) public pairLiquidity;
+
     // Per-token slot storage: token => slotID => Slot
     mapping(address => mapping(uint256 => Slot)) private liquiditySlots;
-    
+
     // Per-token active slots: token => slotIDs[]
     mapping(address => uint256[]) private activeSlots;
-    
+
     // Per-token user indices: token => user => slotIDs[]
     mapping(address => mapping(address => uint256[])) private userSlotIndices;
 
-    // (0.0.1) removed fee related variables 
-struct LiquidityDetails {
-    uint256 liquid;      // Available liquidity (includes all deposited tokens)
-}
-
     struct Slot {
-        address token;       // Token for this slot
-        address depositor;   // Slot owner
-        address recipient;   // Withdrawal recipient
-        uint256 allocation;  // Allocated amount
-        uint256 timestamp;   // Creation timestamp
+        address token;
+        address pairedToken; // Tracks the isolation bucket
+        address depositor;
+        address recipient;
+        uint256 allocation;
+        uint256 timestamp;
     }
 
-struct UpdateType {
-    uint8 updateType;    // 0: liquid, 1: add fees (deprecated), 2: slot alloc, 3: slot depositor, 4: add dFeesAcc (depreciated), 5: subtract fees (deprecated)
-    address token;       // Token address
-    uint256 index;       // Slot index or 0 for liquid/fees
-    uint256 value;       // Value to set/add/subtract
-    address addr;        // Address for depositor changes
-    address recipient;   // Recipient for slot
-}
-
-// --- NEW (0.0.2): Payout Storage ---
+    // --- Payout Storage ---
     struct Payout {
         uint256 id;
         address recipient;
-        address token; // The token owed
+        address token;
+        address pairedToken; // (New 0.0.4) Required to deduct from correct bucket
         uint256 amountOwed;
         uint256 timestamp;
     }
 
-    // Incremental ID tracker
     uint256 public payoutIdCounter;
-
-    // Mapping: payoutID => Payout
     mapping(uint256 => Payout) public payouts;
-
-    // Helper: user => payoutIDs[]
     mapping(address => uint256[]) private userPayoutIds;
-    
-    // Event
-    event PayoutCreated(uint256 indexed id, address indexed recipient, address indexed token, uint256 amount);
-    event PayoutClaimed(uint256 indexed id, address indexed recipient, uint256 amountPaid, uint256 amountRemaining);
-    
-    // -- (0.0.2) --
 
-    event LiquidityUpdated(address indexed token, uint256 liquid);
-    event FeesUpdated(address indexed token, uint256 fees);
-    event SlotDepositorChanged(address indexed token, uint256 indexed slotIndex, address indexed oldDepositor, address newDepositor);
+    // --- Events ---
+    event LiquidityDeposited(address indexed token, address indexed pairedToken, address indexed depositor, uint256 amount, uint256 slotIndex);
+    event LiquidityWithdrawn(address indexed token, address indexed pairedToken, address indexed depositor, uint256 amount, uint256 slotIndex);
+    
     event GlobalizeUpdateFailed(address indexed depositor, address indexed token, uint256 amount, bytes reason);
     event UpdateRegistryFailed(address indexed depositor, address indexed token, bytes reason);
-    event TransactFailed(address indexed depositor, address token, uint256 amount, string reason);
     event RouterAdded(address indexed router);
     event RouterRemoved(address indexed router);
     event RegistryAddressSet(address indexed registry);
     event GlobalizerAddressSet(address indexed globalizer);
     event UniswapFactorySet(address indexed factory);
-    event TokensWithdrawn(address indexed token, address indexed recipient, uint256 amount);
-    // (0.0.1) Event for fee template set
     event FeeTemplateAddressSet(address indexed feeTemplate);
+    
+    event PayoutCreated(uint256 indexed id, address indexed recipient, address indexed token, uint256 amount);
+    event PayoutClaimed(uint256 indexed id, address indexed recipient, uint256 amountPaid, uint256 amountRemaining);
+    event SlotDepositorChanged(address indexed token, uint256 indexed slotIndex, address indexed oldDepositor, address newDepositor);
 
-    function normalize(uint256 amount, uint8 decimals) internal pure returns (uint256 normalizedAmount) {
-        if (decimals == 18) return amount;
-        if (decimals < 18) return amount * 10 ** (18 - decimals);
-        return amount / 10 ** (decimals - 18);
-    }
+    // --- Admin Functions ---
 
-    function denormalize(uint256 amount, uint8 decimals) internal pure returns (uint256 denormalizedAmount) {
-        if (decimals == 18) return amount;
-        if (decimals < 18) return amount / 10 ** (18 - decimals);
-        return amount * 10 ** (decimals - 18);
-    }
-
-    function removePendingOrder(uint256[] storage orders, uint256 orderId) internal {
-        for (uint256 i = 0; i < orders.length; i++) {
-            if (orders[i] == orderId) {
-                orders[i] = orders[orders.length - 1];
-                orders.pop();
-                break;
-            }
-        }
-    }
-
-    function globalizeUpdate(address depositor, address token, uint256 amount) internal {
-        if (globalizerAddress != address(0)) {
-            try ICCGlobalizer(globalizerAddress).globalizeLiquidity(depositor, token) {
-            } catch (bytes memory reason) {
-                emit GlobalizeUpdateFailed(depositor, token, amount, reason);
-            }
-        }
-        
-        if (registryAddress != address(0)) {
-            address[] memory users = new address[](1);
-            users[0] = depositor;
-            try ITokenRegistry(registryAddress).initializeBalances(token, users) {
-            } catch (bytes memory reason) {
-                emit UpdateRegistryFailed(depositor, token, reason);
-            }
-        }
-    }
-
-    // Sets Uniswap V2 Factory address, restricted to owner
     function setUniswapV2Factory(address _factory) external onlyOwner {
         require(_factory != address(0), "Invalid factory address");
         uniswapV2Factory = _factory;
         emit UniswapFactorySet(_factory);
     }
 
-    // Sets registry address, restricted to owner
     function setRegistry(address _registryAddress) external onlyOwner {
         require(_registryAddress != address(0), "Invalid registry address");
         registryAddress = _registryAddress;
         emit RegistryAddressSet(_registryAddress);
     }
 
-    // Sets globalizer address, restricted to owner
     function setGlobalizerAddress(address _globalizerAddress) external onlyOwner {
         require(_globalizerAddress != address(0), "Invalid globalizer address");
         globalizerAddress = _globalizerAddress;
         emit GlobalizerAddressSet(_globalizerAddress);
     }
     
-    // (0.0.1) Sets fee template address, restricted to owner
-function setFeeTemplateAddress(address _feeTemplateAddress) external onlyOwner {
-    require(_feeTemplateAddress != address(0), "Invalid fee template address");
-    feeTemplateAddress = _feeTemplateAddress;
-    emit FeeTemplateAddressSet(_feeTemplateAddress);
-}
+    function setFeeTemplateAddress(address _feeTemplateAddress) external onlyOwner {
+        require(_feeTemplateAddress != address(0), "Invalid fee template address");
+        feeTemplateAddress = _feeTemplateAddress;
+        emit FeeTemplateAddressSet(_feeTemplateAddress);
+    }
 
-    // Adds a router address, restricted to owner
     function addRouter(address router) external onlyOwner {
         require(router != address(0), "Invalid router address");
         require(!routers[router], "Router already exists");
@@ -188,7 +133,6 @@ function setFeeTemplateAddress(address _feeTemplateAddress) external onlyOwner {
         emit RouterAdded(router);
     }
 
-    // Removes a router address, restricted to owner
     function removeRouter(address router) external onlyOwner {
         require(router != address(0), "Invalid router address");
         require(routers[router], "Router does not exist");
@@ -203,16 +147,223 @@ function setFeeTemplateAddress(address _feeTemplateAddress) external onlyOwner {
         emit RouterRemoved(router);
     }
     
-    // --- NEW (0.0.2): Router-Only Settlement Update ---
+    // --- Core: Deposit (Renamed from deposit -> ccDeposit) ---
+    
+    /**
+     * @notice Deposits tokens into a specific pair bucket.
+     * @dev Pulls tokens from caller (Router or User), updates pairLiquidity, and creates a new Slot.
+     */
+    function ccDeposit(
+        address token, 
+        address pairedToken, 
+        address depositor, 
+        uint256 amount
+    ) external payable nonReentrant {
+        require(amount > 0, "Zero amount");
+        require(token != pairedToken, "Identical tokens");
+        require(depositor != address(0), "Invalid depositor");
+
+        // 1. Execute Transfer / Pull Funds
+        uint256 received;
+        
+        if (token == address(0)) {
+            require(msg.value == amount, "ETH amount mismatch");
+            received = amount;
+        } else {
+            require(msg.value == 0, "ETH not expected");
+            uint256 preBalance = IERC20(token).balanceOf(address(this));
+            
+            // Transfer from caller
+            require(IERC20(token).transferFrom(msg.sender, address(this), amount), "Transfer failed");
+            
+            uint256 postBalance = IERC20(token).balanceOf(address(this));
+            received = postBalance - preBalance;
+        }
+        
+        require(received > 0, "No tokens received");
+
+        // 2. Update Isolated Liquidity
+        pairLiquidity[token][pairedToken] += received;
+
+        // 3. Create Slot
+        uint256 slotIndex = activeSlots[token].length; 
+        activeSlots[token].push(slotIndex);
+
+        Slot storage slot = liquiditySlots[token][slotIndex];
+        slot.token = token;
+        slot.pairedToken = pairedToken;
+        slot.depositor = depositor;
+        slot.recipient = depositor;
+        slot.allocation = received;
+        slot.timestamp = block.timestamp;
+        
+        userSlotIndices[token][depositor].push(slotIndex);
+
+        // 4. External Updates (Graceful Degradation)
+        if (globalizerAddress != address(0)) {
+            try ICCGlobalizer(globalizerAddress).globalizeLiquidity(depositor, token) {
+                // Success
+            } catch (bytes memory reason) {
+                emit GlobalizeUpdateFailed(depositor, token, received, reason);
+            }
+        }
+        
+        if (registryAddress != address(0)) {
+            address[] memory users = new address[](1);
+            users[0] = depositor;
+            try ITokenRegistry(registryAddress).initializeBalances(token, users) {
+                // Success
+            } catch (bytes memory reason) {
+                emit UpdateRegistryFailed(depositor, token, reason);
+            }
+        }
+        
+        // Initialize dFeesAcc in fee template for new slot
+        if (feeTemplateAddress != address(0)) {
+            try ICCFeeTemplate(feeTemplateAddress).initializeDepositorFeesAcc(
+                token,
+                pairedToken,
+                depositor,
+                slotIndex
+            ) {
+                // Success
+            } catch (bytes memory reason) {
+                emit GlobalizeUpdateFailed(depositor, token, received, reason); // Reuse event for consistency
+            }
+        }
+
+        emit LiquidityDeposited(token, pairedToken, depositor, received, slotIndex); 
+        }
+
+    // --- Core: Withdraw (New ccWithdraw) ---
+
+    /**
+     * @notice Withdraws tokens from a specific slot.
+     * @dev Decreases slot allocation and the specific pairLiquidity bucket.
+     * @param token The token to withdraw.
+     * @param index The slot index to withdraw from.
+     * @param amount The amount to withdraw.
+     */
+    function ccWithdraw(
+        address token,
+        uint256 index,
+        uint256 amount
+    ) external nonReentrant {
+        require(amount > 0, "Zero amount");
+        
+        Slot storage slot = liquiditySlots[token][index];
+        require(slot.depositor == msg.sender, "Not slot owner");
+        require(slot.allocation >= amount, "Insufficient allocation");
+        
+        address pairedToken = slot.pairedToken;
+        require(pairLiquidity[token][pairedToken] >= amount, "Insufficient pair liquidity");
+
+        // 1. Update State
+        slot.allocation -= amount;
+        pairLiquidity[token][pairedToken] -= amount;
+
+        // 2. Transfer
+        if (token == address(0)) {
+            (bool success, ) = msg.sender.call{value: amount}("");
+            require(success, "ETH transfer failed");
+        } else {
+            require(IERC20(token).transfer(msg.sender, amount), "Token transfer failed");
+        }
+
+        emit LiquidityWithdrawn(token, pairedToken, msg.sender, amount, index);
+    }
+    
+    /**
+     * @notice Donates tokens to a specific pair bucket without creating a liquidity slot.
+     * @dev Increases pairLiquidity directly; tokens are non-refundable to the caller.
+     * @param token The token being donated.
+     * @param pairedToken The token it is paired with (the isolation bucket).
+     * @param amount The amount to donate.
+     */
+    function ccDonate(
+        address token, 
+        address pairedToken, 
+        uint256 amount
+    ) external payable nonReentrant {
+        require(amount > 0, "Zero amount");
+        require(token != pairedToken, "Identical tokens");
+
+        uint256 received;
+        
+        if (token == address(0)) {
+            require(msg.value == amount, "ETH amount mismatch");
+            received = amount;
+        } else {
+            require(msg.value == 0, "ETH not expected");
+            uint256 preBalance = IERC20(token).balanceOf(address(this));
+            
+            // Pull tokens from the caller (e.g., driver, router, or liquidator)
+            require(IERC20(token).transferFrom(msg.sender, address(this), amount), "Transfer failed");
+            
+            uint256 postBalance = IERC20(token).balanceOf(address(this));
+            received = postBalance - preBalance;
+        }
+        
+        require(received > 0, "No tokens received");
+
+        // Increase the isolated bucket balance
+        pairLiquidity[token][pairedToken] += received;
+
+        // Note: No Slot created, no Globalizer/Registry calls needed as there is no depositor.
+        emit LiquidityDeposited(token, pairedToken, address(0), received, type(uint256).max);
+    }
+
+/**
+ * @notice Changes the depositor of a liquidity slot.
+ * @dev Only the current depositor can change to a new depositor.
+ * @param token The token of the slot.
+ * @param slotIndex The slot index to modify.
+ * @param newDepositor The new depositor address.
+ */
+function changeDepositor(
+    address token,
+    uint256 slotIndex,
+    address newDepositor
+) external nonReentrant {
+    require(newDepositor != address(0), "Invalid new depositor");
+    
+    Slot storage slot = liquiditySlots[token][slotIndex];
+    require(slot.depositor == msg.sender, "Not slot owner");
+    require(slot.allocation > 0, "Invalid slot");
+    
+    address oldDepositor = slot.depositor;
+    
+    // Update slot depositor and recipient
+    slot.depositor = newDepositor;
+    slot.recipient = newDepositor;
+    
+    // Update user indices - remove from old depositor
+    uint256[] storage oldIndices = userSlotIndices[token][oldDepositor];
+    for (uint256 i = 0; i < oldIndices.length; i++) {
+        if (oldIndices[i] == slotIndex) {
+            oldIndices[i] = oldIndices[oldIndices.length - 1];
+            oldIndices.pop();
+            break;
+        }
+    }
+    
+    // Add to new depositor
+    userSlotIndices[token][newDepositor].push(slotIndex);
+    
+    emit SlotDepositorChanged(token, slotIndex, oldDepositor, newDepositor);
+}
+
+    // --- Core: Settlement (Payouts) ---
+
     struct SettlementUpdate {
         address recipient;
         address token;
+        address pairedToken; // (New 0.0.4)
         uint256 amount;
     }
 
     function ssUpdate(SettlementUpdate[] calldata updates) external {
-        require(routers[msg.sender], "Router only"); 
-
+        require(routers[msg.sender], "Router only");
         for (uint256 i = 0; i < updates.length; i++) {
             payoutIdCounter++;
             uint256 id = payoutIdCounter;
@@ -221,6 +372,7 @@ function setFeeTemplateAddress(address _feeTemplateAddress) external onlyOwner {
             p.id = id;
             p.recipient = updates[i].recipient;
             p.token = updates[i].token;
+            p.pairedToken = updates[i].pairedToken; // Set the bucket
             p.amountOwed = updates[i].amount;
             p.timestamp = block.timestamp;
 
@@ -230,24 +382,18 @@ function setFeeTemplateAddress(address _feeTemplateAddress) external onlyOwner {
         }
     }
     
-    // --- NEW (0.0.2): Public Payout Claim ---
     function processPayout(uint256 payoutId, uint256 amount) external nonReentrant {
         Payout storage p = payouts[payoutId];
         require(p.amountOwed > 0, "Payout fully claimed or invalid");
         require(amount > 0, "Zero amount");
         require(amount <= p.amountOwed, "Amount exceeds debt");
 
-        // Check contract balance
-        uint256 available;
-        if (p.token == address(0)) {
-            available = address(this).balance;
-        } else {
-            available = IERC20(p.token).balanceOf(address(this));
-        }
-        require(available >= amount, "Insufficient contract liquidity");
+        // (New 0.0.4) Check Pair Liquidity Bucket instead of global balance
+        require(pairLiquidity[p.token][p.pairedToken] >= amount, "Insufficient pair liquidity");
 
         // Update State
         p.amountOwed -= amount;
+        pairLiquidity[p.token][p.pairedToken] -= amount;
 
         // Transfer
         if (p.token == address(0)) {
@@ -259,153 +405,34 @@ function setFeeTemplateAddress(address _feeTemplateAddress) external onlyOwner {
 
         emit PayoutClaimed(payoutId, p.recipient, amount, p.amountOwed);
     }
-    
-    // --- NEW (0.0.2): Payout Views ---
-    function getPayout(uint256 id) external view returns (Payout memory) {
-        return payouts[id];
+
+    // --- Utility: Helpers ---
+
+    function normalize(uint256 amount, uint8 decimals) internal pure returns (uint256) {
+        if (decimals == 18) return amount;
+        if (decimals < 18) return amount * 10 ** (18 - decimals);
+        return amount / 10 ** (decimals - 18);
     }
 
-    function getUserPayoutIds(address user) external view returns (uint256[] memory) {
-        return userPayoutIds[user];
-    }
-    
-    // -- (0.0.2) --
+    // --- Views ---
 
-    function transactToken(address depositor, address token, uint256 amount, address recipient) external {
-        require(routers[msg.sender], "Router only");
-        require(token != address(0), "Use transactNative for ETH");
-        require(amount > 0, "Zero amount");
-        require(recipient != address(0), "Invalid recipient");
-        
-        uint8 decimals = IERC20(token).decimals();
-        require(decimals > 0, "Invalid token decimals");
-        
-        uint256 normalizedAmount = normalize(amount, decimals);
-        require(liquidityDetail[token].liquid >= normalizedAmount, "Insufficient liquidity");
-        
-        try IERC20(token).transfer(recipient, amount) returns (bool) {
-        } catch (bytes memory reason) {
-            emit TransactFailed(depositor, token, amount, "Token transfer failed");
-            revert("Token transfer failed");
-        }
-    }
-
-    function transactNative(address depositor, uint256 amount, address recipient) external {
-        require(routers[msg.sender], "Router only");
-        require(amount > 0, "Zero amount");
-        require(recipient != address(0), "Invalid recipient");
-        
-        uint256 normalizedAmount = normalize(amount, 18);
-        require(liquidityDetail[address(0)].liquid >= normalizedAmount, "Insufficient liquidity");
-        
-        (bool success, ) = recipient.call{value: amount}("");
-        if (!success) {
-            emit TransactFailed(depositor, address(0), amount, "ETH transfer failed");
-            revert("ETH transfer failed");
-        }
-    }
-
-    // Replace the ccUpdate function (around line 218) with this modified version:
-function ccUpdate(address depositor, UpdateType[] memory updates) external {
-    require(routers[msg.sender], "Router only");
-    
-    for (uint256 i = 0; i < updates.length; i++) {
-        UpdateType memory u = updates[i];
-        LiquidityDetails storage details = liquidityDetail[u.token];
-        
-        if (u.updateType == 0) {
-            // Updates liquid directly
-            details.liquid = u.value;
-            emit LiquidityUpdated(u.token, details.liquid);
-        } else if (u.updateType == 1) {
-            // Fee add - retained for consistent numbering but does nothing
-            // Fees are now handled by fee template
-        } else if (u.updateType == 2) {
-    // Updates slot allocation
-    Slot storage slot = liquiditySlots[u.token][u.index];
-    
-    if (slot.depositor == address(0) && u.addr != address(0)) {
-        // Initialize new slot - no longer set dFeesAcc here
-        slot.token = u.token;
-        slot.depositor = u.addr;
-        slot.recipient = u.recipient != address(0) ? u.recipient : u.addr;
-        slot.timestamp = block.timestamp;
-        activeSlots[u.token].push(u.index);
-        userSlotIndices[u.token][u.addr].push(u.index);
-    } else if (u.addr == address(0)) {
-        // Remove slot
-        address oldDepositor = slot.depositor;
-        slot.depositor = address(0);
-        slot.allocation = 0;
-        
-        uint256[] storage userIndices = userSlotIndices[u.token][oldDepositor];
-        for (uint256 j = 0; j < userIndices.length; j++) {
-            if (userIndices[j] == u.index) {
-                userIndices[j] = userIndices[userIndices.length - 1];
-                userIndices.pop();
-                break;
-            }
-        }
-    }
-    
-    uint256 oldAllocation = slot.allocation;
-    slot.allocation = u.value;
-    
-    if (oldAllocation > u.value) {
-        details.liquid -= (oldAllocation - u.value);
-    } else {
-        details.liquid += (u.value - oldAllocation);
-    }
-    
-    emit LiquidityUpdated(u.token, details.liquid);
-    globalizeUpdate(depositor, u.token, u.value);
-        } else if (u.updateType == 3) {
-            // Updates slot depositor without modifying allocation
-            Slot storage slot = liquiditySlots[u.token][u.index];
-            require(slot.depositor == depositor, "Depositor not slot owner");
-            require(u.addr != address(0), "Invalid new depositor");
-            require(slot.allocation > 0, "Invalid slot allocation");
-            
-            address oldDepositor = slot.depositor;
-            slot.depositor = u.addr;
-            
-            uint256[] storage oldUserIndices = userSlotIndices[u.token][oldDepositor];
-            for (uint256 j = 0; j < oldUserIndices.length; j++) {
-                if (oldUserIndices[j] == u.index) {
-                    oldUserIndices[j] = oldUserIndices[oldUserIndices.length - 1];
-                    oldUserIndices.pop();
-                    break;
-                }
-            }
-            
-            userSlotIndices[u.token][u.addr].push(u.index);
-            emit SlotDepositorChanged(u.token, u.index, oldDepositor, u.addr);
-        } 
-else if (u.updateType == 4) {
-    // DEPRECATED: dFeesAcc updates now handled by fee template
-    // Retained for consistent numbering but does nothing
-        } else if (u.updateType == 5) {
-            // Fee subtract - retained for consistent numbering but does nothing
-            // Fees are now handled by fee template
-        } else {
-            revert("Invalid update type");
-        }
-    }
-}
-
-    // View functions
     function routerAddressesView() external view returns (address[] memory) {
         return routerAddresses;
     }
 
     function liquidityAmounts(address token) external view returns (uint256 amount) {
-        return liquidityDetail[token].liquid;
+        if (token == address(0)) return address(this).balance;
+        return IERC20(token).balanceOf(address(this));
+    }
+    
+    function liquidityDetailsView(address token) external view returns (uint256 liquid) {
+        if (token == address(0)) return address(this).balance;
+        return IERC20(token).balanceOf(address(this));
     }
 
-    // (0.0.1) now only returns liquids
-function liquidityDetailsView(address token) external view returns (uint256 liquid) {
-    return liquidityDetail[token].liquid;
-}
+    function getPairLiquidity(address token, address pairedToken) external view returns (uint256) {
+        return pairLiquidity[token][pairedToken];
+    }
 
     function userSlotIndicesView(address token, address user) external view returns (uint256[] memory indices) {
         return userSlotIndices[token][user];
@@ -419,6 +446,13 @@ function liquidityDetailsView(address token) external view returns (uint256 liqu
         return liquiditySlots[token][index];
     }
     
-    // Allows contract to receive ETH
+    function getPayout(uint256 id) external view returns (Payout memory) {
+        return payouts[id];
+    }
+
+    function getUserPayoutIds(address user) external view returns (uint256[] memory) {
+        return userPayoutIds[user];
+    }
+    
     receive() external payable {}
 }

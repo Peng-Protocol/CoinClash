@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.0.1
+// Version: 0.0.3
+// - v0.0.3: Refactored claimFees into _getClaimContext, _calculateFeeShare, _executeClaim.
+// - 0.0.2: Added direct feeClaiming, streamlined dFeesAcc update logic. 
 // Fee template for managing liquidity pair fees independently from liquidity template
 
-import "../imports/Ownable.sol";
+import "../imports/ReentrancyGuard.sol"; //Imports and inherits ownable 
 
 interface IERC20 {
     function decimals() external view returns (uint8);
@@ -13,7 +15,21 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
-contract TypeCFees is Ownable {
+interface ILiquidityTemplate {
+    struct Slot {
+        address token;
+        address pairedToken;
+        address depositor;
+        address recipient;
+        uint256 allocation;
+        uint256 timestamp;
+    }
+    
+    function getSlotView(address token, uint256 index) external view returns (Slot memory slot);
+    function getPairLiquidity(address token, address pairedToken) external view returns (uint256);
+}
+
+contract TypeCFees is ReentrancyGuard  {
 	mapping(address router => bool isRouter) public routers;
     address[] private routerAddresses;
     // Per-token pair fee tracking: tokenA => tokenB => FeeDetails
@@ -37,6 +53,7 @@ mapping(address => mapping(address => mapping(address => mapping(uint256 => uint
     event RouterAdded(address indexed router);
     event RouterRemoved(address indexed router);
 event DepositorFeesAccUpdated(address indexed tokenA, address indexed tokenB, address indexed depositor, uint256 slotIndex, uint256 dFeesAcc);
+event FeeClaimed(address indexed token0, address indexed token1, address indexed depositor, uint256 slotIndex, uint256 amount);
     
         // Adds a router address, restricted to owner
     function addRouter(address router) external onlyOwner {
@@ -78,9 +95,9 @@ event DepositorFeesAccUpdated(address indexed tokenA, address indexed tokenB, ad
         if (decimals < 18) return amount / 10 ** (18 - decimals);
         return amount * 10 ** (decimals - 18);
     }
-    
+
 /**
- * @notice Initialize dFeesAcc for a new depositor slot. Restricted to owner (router).
+ * @notice Initialize dFeesAcc for a new depositor slot. Restricted to routers.
  * @dev Called when a new liquidity slot is created
  * @param tokenA First token in the pair
  * @param tokenB Second token in the pair
@@ -92,37 +109,13 @@ function initializeDepositorFeesAcc(
     address tokenB, 
     address depositor, 
     uint256 slotIndex
-) external onlyOwner {
+) external {
+    require(routers[msg.sender], "Router only");
     require(depositor != address(0), "Invalid depositor");
     
     (address token0, address token1) = getCanonicalPair(tokenA, tokenB);
     
     // Set dFeesAcc to current feesAcc for this pair
-    uint256 currentFeesAcc = pairFees[token0][token1].feesAcc;
-    depositorFeesAcc[token0][token1][depositor][slotIndex] = currentFeesAcc;
-    
-    emit DepositorFeesAccUpdated(token0, token1, depositor, slotIndex, currentFeesAcc);
-}
-
-/**
- * @notice Update dFeesAcc for a depositor after claiming fees. Restricted to owner (router).
- * @dev Called after successful fee claim to update the snapshot
- * @param tokenA First token in the pair
- * @param tokenB Second token in the pair
- * @param depositor Depositor address
- * @param slotIndex Slot index in liquidity template
- */
-function updateDepositorFeesAcc(
-    address tokenA, 
-    address tokenB, 
-    address depositor, 
-    uint256 slotIndex
-) external onlyOwner {
-    require(depositor != address(0), "Invalid depositor");
-    
-    (address token0, address token1) = getCanonicalPair(tokenA, tokenB);
-    
-    // Update to current feesAcc for this pair
     uint256 currentFeesAcc = pairFees[token0][token1].feesAcc;
     depositorFeesAcc[token0][token1][depositor][slotIndex] = currentFeesAcc;
     
@@ -207,51 +200,92 @@ function getDepositorFeesAcc(
         }
     }
 
-    /**
-     * @notice Withdraws fees from a token pair. Restricted to routers.
-     * @param tokenA First token in the pair
-     * @param tokenB Second token in the pair
-     * @param amount Amount to withdraw (in normalized 18 decimal format)
-     * @param recipient Address to receive the fees
-     */
-    function withdrawFees(address tokenA, address tokenB, uint256 amount, address recipient) external {
-     require(routers[msg.sender], "Router only");
-     require(amount > 0, "Zero amount");
-        require(recipient != address(0), "Invalid recipient");
-        
-        // Get canonical pair ordering
-        (address token0, address token1) = getCanonicalPair(tokenA, tokenB);
-        
-        FeeDetails storage details = pairFees[token0][token1];
-        require(details.fees >= amount, "Insufficient fees");
-        
-        details.fees -= amount;
-        
-        // Handle ETH withdrawal
-        if (token0 == address(0)) {
-            uint256 ethAmount = denormalize(amount, 18);
-            (bool success, ) = recipient.call{value: ethAmount}("");
-            require(success, "ETH transfer failed");
-        } else {
-            // Handle ERC20 withdrawal
-            uint8 decimals = IERC20(token0).decimals();
-            uint256 tokenAmount = denormalize(amount, decimals);
-            require(IERC20(token0).transfer(recipient, tokenAmount), "Token transfer failed");
-        }
-        
-        emit FeesWithdrawn(token0, token1, recipient, amount);
+// --- Updated Internal Helpers for claimFees ---
+
+function _getClaimContext(
+    address liquidityAddress,
+    address token,
+    uint256 index
+) internal view returns (address token0, address token1, address depositor, uint256 allocation) {
+    ILiquidityTemplate.Slot memory slot = ILiquidityTemplate(liquidityAddress).getSlotView(token, index);
+    require(slot.depositor == msg.sender, "Not slot owner");
+    require(slot.allocation > 0, "No allocation");
+
+    // Ensure we use the canonical pair ordering used in this contract's mapping
+    (token0, token1) = getCanonicalPair(slot.token, slot.pairedToken);
+    
+    return (token0, token1, slot.depositor, slot.allocation);
+}
+
+function _calculateFeeShare(
+    address token0,
+    address token1,
+    address depositor,
+    uint256 slotIndex,
+    uint256 allocation,
+    address liquidityAddress
+) internal view returns (uint256 feeShare, uint256 currentFeesAcc) {
+    // We need the total liquidity for THIS specific pair bucket from the template
+    uint256 poolLiquidity = ILiquidityTemplate(liquidityAddress).getPairLiquidity(token0, token1);
+    require(poolLiquidity > 0, "Pool has no liquidity");
+
+    FeeDetails storage details = pairFees[token0][token1];
+    currentFeesAcc = details.feesAcc;
+    uint256 lastFeesAcc = depositorFeesAcc[token0][token1][depositor][slotIndex];
+
+    if (currentFeesAcc <= lastFeesAcc) return (0, currentFeesAcc);
+
+    // Standard fee sharing logic: (currentAcc - lastAcc) * userAllocation / totalPool
+    uint256 diff = currentFeesAcc - lastFeesAcc;
+    feeShare = (diff * allocation) / poolLiquidity;
+
+    return (feeShare, currentFeesAcc);
+}
+
+function _executeClaim(
+    address token0,
+    address token1,
+    address depositor,
+    uint256 slotIndex,
+    uint256 feeShare,
+    uint256 currentFeesAcc
+) internal {
+    if (feeShare == 0) return;
+
+    // 1. Update the snapshot BEFORE the transfer (reentrancy/double-claim protection)
+    depositorFeesAcc[token0][token1][depositor][slotIndex] = currentFeesAcc;
+    
+    // 2. Deduct from the pool's claimable fee balance
+    require(pairFees[token0][token1].fees >= feeShare, "Insufficient fee balance");
+    pairFees[token0][token1].fees -= feeShare;
+
+    // 3. Transfer the fees (Handling Native ETH vs ERC20)
+    if (token0 == address(0)) {
+        (bool success, ) = payable(depositor).call{value: feeShare}("");
+        require(success, "ETH fee transfer failed");
+    } else {
+        require(IERC20(token0).transfer(depositor, feeShare), "Token fee transfer failed");
     }
 
-    /**
-     * @notice Manually update token-level feesAcc. Restricted to owner.
-     * @dev Used by liquidity template to sync feesAcc when needed
-     * @param token Token address to update
-     * @param feesAcc New feesAcc value
-     */
-    function updateTokenFeesAcc(address token, uint256 feesAcc) external onlyOwner {
-        tokenFeesAcc[token] = feesAcc;
-        emit TokenFeesAccUpdated(token, feesAcc);
-    }
+    emit FeeClaimed(token0, token1, depositor, slotIndex, feeShare);
+}
+
+// --- Main Entry Point ---
+
+function claimFees(
+    address liquidityAddress,
+    address token,
+    uint256 index
+) external nonReentrant {
+    // Part 1: Gather data
+    (address t0, address t1, address dep, uint256 alloc) = _getClaimContext(liquidityAddress, token, index);
+    
+    // Part 2: Math
+    (uint256 share, uint256 acc) = _calculateFeeShare(t0, t1, dep, index, alloc, liquidityAddress);
+    
+    // Part 3: State & Transfer
+    _executeClaim(t0, t1, dep, index, share, acc);
+}
 
     // View functions
     
