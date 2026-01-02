@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.4 (Base Token Cross Model - Fixed Params)
+// File Version: 0.0.5
+// - 0.0.5 (02/01/2025): Added per pair payout integration, explicit pair token in addFees, ccDonate instead of raw transfer. 
+// - 0.0.4 (Base Token Cross Model - Fixed Params)
 // NOTICE: Requires via-IR to compile!
 
 import "./imports/ReentrancyGuard.sol";
@@ -21,9 +23,11 @@ interface ICCLiquidity {
     struct SettlementUpdate {
         address recipient;
         address token;
+        address pairedToken; // Added
         uint256 amount;
     }
     function ssUpdate(SettlementUpdate[] calldata updates) external;
+    function ccDonate(address token, address pairedToken, uint256 amount) external payable;
 }
 
 interface ICCFeeTemplate {
@@ -150,25 +154,27 @@ contract CCBaseCrossDriver is ReentrancyGuard {
         require(params.initialMargin > 0, "Zero margin");
         require(params.leverageMultiplier >= 2 && params.leverageMultiplier <= 100, "Invalid leverage");
 
-        // Calculate Fee based on Initial Margin (Leverage is applied to this part only)
+        // Calculate Fee
         uint256 feeRatio = ((params.leverageMultiplier - 1) * 1e18) / 100;
         uint256 feeAmount = (params.initialMargin * feeRatio) / 1e18;
-        
-        // Total Transfer = Initial + Excess
-        // Note: The user pays the fee out of the Initial Margin portion, 
         
         uint256 totalTransfer = params.initialMargin + params.excessMargin;
         _transferIn(baseToken, msg.sender, totalTransfer);
         
         if (feeAmount > 0) {
             IERC20(baseToken).approve(feeTemplate, feeAmount);
-            ICCFeeTemplate(feeTemplate).addFees(baseToken, address(0), feeAmount);
+            
+            // Determine paired token from params.pair for correct fee bucketing
+            // Assumes baseToken is part of params.pair. If not, this might need fallback logic.
+            address t0 = IUniswapV2Pair(params.pair).token0();
+            address pairedToken = (t0 == baseToken) 
+                ? IUniswapV2Pair(params.pair).token1() 
+                : t0;
+
+            ICCFeeTemplate(feeTemplate).addFees(baseToken, pairedToken, feeAmount);
         }
 
-        // Taxed Margin is what's left of Initial after fees
         taxedMargin = params.initialMargin - feeAmount;
-        
-        // Excess Margin is untouched
         excessMargin = params.excessMargin;
     }
 
@@ -292,32 +298,36 @@ contract CCBaseCrossDriver is ReentrancyGuard {
 
     function _internalClose(Position storage pos, bool isLong) internal {
         require(pos.status == 2, "Not active");
-        
         // 1. Calculate Payout in Position Token
         (uint256 payoutPosToken, int256 netGains) = _calculateCloseValues(pos, isLong);
-        
         // 2. Convert Payout to Base Token
         address posToken = isLong 
             ? IUniswapV2Pair(pos.pair).token0() 
             : IUniswapV2Pair(pos.pair).token1();
+        address pairedToken = isLong 
+            ? IUniswapV2Pair(pos.pair).token1() 
+            : IUniswapV2Pair(pos.pair).token0();
             
         uint256 payoutBase = 0;
         if (payoutPosToken > 0) {
-            uint256 rate = _getConversionRate(posToken, baseToken); 
+            uint256 rate = _getConversionRate(posToken, baseToken);
             payoutBase = (payoutPosToken * rate) / 1e18;
         }
 
         // 3. Finalize
         pos.status = 0;
-        
-        // Send the locked PosToken margin to Liquidity Template
+        // Send the locked PosToken margin to Liquidity Template via Donate
         if (pos.taxedMargin > 0) {
-             IERC20(posToken).transfer(liquidityTemplate, pos.taxedMargin);
+             IERC20(posToken).approve(liquidityTemplate, pos.taxedMargin);
+             ICCLiquidity(liquidityTemplate).ccDonate(posToken, pairedToken, pos.taxedMargin);
         }
 
         // User receives Base Token via Settlement
         if (payoutBase > 0) {
-            _executePayout(pos.maker, payoutBase);
+            // Must specify pos.pair so settlement knows which bucket (Base/PosToken) to check?
+            // Note: Base payout usually comes from the BaseToken bucket. 
+            // We pass pos.pair assuming BaseToken is paired there.
+            _executePayout(pos.maker, payoutBase, pos.pair);
         }
         
         emit PositionClosed(pos.id, isLong ? 0 : 1, payoutBase, netGains);
@@ -362,10 +372,16 @@ contract CCBaseCrossDriver is ReentrancyGuard {
         }
     }
 
-    function _executePayout(address maker, uint256 amountBase) private {
+    function _executePayout(address maker, uint256 amountBase, address pair) private {
         ICCLiquidity.SettlementUpdate[] memory updates = new ICCLiquidity.SettlementUpdate[](1);
         updates[0].recipient = maker;
         updates[0].token = baseToken; 
+        
+        // Determine paired token for the payout bucket
+        address t0 = IUniswapV2Pair(pair).token0();
+        address pairedToken = (t0 == baseToken) ? IUniswapV2Pair(pair).token1() : t0;
+        updates[0].pairedToken = pairedToken;
+
         updates[0].amount = amountBase;
         
         ICCLiquidity(liquidityTemplate).ssUpdate(updates);
@@ -429,35 +445,62 @@ contract CCBaseCrossDriver is ReentrancyGuard {
     }
 
     function _liquidateAccount(address maker) internal {
-        // 1. Wipe Global Base Margin
-        uint256 wipedBase = userBaseMargin[maker];
-        if (wipedBase > 0) {
-            userBaseMargin[maker] = 0;
-            IERC20(baseToken).transfer(liquidityTemplate, wipedBase);
-        }
+        // Track a pair to attribute the global base margin donation to
+        address donationPairToken = address(0);
 
-        // 2. Close All Longs
+        // 1. Close All Longs
         uint256[] storage lIds = userLongIds[maker];
         for(uint i=0; i<lIds.length; i++) {
             Position storage p = longPositions[lIds[i]];
             if (p.status == 2) {
                 p.status = 0;
                 address pToken = IUniswapV2Pair(p.pair).token0();
-                if (p.taxedMargin > 0) IERC20(pToken).transfer(liquidityTemplate, p.taxedMargin);
-                emit PositionClosed(p.id, 0, 0, -int256(int(p.initialMargin))); 
+                address paired = IUniswapV2Pair(p.pair).token1();
+                
+                // Capture a paired token for base donation if needed
+                if (donationPairToken == address(0)) {
+                    donationPairToken = (IUniswapV2Pair(p.pair).token0() == baseToken) ? paired : pToken;
+                }
+
+                if (p.taxedMargin > 0) {
+                    IERC20(pToken).approve(liquidityTemplate, p.taxedMargin);
+                    ICCLiquidity(liquidityTemplate).ccDonate(pToken, paired, p.taxedMargin);
+                }
+                emit PositionClosed(p.id, 0, 0, -int256(int(p.initialMargin)));
             }
         }
 
-        // 3. Close All Shorts
+        // 2. Close All Shorts (Similar logic)
         uint256[] storage sIds = userShortIds[maker];
         for(uint i=0; i<sIds.length; i++) {
             Position storage p = shortPositions[sIds[i]];
             if (p.status == 2) {
                 p.status = 0;
                 address pToken = IUniswapV2Pair(p.pair).token1();
-                if (p.taxedMargin > 0) IERC20(pToken).transfer(liquidityTemplate, p.taxedMargin);
+                address paired = IUniswapV2Pair(p.pair).token0();
+
+                if (donationPairToken == address(0)) {
+                    donationPairToken = (IUniswapV2Pair(p.pair).token0() == baseToken) ? paired : pToken;
+                }
+
+                if (p.taxedMargin > 0) {
+                    IERC20(pToken).approve(liquidityTemplate, p.taxedMargin);
+                    ICCLiquidity(liquidityTemplate).ccDonate(pToken, paired, p.taxedMargin);
+                }
                 emit PositionClosed(p.id, 1, 0, -int256(int(p.initialMargin)));
             }
+        }
+
+        // 3. Wipe Global Base Margin
+        uint256 wipedBase = userBaseMargin[maker];
+        if (wipedBase > 0) {
+            userBaseMargin[maker] = 0;
+            IERC20(baseToken).approve(liquidityTemplate, wipedBase);
+            
+            // If we found a pair from positions, use it. Otherwise, assume baseToken is isolated 
+            // or we cannot donate correctly. Fallback: pairedToken = address(0) (if allowed) or burn.
+            // Using address(0) as paired token for now if no positions existed (rare edge case).
+            ICCLiquidity(liquidityTemplate).ccDonate(baseToken, donationPairToken, wipedBase);
         }
 
         emit AccountLiquidated(maker, wipedBase);

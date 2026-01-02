@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.0.3
+// Version: 0.0.5
+// - 0.0.5: Ensured fee acc and fee claims use opposite tokens. Fixed denormalization on fee claims. 
+// - 0.0.4: Fixed incorrect canonical pair function by fetching from Uniswap. 
 // - v0.0.3: Refactored claimFees into _getClaimContext, _calculateFeeShare, _executeClaim.
 // - 0.0.2: Added direct feeClaiming, streamlined dFeesAcc update logic. 
 // Fee template for managing liquidity pair fees independently from liquidity template
@@ -27,6 +29,15 @@ interface ILiquidityTemplate {
     
     function getSlotView(address token, uint256 index) external view returns (Slot memory slot);
     function getPairLiquidity(address token, address pairedToken) external view returns (uint256);
+}
+
+interface IUniswapV2Pair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+}
+
+interface IUniswapV2Factory {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
 }
 
 contract TypeCFees is ReentrancyGuard  {
@@ -99,8 +110,9 @@ event FeeClaimed(address indexed token0, address indexed token1, address indexed
 /**
  * @notice Initialize dFeesAcc for a new depositor slot. Restricted to routers.
  * @dev Called when a new liquidity slot is created
- * @param tokenA First token in the pair
- * @param tokenB Second token in the pair
+ *      Fees are tracked for the OPPOSITE token (pairedToken, not the deposited token)
+ * @param tokenA First token in the pair (deposited token)
+ * @param tokenB Second token in the pair (paired token - this is what fees are paid in)
  * @param depositor Depositor address
  * @param slotIndex Slot index in liquidity template
  */
@@ -113,6 +125,7 @@ function initializeDepositorFeesAcc(
     require(routers[msg.sender], "Router only");
     require(depositor != address(0), "Invalid depositor");
     
+    // Get canonical ordering - but we want fees from the OPPOSITE token (tokenB)
     (address token0, address token1) = getCanonicalPair(tokenA, tokenB);
     
     // Set dFeesAcc to current feesAcc for this pair
@@ -141,10 +154,18 @@ function getDepositorFeesAcc(
 }
 
     // Returns canonical ordering of token pair
-    function getCanonicalPair(address tokenA, address tokenB) internal pure returns (address token0, address token1) {
-        require(tokenA != tokenB, "Identical tokens");
-        (token0, token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
-    }
+    function getCanonicalPair(address tokenA, address tokenB) internal view returns (address token0, address token1) {
+    require(tokenA != tokenB, "Identical tokens");
+    require(uniswapV2Factory != address(0), "Factory not set");
+    
+    // Get the actual Uniswap pair
+    address pair = IUniswapV2Factory(uniswapV2Factory).getPair(tokenA, tokenB);
+    require(pair != address(0), "Pair does not exist");
+    
+    // Get the canonical ordering from the pair itself
+    token0 = IUniswapV2Pair(pair).token0();
+    token1 = IUniswapV2Pair(pair).token1();
+}
 
     /**
      * @notice Adds fees to a token pair. Anyone can call this function.
@@ -206,15 +227,19 @@ function _getClaimContext(
     address liquidityAddress,
     address token,
     uint256 index
-) internal view returns (address token0, address token1, address depositor, uint256 allocation) {
+) internal view returns (address token0, address token1, address depositor, uint256 allocation, address feeToken) {
     ILiquidityTemplate.Slot memory slot = ILiquidityTemplate(liquidityAddress).getSlotView(token, index);
     require(slot.depositor == msg.sender, "Not slot owner");
     require(slot.allocation > 0, "No allocation");
 
-    // Ensure we use the canonical pair ordering used in this contract's mapping
+    // Ensure we use the canonical pair ordering 
     (token0, token1) = getCanonicalPair(slot.token, slot.pairedToken);
     
-    return (token0, token1, slot.depositor, slot.allocation);
+    // Determine which token to pay fees in (the OPPOSITE of what was deposited)
+    // If slot.token matches token0, fees should be paid in token1, and vice versa
+    feeToken = (slot.token == token0) ? token1 : token0;
+    
+    return (token0, token1, slot.depositor, slot.allocation, feeToken);
 }
 
 function _calculateFeeShare(
@@ -248,7 +273,8 @@ function _executeClaim(
     address depositor,
     uint256 slotIndex,
     uint256 feeShare,
-    uint256 currentFeesAcc
+    uint256 currentFeesAcc,
+    address feeToken
 ) internal {
     if (feeShare == 0) return;
 
@@ -259,12 +285,18 @@ function _executeClaim(
     require(pairFees[token0][token1].fees >= feeShare, "Insufficient fee balance");
     pairFees[token0][token1].fees -= feeShare;
 
-    // 3. Transfer the fees (Handling Native ETH vs ERC20)
-    if (token0 == address(0)) {
-        (bool success, ) = payable(depositor).call{value: feeShare}("");
+    // 3. Denormalize feeShare to the actual token decimals before transfer
+    uint256 actualAmount;
+    if (feeToken == address(0)) {
+        // ETH is already 18 decimals, no denormalization needed
+        actualAmount = feeShare;
+        (bool success, ) = payable(depositor).call{value: actualAmount}("");
         require(success, "ETH fee transfer failed");
     } else {
-        require(IERC20(token0).transfer(depositor, feeShare), "Token fee transfer failed");
+        // Get token decimals and denormalize
+        uint8 decimals = IERC20(feeToken).decimals();
+        actualAmount = denormalize(feeShare, decimals);
+        require(IERC20(feeToken).transfer(depositor, actualAmount), "Token fee transfer failed");
     }
 
     emit FeeClaimed(token0, token1, depositor, slotIndex, feeShare);
@@ -277,14 +309,14 @@ function claimFees(
     address token,
     uint256 index
 ) external nonReentrant {
-    // Part 1: Gather data
-    (address t0, address t1, address dep, uint256 alloc) = _getClaimContext(liquidityAddress, token, index);
+    // Part 1: Gather data (now includes feeToken)
+    (address t0, address t1, address dep, uint256 alloc, address feeToken) = _getClaimContext(liquidityAddress, token, index);
     
     // Part 2: Math
     (uint256 share, uint256 acc) = _calculateFeeShare(t0, t1, dep, index, alloc, liquidityAddress);
     
-    // Part 3: State & Transfer
-    _executeClaim(t0, t1, dep, index, share, acc);
+    // Part 3: State & Transfer (now uses feeToken)
+    _executeClaim(t0, t1, dep, index, share, acc, feeToken);
 }
 
     // View functions

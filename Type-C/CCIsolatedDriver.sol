@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.3
+// File Version: 0.0.4
+// - 0.0.4 (02/01/2025): Added per pair payout integration, explicit pair token in addFees, ccDonate instead of raw transfer. 
 // - 0.0.3 (31/12/2025): Added excessMargin initialization. 
 // - 0.0.2 (30/12/2025): Refactored to address stack issues. 
 
@@ -22,10 +23,13 @@ interface ICCLiquidity {
     struct SettlementUpdate {
         address recipient;
         address token;
+        address pairedToken; // Added pairedToken
         uint256 amount;
     }
     // Replaces createPayout with router-privileged update
     function ssUpdate(SettlementUpdate[] calldata updates) external;
+    // Added ccDonate for returning margin/liquidation funds
+    function ccDonate(address token, address pairedToken, uint256 amount) external payable;
 }
 
 interface ICCFeeTemplate {
@@ -156,33 +160,40 @@ contract CCIsolatedDriver is ReentrancyGuard {
     // Phase 1: Handles transfers and fee calculations. Returns only what's needed for storage.
     
     function _processEntryFunding(EntryParams calldata params, bool isLong) private returns (uint256 taxedMargin, uint256 leverageAmount) {
-    require(params.initialMargin > 0, "Zero margin");
-    require(params.leverageMultiplier >= 2 && params.leverageMultiplier <= 100, "Invalid leverage");
+        require(params.initialMargin > 0, "Zero margin");
+        require(params.leverageMultiplier >= 2 && params.leverageMultiplier <= 100, "Invalid leverage");
 
-    address token = isLong ? IUniswapV2Pair(params.pair).token0() : IUniswapV2Pair(params.pair).token1();
-    
-    // (0.0.3) Transfer total margin (initial + excess)
-    uint256 totalToTransfer = params.initialMargin + params.excessMargin;
-    uint256 received = _transferIn(token, msg.sender, totalToTransfer);
-    
-    // Calculate actual amounts received (accounting for transfer taxes)
-    uint256 initialReceived = params.excessMargin == 0 
-        ? received 
-        : (received * params.initialMargin) / totalToTransfer;
-    uint256 excessReceived = received - initialReceived;
-    
-    // Fee only applies to initial margin
-    uint256 feeRatio = ((params.leverageMultiplier - 1) * 1e18) / 100;
-    uint256 feeAmount = (initialReceived * feeRatio) / 1e18;
-    
-    if (feeAmount > 0) {
-        IERC20(token).approve(feeTemplate, feeAmount);
-        if (isLong) ICCFeeTemplate(feeTemplate).addFees(token, address(0), feeAmount);
-        else ICCFeeTemplate(feeTemplate).addFees(address(0), token, feeAmount);
+        // Identify Token and PairedToken for Fee Attribution
+        address token0 = IUniswapV2Pair(params.pair).token0();
+        address token1 = IUniswapV2Pair(params.pair).token1();
+        
+        // Long: Margin is Token0 (usually), Paired is Token1
+        // Short: Margin is Token1, Paired is Token0
+        address token = isLong ? token0 : token1;
+        address pairedToken = isLong ? token1 : token0;
+
+        // (0.0.3) Transfer total margin (initial + excess)
+        uint256 totalToTransfer = params.initialMargin + params.excessMargin;
+        uint256 received = _transferIn(token, msg.sender, totalToTransfer);
+        
+        // Calculate actual amounts received (accounting for transfer taxes)
+        uint256 initialReceived = params.excessMargin == 0 
+            ? received 
+            : (received * params.initialMargin) / totalToTransfer;
+        uint256 excessReceived = received - initialReceived;
+        
+        // Fee only applies to initial margin
+        uint256 feeRatio = ((params.leverageMultiplier - 1) * 1e18) / 100;
+        uint256 feeAmount = (initialReceived * feeRatio) / 1e18;
+        
+        if (feeAmount > 0) {
+            IERC20(token).approve(feeTemplate, feeAmount);
+            // Updated (0.0.4): Pass specific pairedToken instead of address(0)
+            ICCFeeTemplate(feeTemplate).addFees(token, pairedToken, feeAmount);
+        }
+
+        return (initialReceived - feeAmount + excessReceived, initialReceived * params.leverageMultiplier);
     }
-
-    return (initialReceived - feeAmount + excessReceived, initialReceived * params.leverageMultiplier);
-}
 
     // Phase 2: Handles ID generation, storage, and execution logic.
     function _finalizeEntry(EntryParams calldata params, bool isLong, uint256 taxedMargin, uint256 leverageAmount) private {
@@ -278,24 +289,27 @@ function _handlePositionExecution(uint256 id, EntryParams calldata params, bool 
     }
 
     function _internalCancel(Position storage pos, bool isLong) internal {
-    require(pos.status != 0, "Already closed/cancelled");
-    pos.status = 0;
+        require(pos.status != 0, "Already closed/cancelled");
+        pos.status = 0;
 
-    address token = isLong ? IUniswapV2Pair(pos.pair).token0() : IUniswapV2Pair(pos.pair).token1();
-    (uint256 refund, uint256 fee) = _getRefundValues(pos);
+        address token0 = IUniswapV2Pair(pos.pair).token0();
+        address token1 = IUniswapV2Pair(pos.pair).token1();
+        address token = isLong ? token0 : token1;
+        address pairedToken = isLong ? token1 : token0;
 
-    if (fee > 0) {
-        IERC20(token).approve(feeTemplate, fee);
-        if (isLong) ICCFeeTemplate(feeTemplate).addFees(token, address(0), fee);
-        else ICCFeeTemplate(feeTemplate).addFees(address(0), token, fee);
+        (uint256 refund, uint256 fee) = _getRefundValues(pos);
+        if (fee > 0) {
+            IERC20(token).approve(feeTemplate, fee);
+            // Updated: Pass specific pairedToken instead of address(0)
+            ICCFeeTemplate(feeTemplate).addFees(token, pairedToken, fee);
+        }
+        
+        if (refund > 0) {
+            IERC20(token).transfer(pos.maker, refund);
+        }
+
+        emit PositionCancelled(pos.id, isLong ? 0 : 1, refund, fee);
     }
-    
-    if (refund > 0) {
-        IERC20(token).transfer(pos.maker, refund);
-    }
-
-    emit PositionCancelled(pos.id, isLong ? 0 : 1, refund, fee);
-}
 
     function _getRefundValues(Position storage pos) private view returns (uint256 refund, uint256 fee) {
         uint256 totalMargin = pos.taxedMargin + pos.excessMargin;
@@ -371,31 +385,36 @@ function _handlePositionExecution(uint256 id, EntryParams calldata params, bool 
 }
 
     function _finalizeClose(Position storage pos, uint256 payout, uint256 pType) internal {
-    pos.status = 0;
+        pos.status = 0;
+        address pair = pos.pair;
+        // Identify the token being returned and its pair for donation
+        address marginToken = pType == 0 ? IUniswapV2Pair(pair).token0() : IUniswapV2Pair(pair).token1();
+        address pairedToken = pType == 0 ? IUniswapV2Pair(pair).token1() : IUniswapV2Pair(pair).token0();
+        
+        uint256 totalToLiq = pos.taxedMargin + pos.excessMargin;
+        if (totalToLiq > 0) {
+            // Updated: Approve and Donate to specific bucket
+            IERC20(marginToken).approve(liquidityTemplate, totalToLiq);
+            ICCLiquidity(liquidityTemplate).ccDonate(marginToken, pairedToken, totalToLiq);
+        }
 
-    address pair = pos.pair;
-    address marginToken = pType == 0 ? IUniswapV2Pair(pair).token0() : IUniswapV2Pair(pair).token1();
-    
-    uint256 totalToLiq = pos.taxedMargin + pos.excessMargin;
-    if (totalToLiq > 0) {
-        IERC20(marginToken).transfer(liquidityTemplate, totalToLiq);
+        if (payout > 0) {
+            _executePayout(pos.maker, pair, payout, pType);
+        }
     }
-
-    if (payout > 0) {
-        _executePayout(pos.maker, pair, payout, pType);
-    }
-}
 
 function _executePayout(address maker, address pair, uint256 amount, uint256 pType) private {
-    address payoutToken = pType == 0 ? IUniswapV2Pair(pair).token1() : IUniswapV2Pair(pair).token0();
-    
-    ICCLiquidity.SettlementUpdate[] memory updates = new ICCLiquidity.SettlementUpdate[](1);
-    updates[0].recipient = maker;
-    updates[0].token = payoutToken;
-    updates[0].amount = amount;
-    
-    ICCLiquidity(liquidityTemplate).ssUpdate(updates);
-}
+        address payoutToken = pType == 0 ? IUniswapV2Pair(pair).token1() : IUniswapV2Pair(pair).token0();
+        address pairedToken = pType == 0 ? IUniswapV2Pair(pair).token0() : IUniswapV2Pair(pair).token1();
+        
+        ICCLiquidity.SettlementUpdate[] memory updates = new ICCLiquidity.SettlementUpdate[](1);
+        updates[0].recipient = maker;
+        updates[0].token = payoutToken;
+        updates[0].pairedToken = pairedToken; // New: Attribute debt to specific bucket
+        updates[0].amount = amount;
+        
+        ICCLiquidity(liquidityTemplate).ssUpdate(updates);
+    }
 
     // --- Batch Functions ---
 
