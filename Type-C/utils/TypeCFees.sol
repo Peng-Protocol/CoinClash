@@ -43,6 +43,7 @@ interface IUniswapV2Factory {
 contract TypeCFees is ReentrancyGuard  {
 	mapping(address router => bool isRouter) public routers;
     address[] private routerAddresses;
+    address uniswapV2Factory;
     // Per-token pair fee tracking: tokenA => tokenB => FeeDetails
     // Canonical ordering: address(tokenA) < address(tokenB)
     mapping(address => mapping(address => FeeDetails)) private pairFees;
@@ -65,6 +66,7 @@ mapping(address => mapping(address => mapping(address => mapping(uint256 => uint
     event RouterRemoved(address indexed router);
 event DepositorFeesAccUpdated(address indexed tokenA, address indexed tokenB, address indexed depositor, uint256 slotIndex, uint256 dFeesAcc);
 event FeeClaimed(address indexed token0, address indexed token1, address indexed depositor, uint256 slotIndex, uint256 amount);
+event UniswapFactorySet(address indexed factory);
     
         // Adds a router address, restricted to owner
     function addRouter(address router) external onlyOwner {
@@ -92,6 +94,12 @@ event FeeClaimed(address indexed token0, address indexed token1, address indexed
     
     function routerAddressesView() external view returns (address[] memory) {
         return routerAddresses;
+    }
+    
+    function setUniswapV2Factory(address _factory) external onlyOwner {
+        require(_factory != address(0), "Invalid factory address");
+        uniswapV2Factory = _factory;
+        emit UniswapFactorySet(_factory);
     }
     
     
