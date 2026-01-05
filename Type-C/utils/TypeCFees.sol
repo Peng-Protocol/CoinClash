@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.0.5
+// Version: 0.0.6
+// - 0.0.6: Fixed claimFees signature, using liquidity state.v and paired.t param. Adjusted liq.t interface and calls. 
 // - 0.0.5: Ensured fee acc and fee claims use opposite tokens. Fixed denormalization on fee claims. 
 // - 0.0.4: Fixed incorrect canonical pair function by fetching from Uniswap. 
 // - v0.0.3: Refactored claimFees into _getClaimContext, _calculateFeeShare, _executeClaim.
@@ -17,6 +18,7 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
+// 0.0.6
 interface ILiquidityTemplate {
     struct Slot {
         address token;
@@ -27,7 +29,7 @@ interface ILiquidityTemplate {
         uint256 timestamp;
     }
     
-    function getSlotView(address token, uint256 index) external view returns (Slot memory slot);
+    function getSlotView(address token, address pairedToken, uint256 index) external view returns (Slot memory slot);
     function getPairLiquidity(address token, address pairedToken) external view returns (uint256);
 }
 
@@ -44,6 +46,7 @@ contract TypeCFees is ReentrancyGuard  {
 	mapping(address router => bool isRouter) public routers;
     address[] private routerAddresses;
     address uniswapV2Factory;
+address public liquidityTemplate;
     // Per-token pair fee tracking: tokenA => tokenB => FeeDetails
     // Canonical ordering: address(tokenA) < address(tokenB)
     mapping(address => mapping(address => FeeDetails)) private pairFees;
@@ -67,7 +70,7 @@ mapping(address => mapping(address => mapping(address => mapping(uint256 => uint
 event DepositorFeesAccUpdated(address indexed tokenA, address indexed tokenB, address indexed depositor, uint256 slotIndex, uint256 dFeesAcc);
 event FeeClaimed(address indexed token0, address indexed token1, address indexed depositor, uint256 slotIndex, uint256 amount);
 event UniswapFactorySet(address indexed factory);
-    
+event LiquidityTemplateSet(address indexed template);
         // Adds a router address, restricted to owner
     function addRouter(address router) external onlyOwner {
         require(router != address(0), "Invalid router address");
@@ -76,6 +79,7 @@ event UniswapFactorySet(address indexed factory);
         routerAddresses.push(router);
         emit RouterAdded(router);
     }
+    // NOTICE: Liquidity Template must be added as router. 
 
     // Removes a router address, restricted to owner
     function removeRouter(address router) external onlyOwner {
@@ -91,6 +95,12 @@ event UniswapFactorySet(address indexed factory);
         }
         emit RouterRemoved(router);
     }
+
+function setLiquidityTemplate(address _template) external onlyOwner {
+    require(_template != address(0), "Invalid template address");
+    liquidityTemplate = _template;
+    emit LiquidityTemplateSet(_template);
+}
     
     function routerAddressesView() external view returns (address[] memory) {
         return routerAddresses;
@@ -231,12 +241,16 @@ function getDepositorFeesAcc(
 
 // --- Updated Internal Helpers for claimFees ---
 
+// 0.0.6
+// New liquidity template interface for slot data
 function _getClaimContext(
-    address liquidityAddress,
     address token,
+    address pairedToken,
     uint256 index
 ) internal view returns (address token0, address token1, address depositor, uint256 allocation, address feeToken) {
-    ILiquidityTemplate.Slot memory slot = ILiquidityTemplate(liquidityAddress).getSlotView(token, index);
+    require(liquidityTemplate != address(0), "Liquidity template not set");
+    
+    ILiquidityTemplate.Slot memory slot = ILiquidityTemplate(liquidityTemplate).getSlotView(token, pairedToken, index);
     require(slot.depositor == msg.sender, "Not slot owner");
     require(slot.allocation > 0, "No allocation");
 
@@ -244,22 +258,21 @@ function _getClaimContext(
     (token0, token1) = getCanonicalPair(slot.token, slot.pairedToken);
     
     // Determine which token to pay fees in (the OPPOSITE of what was deposited)
-    // If slot.token matches token0, fees should be paid in token1, and vice versa
     feeToken = (slot.token == token0) ? token1 : token0;
     
     return (token0, token1, slot.depositor, slot.allocation, feeToken);
 }
 
+// 0.0.6
 function _calculateFeeShare(
     address token0,
     address token1,
     address depositor,
     uint256 slotIndex,
-    uint256 allocation,
-    address liquidityAddress
+    uint256 allocation
 ) internal view returns (uint256 feeShare, uint256 currentFeesAcc) {
     // We need the total liquidity for THIS specific pair bucket from the template
-    uint256 poolLiquidity = ILiquidityTemplate(liquidityAddress).getPairLiquidity(token0, token1);
+    uint256 poolLiquidity = ILiquidityTemplate(liquidityTemplate).getPairLiquidity(token0, token1);
     require(poolLiquidity > 0, "Pool has no liquidity");
 
     FeeDetails storage details = pairFees[token0][token1];
@@ -312,16 +325,17 @@ function _executeClaim(
 
 // --- Main Entry Point ---
 
+// 0.0.6
 function claimFees(
-    address liquidityAddress,
     address token,
+    address pairedToken,
     uint256 index
 ) external nonReentrant {
     // Part 1: Gather data (now includes feeToken)
-    (address t0, address t1, address dep, uint256 alloc, address feeToken) = _getClaimContext(liquidityAddress, token, index);
+    (address t0, address t1, address dep, uint256 alloc, address feeToken) = _getClaimContext(token, pairedToken, index);
     
     // Part 2: Math
-    (uint256 share, uint256 acc) = _calculateFeeShare(t0, t1, dep, index, alloc, liquidityAddress);
+    (uint256 share, uint256 acc) = _calculateFeeShare(t0, t1, dep, index, alloc);
     
     // Part 3: State & Transfer (now uses feeToken)
     _executeClaim(t0, t1, dep, index, share, acc, feeToken);

@@ -1,87 +1,90 @@
-# CoinClash Type-C Liquidity & Fee Docs (v0.0.5)
+# CoinClash Type-C Liquidity & Fee Docs (v0.0.6)
 
-This document outlines the technical specifications for the **TypeCLiquidity** and **TypeCFees** templates. As of version 0.0.5, the protocol uses an **Isolated Liquidity** model to prevent cross-pair exploits.
+This document outlines the technical specifications for the **TypeCLiquidity** and **TypeCFees** templates. As of version 0.0.6, the protocol uses a **Pair-Specific Slot** model, further hardening the isolation between different liquidity pools.
 
 ---
 
 ## 1. Core Architecture: Pair-Isolation
 
-Unlike certain liquidity pools where all assets of a certain type (e.g., USDT) are fungible, Type-C isolates liquidity by the **Pair Bucket**.
+Type-C isolates liquidity and accounting by the **Pair Bucket**. This ensures that risk and rewards are strictly confined to the specific market participants of a given token pair.
 
-* **The Bucket:** `pairLiquidity[Token][PairedToken]` If `USDT` is deposited to support an `ETH/USDT` pair, that USDT **cannot** be used to pay out winners on a `JUNK/USDT` pair.
-* **Security Impact:** A price manipulation attack on a low-liquidity or "trash" pair is mathematically confined to the liquidity specifically deposited for that pair.
+* **The Bucket:** `pairLiquidity[Token][PairedToken]`. Liquidity is tracked in a directional mapping. If `USDT` is deposited to support an `ETH/USDT` pair, that USDT is strictly locked to that specific pair's settlement logic.
+* **Security Impact:** This architecture prevents "Contagion Draining." A failure, exploit, or extreme volatility in a "junk" token pair cannot mathematically impact the liquidity or fees of a blue-chip pair like `ETH/USDT`.
+* **Slot-Level Isolation:** In v0.0.6, slots are indexed *within* each pair. This means `Slot #1` for Pair A is entirely distinct from `Slot #1` for Pair B, preventing index collisions and simplifying cross-contract lookups.
 
 ---
 
 ## 2. TypeCLiquidity Template
 
-The `TypeCLiquidity` contract serves as the primary vault. It handles principal deposits, trade payouts, and direct withdrawals.
+The `TypeCLiquidity` contract serves as the primary vault and ledger for user allocations.
 
 ### A. Core Entry Points
 
 * **`ccDeposit(token, pairedToken, depositor, amount)`**:
-  * Pulls funds from the caller.
-  * Creates a `Slot` for the depositor.
-  * Increases the specific `pairLiquidity` bucket.
-  * Initializes the fee snapshot in the Fee Template.
+* Pulls funds from the caller and updates the isolated `pairLiquidity` bucket.
+* Generates a new `Slot` using a pair-specific index (`activeSlots[token][pairedToken]`).
+* Triggers an external call to the Fee Template to "snapshot" the current fee accumulator for that specific pair.
 
-* **`ccWithdraw(token, slotIndex, amount)`**:
-  * Allows a depositor to reclaim their principal.
-  * Decreases both the slot `allocation` and the `pairLiquidity` bucket.
-  * Restricted to the `depositor` address.
+
+* **`ccWithdraw(token, pairedToken, index, amount)`**:
+* Reclaims principal from a specific pair bucket.
+* Requires both the `token` and `pairedToken` to locate the correct isolated slot.
+* Decreases the slot `allocation` and the total `pairLiquidity` for that bucket.
+
 
 * **`ccDonate(token, pairedToken, amount)`**:
-  * Adds liquidity to a pair bucket without creating a debt (slot).
-  * Used by drivers to add "Yield" or "Closures" to a specific pair.
+* Injects "unclaimed" liquidity into a pair bucket. Because no `Slot` is created, this liquidity acts as a permanent buffer or reward for other participants in that specific pair.
+
+
 
 ### B. Settlement Logic
 
-* **`ssUpdate`**: Authorized Drivers call this to create `Payout` objects. Every payout is linked to a `pairedToken` to ensure isolation.
-* **`processPayout`**: Checks that the requested payout does not exceed the `pairLiquidity` for that specific pair. This is the final line of defense against drain attacks.
+* **`ssUpdate`**: Authorized Routers/Drivers create `Payout` objects. These are now explicitly linked to a `pairedToken` to ensure the debt is settled from the correct isolated bucket.
+* **`processPayout`**: The final safety check. It ensures the contract never pays out more than the specific pair's liquidity allows, regardless of the contract's total global balance.
 
 ---
 
 ## 3. TypeCFees Template
 
-The `TypeCFees` contract manages protocol revenue independently of user principal. It uses a **Global Accumulator** pattern, meaning it tracks the "true" fees a user is entitled to, rather than a simple time based function. 
+The `TypeCFees` contract manages protocol revenue. It uses a **Global Accumulator** pattern (*feesAcc*) to handle pro-rata distributions without expensive loop-based accounting.
 
 ### A. Fee Logic
 
-* **`addFees(tokenA, tokenB, amount)`**: Increases the `feesAcc` (accumulator) for the canonical pair by billing the caller.
-* **`initializeDepositorFeesAcc`**: Called during `ccDeposit` to take a "snapshot" of the current accumulator, this is essential for accurate depositor fee calculation.
+* **`addFees(tokenA, tokenB, amount)`**:
+* Calculates the **Canonical Ordering** of the pair (standardizing `TokenA/TokenB` vs `TokenB/TokenA`).
+* Increases the pair's global accumulator. All fees are normalized to 18 decimals internally for mathematical precision.
 
-* **`claimFees(liquidityAddress, token, index)`**: 
-  1. Calculates the delta between the current `feesAcc` and the user's last snapshot. (Essentially; what amount of fees their liquidity has contributed to). 
-  2. Multiplies the delta by the user's `allocation` relative to the `pairLiquidity`.
-  3. Updates the snapshot to the current value to prevent double-claiming.
-  4. Transfers the pro-rata share of fees to the user.
 
----
+* **`claimFees(token, pairedToken, index)`**:
+1. **Context Fetching:** Retrieves the user's specific slot data from the Liquidity Template.
+2. **Delta Calculation:** Calculates the difference between the current pair accumulator and the user's last snapshot.
+3. **Pro-Rata Share:** Multiplies this delta by the user's `allocation` relative to the *entire* liquidity of that specific pair.
+4. **Inverse Payment:** Fees are always paid in the **opposite** token of the deposit. If you provide liquidity in Token A, you earn your yield in Token B.
+5. **Denormalization:** Before transfer, the normalized fee amount is converted back to the specific decimal precision of the fee token.
 
-## 4. Technical Constants & Safety
 
-### Canonical Ordering
-
-To prevent duplicate data for `ETH/USDT` vs `USDT/ETH`, all mappings in the Fee Template use canonical sorting:
-`token0 = address(tokenA) < address(tokenB) ? tokenA : tokenB`
-
-### Graceful Degradation
-
-Internal calls between the Liquidity and Fee templates (and Globalizer/Registry) are wrapped in `try/catch` blocks. If a non-essential accounting module (like the Globalizer) fails, the core deposit or settlement will still succeed.
-
-### Native ETH Handling
-
-Both templates natively support ETH (`address(0)`).
-
-* **Deposits:** Handled via `msg.value`.
-* **Withdrawals/Claims:** Handled via `address(recipient).call{value: amount}("")`.
 
 ---
 
-## 5. Deployment Checklist
+## 4. Technical Nuances & Safety
 
-1. **Linkage:** Set `feeTemplateAddress` in `TypeCLiquidity`. Setup `TypeCLiquidity` as a router in `TypeCFees` to enable `dFeesAcc` initialization. 
-2. **Auth:** Add the `CCIsolatedDriver` address to the `routers` mapping in both templates.
-3. **Initialization:** Ensure the token registry and globalizer addresses are set (optional). 
+### Canonical Ordering & Uniswap V2
+
+To ensure consistent tracking, TypeCFees fetches the "True" token order from the Uniswap V2 Factory. This prevents the creation of two separate fee buckets for the same pair (e.g., one for `ETH/USDC` and one for `USDC/ETH`).
+
+### The "Opposite Token" Rule
+
+Liquidity providers (LPs) act as the counterparty to the pair. Therefore, their earnings are denominated in the paired asset. This ensures that LPs are naturally diversifying their holdings into the asset they are supporting.
+
+### Reentrancy & State
+
+All core functions utilize `nonReentrant` guards. In `claimFees`, the user's fee snapshot is updated *before* the transfer of funds to prevent double-claim exploits.
 
 ---
+
+## 5. Deployment & Configuration
+
+1. **Linkage:** The `TypeCLiquidity` contract must have the `feeTemplateAddress` set.
+2. **Router Permissions:** `TypeCLiquidity` must be added as a **Router** in `TypeCFees` so it can trigger the `initializeDepositorFeesAcc` function during deposits.
+3. **Factory Setup:** Both contracts require the `uniswapV2Factory` address to correctly identify and order token pairs.
+4. **Graceful Degradation:** Core operations (deposits/withdrawals) use `try/catch` blocks for external calls to the Registry or Globalizer. This ensures that a failure in a secondary accounting module does not lock user funds.
