@@ -21,19 +21,20 @@ The `TypeCLiquidity` contract serves as the primary vault and ledger for user al
 ### A. Core Entry Points
 
 * **`ccDeposit(token, pairedToken, depositor, amount)`**:
-* Pulls funds from the caller and updates the isolated `pairLiquidity` bucket.
-* Generates a new `Slot` using a pair-specific index (`activeSlots[token][pairedToken]`).
-* Triggers an external call to the Fee Template to "snapshot" the current fee accumulator for that specific pair.
+  * Pulls funds from the caller and updates the isolated `pairLiquidity` bucket.
+  * Generates a new `Slot` using a pair-specific index (`activeSlots[token][pairedToken]`).
+  * Triggers an external call to the Fee Template to "snapshot" the current fee accumulator for that specific pair.
+  * Note: Once a slot is created, its allocation cannot be increased, this is essential for accurate fee tracking. 
 
 
 * **`ccWithdraw(token, pairedToken, index, amount)`**:
-* Reclaims principal from a specific pair bucket.
-* Requires both the `token` and `pairedToken` to locate the correct isolated slot.
-* Decreases the slot `allocation` and the total `pairLiquidity` for that bucket.
+  * Reclaims principal from a specific pair bucket.
+  * Requires both the `token` and `pairedToken` to locate the correct isolated slot.
+  * Decreases the slot `allocation` and the total `pairLiquidity` for that bucket.
 
 
 * **`ccDonate(token, pairedToken, amount)`**:
-* Injects "unclaimed" liquidity into a pair bucket. Because no `Slot` is created, this liquidity acts as a permanent buffer or reward for other participants in that specific pair.
+  * Injects "unclaimed" liquidity into a pair bucket. Because no `Slot` is created, this liquidity acts as a permanent buffer or reward for other participants in that specific pair.
 
 
 
@@ -51,8 +52,8 @@ The `TypeCFees` contract manages protocol revenue. It uses a **Global Accumulato
 ### A. Fee Logic
 
 * **`addFees(tokenA, tokenB, amount)`**:
-* Calculates the **Canonical Ordering** of the pair (standardizing `TokenA/TokenB` vs `TokenB/TokenA`).
-* Increases the pair's global accumulator. All fees are normalized to 18 decimals internally for mathematical precision.
+  * Calculates the **Canonical Ordering** of the pair (standardizing `TokenA/TokenB` vs `TokenB/TokenA`).
+  * Increases the pair's global accumulator. All fees are normalized to 18 decimals internally for mathematical precision.
 
 
 * **`claimFees(token, pairedToken, index)`**:
