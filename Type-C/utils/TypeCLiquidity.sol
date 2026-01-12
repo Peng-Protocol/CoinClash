@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.0.6
+// Version: 0.0.7
 // Changes:
+// - 0.0.7 (12/01/2026): Removed globalizer logic and integrated userPositions struct arrays. 
 // - v0.0.6: Ensured slot data uses per pair mapping, updated deposit, withdrawal, depositor change and view function usage. 
 // - v0.0.5: Added dFeesAcc initialization. Added direct liquidity ownership transfer. 
 // - v0.0.4: Implemented ccDeposit/ccWithdraw; secured payouts with pair isolation.
@@ -19,10 +20,6 @@ interface IERC20 {
 
 interface ITokenRegistry {
     function initializeBalances(address token, address[] memory users) external;
-}
-
-interface ICCGlobalizer {
-    function globalizeLiquidity(address depositor, address token) external;
 }
 
 interface ICCFeeTemplate {
@@ -42,7 +39,6 @@ contract TypeCLiquidity is ReentrancyGuard {
     // --- Configuration ---
     address public uniswapV2Factory;
     address public registryAddress;
-    address public globalizerAddress;
     address public feeTemplateAddress;
 
     // --- Liquidity Storage ---
@@ -80,6 +76,15 @@ mapping(address => mapping(address => mapping(address => uint256[]))) private us
         uint256 amountOwed;
         uint256 timestamp;
     }
+    
+    struct UserPosition {
+        address token;
+        address pairedToken;
+        uint256 slotIndex;
+    }
+    
+    // Global tracking of all user positions
+    mapping(address => UserPosition[]) private userPositions; 
 
     uint256 public payoutIdCounter;
     mapping(uint256 => Payout) public payouts;
@@ -88,19 +93,17 @@ mapping(address => mapping(address => mapping(address => uint256[]))) private us
     // --- Events ---
     event LiquidityDeposited(address indexed token, address indexed pairedToken, address indexed depositor, uint256 amount, uint256 slotIndex);
     event LiquidityWithdrawn(address indexed token, address indexed pairedToken, address indexed depositor, uint256 amount, uint256 slotIndex);
-    
-    event GlobalizeUpdateFailed(address indexed depositor, address indexed token, uint256 amount, bytes reason);
     event UpdateRegistryFailed(address indexed depositor, address indexed token, bytes reason);
     event RouterAdded(address indexed router);
     event RouterRemoved(address indexed router);
     event RegistryAddressSet(address indexed registry);
-    event GlobalizerAddressSet(address indexed globalizer);
     event UniswapFactorySet(address indexed factory);
     event FeeTemplateAddressSet(address indexed feeTemplate);
     
     event PayoutCreated(uint256 indexed id, address indexed recipient, address indexed token, uint256 amount);
     event PayoutClaimed(uint256 indexed id, address indexed recipient, uint256 amountPaid, uint256 amountRemaining);
     event SlotDepositorChanged(address indexed token, uint256 indexed slotIndex, address indexed oldDepositor, address newDepositor);
+    event GlobalizeUpdateFailed(address indexed depositor, address indexed token, uint256 amount, bytes reason);
 
     // --- Admin Functions ---
 
@@ -114,12 +117,6 @@ mapping(address => mapping(address => mapping(address => uint256[]))) private us
         require(_registryAddress != address(0), "Invalid registry address");
         registryAddress = _registryAddress;
         emit RegistryAddressSet(_registryAddress);
-    }
-
-    function setGlobalizerAddress(address _globalizerAddress) external onlyOwner {
-        require(_globalizerAddress != address(0), "Invalid globalizer address");
-        globalizerAddress = _globalizerAddress;
-        emit GlobalizerAddressSet(_globalizerAddress);
     }
     
     function setFeeTemplateAddress(address _feeTemplateAddress) external onlyOwner {
@@ -152,10 +149,10 @@ mapping(address => mapping(address => mapping(address => uint256[]))) private us
     
     // --- Core: Deposit (Renamed from deposit -> ccDeposit) ---
     
-    /**
-     * @notice Deposits tokens into a specific pair bucket.
-     * @dev Pulls tokens from caller (Router or User), updates pairLiquidity, and creates a new Slot.
-     */
+/**
+ * @notice Deposits tokens into a specific pair bucket.
+ * @dev Pulls tokens from caller (Router or User), updates pairLiquidity, and creates a new Slot.
+ */
 // 0.0.6
 function ccDeposit(
     address token, 
@@ -202,16 +199,15 @@ function ccDeposit(
     slot.timestamp = block.timestamp;
     
     userSlotIndices[token][pairedToken][depositor].push(slotIndex);
+    
+    // Add to global user positions tracker
+    userPositions[depositor].push(UserPosition({
+        token: token,
+        pairedToken: pairedToken,
+        slotIndex: slotIndex
+    }));
 
     // 4. External Updates (Graceful Degradation)
-    if (globalizerAddress != address(0)) {
-        try ICCGlobalizer(globalizerAddress).globalizeLiquidity(depositor, token) {
-            // Success
-        } catch (bytes memory reason) {
-            emit GlobalizeUpdateFailed(depositor, token, received, reason);
-        }
-    }
-    
     if (registryAddress != address(0)) {
         address[] memory users = new address[](1);
         users[0] = depositor;
@@ -264,9 +260,23 @@ function ccWithdraw(
     
     require(pairLiquidity[token][pairedToken] >= amount, "Insufficient pair liquidity");
 
-    // 1. Update State
+// 1. Update State
     slot.allocation -= amount;
     pairLiquidity[token][pairedToken] -= amount;
+    
+    // Remove from global positions if fully withdrawn
+    if (slot.allocation == 0) {
+        UserPosition[] storage positions = userPositions[msg.sender];
+        for (uint256 i = 0; i < positions.length; i++) {
+            if (positions[i].token == token && 
+                positions[i].pairedToken == pairedToken && 
+                positions[i].slotIndex == index) {
+                positions[i] = positions[positions.length - 1];
+                positions.pop();
+                break;
+            }
+        }
+    }
 
     // 2. Transfer
     if (token == address(0)) {
@@ -315,7 +325,7 @@ function ccWithdraw(
         // Increase the isolated bucket balance
         pairLiquidity[token][pairedToken] += received;
 
-        // Note: No Slot created, no Globalizer/Registry calls needed as there is no depositor.
+        // Note: No Slot created.
         emit LiquidityDeposited(token, pairedToken, address(0), received, type(uint256).max);
     }
 
@@ -356,8 +366,28 @@ function changeDepositor(
         }
     }
     
-    // Add to new depositor
+// /Find new depositor
     userSlotIndices[token][pairedToken][newDepositor].push(slotIndex);
+    
+    // Transfer global position from old to new depositor
+    UserPosition[] storage oldPositions = userPositions[oldDepositor];
+    for (uint256 i = 0; i < oldPositions.length; i++) {
+        if (oldPositions[i].token == token && 
+            oldPositions[i].pairedToken == pairedToken && 
+            oldPositions[i].slotIndex == slotIndex) {
+            // Remove from old depositor
+            oldPositions[i] = oldPositions[oldPositions.length - 1];
+            oldPositions.pop();
+            break;
+        }
+    }
+    
+    // Add to new depositor
+    userPositions[newDepositor].push(UserPosition({
+        token: token,
+        pairedToken: pairedToken,
+        slotIndex: slotIndex
+    }));
     
     emit SlotDepositorChanged(token, slotIndex, oldDepositor, newDepositor);
 }
@@ -464,6 +494,10 @@ function getSlotView(address token, address pairedToken, uint256 index) external
 
     function getUserPayoutIds(address user) external view returns (uint256[] memory) {
         return userPayoutIds[user];
+    }
+    
+    function getUserPositions(address user) external view returns (UserPosition[] memory) {
+        return userPositions[user];
     }
     
     receive() external payable {}

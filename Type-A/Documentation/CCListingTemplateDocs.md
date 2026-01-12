@@ -1,4 +1,4 @@
-# CCListingTemplate Contract Documentation (v0.4.2)
+# CCListingTemplate Contract Documentation (v0.4.3)
 
 The `CCListingTemplate` is a core smart contract in the CoinClash Type-B system. It functions by managing buy and sell orders and calculating prices directly using the state of Uniswap V2 pairs.
 
@@ -43,7 +43,6 @@ Trading volume is tracked over time on a per-token-pair basis using the `_histor
 | :--- | :--- |
 | **IERC20** | Standard token interface |
 | **IUniswapV2Factory** | Uniswap V2 protocol integration |
-| **ICCGlobalizer** | Optional component for globalizing order data |
 | **ITokenRegistry** | Optional component for storing all tokens a maker has interacted with |
 
 ### Structs (Data Structures)
@@ -72,7 +71,7 @@ This is the main function for state modification, callable only by authorized ro
 **Post-Processing Actions:**
 
   * **Completeness Check**: Verifies if all parts of an order update (Core, Pricing, Amounts) have been received.
-  * **Globalization**: Calls `ICCGlobalizer.globalizeOrders` with the last updated maker and token.
+  * **Globalization**: All orders are tracked globally across pairs. 
 
 ### `prices(address tokenA, address tokenB)` (View)
 

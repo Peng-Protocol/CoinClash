@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// Version: 0.4.2 (10/11)
+// Version: 0.4.3 (12/01/2026)
 // Changes:
-// - (10/11/2025) v0.4.2: Removed _balances mapping and all balance-update logic. 
+// - (12/01/2026) 0.4.3: Removed globalizer related logic as monolithic structure is now global. 
 //           volumeBalances() now queries Uniswap pair reserves directly via balanceOf.
 //           Removed Balance struct, BalanceUpdate struct, BalancesUpdated event, 
 //           and balance-processing loop in ccUpdate().
@@ -36,10 +36,6 @@ interface ITokenRegistry {
     function initializeTokens(address user, address[] memory tokens) external;
 }
 
-interface ICCGlobalizer {
-    function globalizeOrders(address maker, address token) external;
-}
-
 contract CCListingTemplate is Ownable {
     mapping(address router => bool isRouter) public routers;
     address[] private routerAddresses;
@@ -47,7 +43,6 @@ contract CCListingTemplate is Ownable {
     address public uniswapV2Factory; // Uniswap V2 Factory address
     address public uniswapV2Router; // Uniswap V2 Router address
     address public registryAddress; // Token registry address
-    address public globalizerAddress; // Globalizer address
     
     uint256 private nextOrderId;
     
@@ -125,7 +120,6 @@ contract CCListingTemplate is Ownable {
     }
     
     event OrderUpdated(uint256 orderId, bool isBuy, uint8 status);
-    event GlobalizerAddressSet(address indexed globalizer);
     event RegistryAddressSet(address indexed registry);
     event UniswapFactorySet(address indexed factory);
     event UniswapRouterSet(address indexed router);
@@ -195,23 +189,6 @@ contract CCListingTemplate is Ownable {
         }
     }
 
-    // Calls globalizeOrders with latest order details
-    function globalizeUpdate(address maker, address token) internal {
-        if (globalizerAddress == address(0)) {
-            emit GlobalUpdateFailed("Invalid globalizer address");
-            return;
-        }
-        if (maker == address(0) || token == address(0)) {
-            return;
-        }
-        try ICCGlobalizer(globalizerAddress).globalizeOrders(maker, token) {
-        } catch (bytes memory reason) {
-            string memory decodedReason = string(reason);
-            emit ExternalCallFailed(globalizerAddress, "globalizeOrders", decodedReason);
-            emit GlobalUpdateFailed(decodedReason);
-        }
-    }
-
     // Sets Uniswap V2 Factory address, restricted to owner
     function setUniswapV2Factory(address _factory) external onlyOwner {
         require(_factory != address(0), "Invalid factory address");
@@ -231,13 +208,6 @@ contract CCListingTemplate is Ownable {
         require(_registryAddress != address(0), "Invalid registry address");
         registryAddress = _registryAddress;
         emit RegistryAddressSet(_registryAddress);
-    }
-
-    // Sets globalizer address, restricted to owner
-    function setGlobalizerAddress(address _globalizerAddress) external onlyOwner {
-        require(_globalizerAddress != address(0), "Invalid globalizer address");
-        globalizerAddress = _globalizerAddress;
-        emit GlobalizerAddressSet(_globalizerAddress);
     }
 
     // Adds a router address, restricted to owner
@@ -499,11 +469,6 @@ contract CCListingTemplate is Ownable {
                                       !status.hasPricing ? "Missing Pricing" : "Missing Amounts";
                 emit OrderUpdateIncomplete(orderId, reason);
             }
-        }
-
-        // Call globalizer with last maker and token
-        if (lastMaker != address(0) && lastToken != address(0)) {
-            globalizeUpdate(lastMaker, lastToken);
         }
     }
 

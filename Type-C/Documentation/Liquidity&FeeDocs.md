@@ -1,4 +1,4 @@
-# CoinClash Type-C Liquidity & Fee Docs (v0.0.6)
+# CoinClash Type-C Liquidity & Fee Docs (v0.0.7)
 
 This document outlines the technical specifications for the **TypeCLiquidity** and **TypeCFees** templates. As of version 0.0.6, the protocol uses a **Pair-Specific Slot** model, further hardening the isolation between different liquidity pools.
 
@@ -11,6 +11,7 @@ Type-C isolates liquidity and accounting by the **Pair Bucket**. This ensures th
 * **The Bucket:** `pairLiquidity[Token][PairedToken]`. Liquidity is tracked in a directional mapping. If `USDT` is deposited to support an `ETH/USDT` pair, that USDT is strictly locked to that specific pair's settlement logic.
 * **Security Impact:** This architecture prevents "Contagion Draining." A failure, exploit, or extreme volatility in a "junk" token pair cannot mathematically impact the liquidity or fees of a blue-chip pair like `ETH/USDT`.
 * **Slot-Level Isolation:** In v0.0.6, slots are indexed *within* each pair. This means `Slot #1` for Pair A is entirely distinct from `Slot #1` for Pair B, preventing index collisions and simplifying cross-contract lookups.
+* **Globalization:** All positions a user has are stored under a global `mapping(address => UserPosition[])`, which is added to during deposit, transfered during ownership transfers and cleared during withdrawal. 
 
 ---
 
@@ -88,4 +89,4 @@ All core functions utilize `nonReentrant` guards. In `claimFees`, the user's fee
 1. **Linkage:** The `TypeCLiquidity` contract must have the `feeTemplateAddress` set.
 2. **Router Permissions:** `TypeCLiquidity` must be added as a **Router** in `TypeCFees` so it can trigger the `initializeDepositorFeesAcc` function during deposits.
 3. **Factory Setup:** Both contracts require the `uniswapV2Factory` address to correctly identify and order token pairs.
-4. **Graceful Degradation:** Core operations (deposits/withdrawals) use `try/catch` blocks for external calls to the Registry or Globalizer. This ensures that a failure in a secondary accounting module does not lock user funds.
+4. **Graceful Degradation:** Core operations (deposits/withdrawals) use `try/catch` blocks for external calls to the Registry. This ensures that a failure in a secondary accounting module does not lock user funds.
